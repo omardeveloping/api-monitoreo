@@ -1,0 +1,16 @@
+services:
+  web:
+    build: .
+    ports:
+      - "${WEB_PORT:-8000}:8000"
+    environment:
+      DJANGO_DEBUG: "${DJANGO_DEBUG:-1}"
+      DJANGO_ALLOWED_HOSTS: "${DJANGO_ALLOWED_HOSTS:-localhost,127.0.0.1,0.0.0.0}"
+      DJANGO_SECRET_KEY: "${DJANGO_SECRET_KEY:-}"
+      DJANGO_SQLITE_PATH: "${DJANGO_SQLITE_PATH:-/data/db.sqlite3}"
+    volumes:
+      - .:/app
+      - sqlite_data:/data
+
+volumes:
+  sqlite_data:
