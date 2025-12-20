@@ -26,7 +26,7 @@ class Video(models.Model):
     camara = models.IntegerField(choices=NumeroCamara.choices)
     ruta_archivo = models.FileField(upload_to='videos/')
     hora_inicio = models.TimeField()
-    duracion = models.DurationField()
+    duracion = models.FloatField(null=True, blank=True)
     id_turno = models.ForeignKey(Turno, on_delete=models.CASCADE)
 
     def __str__(self):
