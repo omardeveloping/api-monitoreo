@@ -2,7 +2,9 @@ from rest_framework import viewsets, status
 from rest_framework.response import Response
 from .models import Camion, Turno, Video
 from .serializers import CamionSerializer, TurnoSerializer, VideoSerializer
-from dashboard.services.calcular_duracion_video import calcular_duracion_video, validar_formato
+from dashboard.services.calcular_duracion_video import (
+    procesar_video_subida,
+)
 
 
 class CamionViewSet(viewsets.ModelViewSet):
@@ -18,11 +20,9 @@ class VideoViewSet(viewsets.ModelViewSet):
     serializer_class = VideoSerializer
 
     def perform_create(self, serializer):
-        archivo = serializer.validated_data.get("ruta_archivo")
-        validar_formato(archivo)
         video = serializer.save()
-        video.duracion = calcular_duracion_video(video.ruta_archivo.path)
-        video.save(update_fields=["duracion"])
+        archivo = serializer.validated_data.get("ruta_archivo")
+        procesar_video_subida(video, archivo)
 
     def create(self, request, *args, **kwargs):
         serializer = self.get_serializer(data=request.data)
