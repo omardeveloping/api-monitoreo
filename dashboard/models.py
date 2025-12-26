@@ -34,6 +34,8 @@ class Video(models.Model):
     ruta_archivo = models.FileField(upload_to='videos/')
     hora_inicio = models.TimeField()
     duracion = models.IntegerField(null=True, blank=True)
+    inicio_timestamp = models.DateTimeField(null=True, blank=True)
+    fin_timestamp = models.DateTimeField(null=True, blank=True)
     estado = models.CharField(
         max_length=20,
         choices=EstadoVideo.choices,

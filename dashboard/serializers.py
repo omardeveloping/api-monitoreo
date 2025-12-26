@@ -21,4 +21,15 @@ class VideoSerializer(serializers.ModelSerializer):
 
     class Meta:
         model = Video
-        fields = ['id', 'nombre', 'camara', 'ruta_archivo', 'hora_inicio', 'duracion', 'estado', 'id_turno']
+        fields = [
+            'id',
+            'nombre',
+            'camara',
+            'ruta_archivo',
+            'hora_inicio',
+            'duracion',
+            'inicio_timestamp',
+            'fin_timestamp',
+            'estado',
+            'id_turno',
+        ]

@@ -1,5 +1,6 @@
 from rest_framework.exceptions import ValidationError
 from django.conf import settings
+from django.utils import timezone
 from dashboard.models import EstadoVideo
 import datetime, json, os, subprocess
 
@@ -70,13 +71,18 @@ def procesar_video_subida(video_obj, archivo):
     ruta_convertida = None
 
     try:
+        if not video_obj.inicio_timestamp:
+            video_obj.inicio_timestamp = timezone.now()
+
         if content_type in {"video/h264", "video/x-h264"} or ruta_original.lower().endswith(".h264"):
             ruta_convertida = envolver_h264_en_mp4(ruta_original)
             video_obj.ruta_archivo.name = os.path.relpath(ruta_convertida, settings.MEDIA_ROOT)
 
         video_obj.duracion = calcular_duracion_video(video_obj.ruta_archivo.path)
+        if video_obj.inicio_timestamp:
+            video_obj.fin_timestamp = video_obj.inicio_timestamp + datetime.timedelta(seconds=video_obj.duracion or 0)
         video_obj.estado = EstadoVideo.LISTO
-        campos = ["duracion", "estado"]
+        campos = ["duracion", "estado", "inicio_timestamp", "fin_timestamp"]
         if ruta_convertida:
             campos.append("ruta_archivo")
         video_obj.save(update_fields=campos)
