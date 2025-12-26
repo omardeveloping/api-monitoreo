@@ -71,6 +71,12 @@ MIDDLEWARE = [
 
 if DEBUG:
     CORS_ALLOW_ALL_ORIGINS = True
+else:
+    CORS_ALLOWED_ORIGINS = [
+        "https://mdvr.life",
+        "https://www.mdvr.life",
+        "https://camaras.omarmontanares.com",
+    ]
 
 ROOT_URLCONF = 'apiMonitoreo.urls'
 
