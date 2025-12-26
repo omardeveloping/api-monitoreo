@@ -53,13 +53,54 @@ INSTALLED_APPS = [
     'django.contrib.sessions',
     'django.contrib.messages',
     'django.contrib.staticfiles',
+    'django.contrib.sites',
     'dashboard',
     'rest_framework',
+    'rest_framework.authtoken',
+    'dj_rest_auth',
+    'allauth',
+    'allauth.account',
+    'allauth.socialaccount',
+    'dj_rest_auth.registration',
     'corsheaders',
+    'usuarios',
 ]
+
+# DJ-REST-AUTH 
+REST_USE_JWT = True
+SIMPLE_JWT = {"AUTH_HEADER_TYPES": ("Bearer",)}
+SITE_ID = 1
+REST_SESSION_LOGIN = False
+REST_AUTH_TOKEN_MODEL = None
+
+# USUARIOS PERSONALIZADOS
+AUTH_USER_MODEL = "usuarios.Usuario"
+ACCOUNT_USER_MODEL_USERNAME_FIELD = None
+ACCOUNT_USERNAME_REQUIRED = False
+ACCOUNT_LOGIN_METHODS = {"email"}
+ACCOUNT_SIGNUP_FIELDS = ["email*", "password1*", "password2*"]
+ACCOUNT_UNIQUE_EMAIL = True  # default True
+ACCOUNT_EMAIL_VERIFICATION = "none"
+
+REST_AUTH_REGISTER_SERIALIZERS = {
+    "REGISTER_SERIALIZER": "usuarios.serializers.CustomRegisterSerializer",
+}
+
+REST_AUTH_SERIALIZERS = {
+    "LOGIN_SERIALIZER": "usuarios.serializers.CustomLoginSerializer",
+    "JWT_SERIALIZER": "dj_rest_auth.serializers.JWTSerializer",
+}
+
+
+REST_FRAMEWORK = {
+    "DEFAULT_AUTHENTICATION_CLASSES": [
+        "rest_framework_simplejwt.authentication.JWTAuthentication",
+    ],
+}
 
 MIDDLEWARE = [
     'django.middleware.security.SecurityMiddleware',
+    'allauth.account.middleware.AccountMiddleware',
     'corsheaders.middleware.CorsMiddleware',
     'django.contrib.sessions.middleware.SessionMiddleware',
     'django.middleware.common.CommonMiddleware',
