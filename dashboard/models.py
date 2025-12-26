@@ -21,12 +21,24 @@ class NumeroCamara(models.IntegerChoices):
     CAMARA_3 = 3, "Cámara 3"
     CAMARA_4 = 4, "Cámara 4"
 
+
+class EstadoVideo(models.TextChoices):
+    PROCESANDO = "procesando", "Procesando"
+    LISTO = "listo", "Listo"
+    ERROR = "error", "Error"
+
+
 class Video(models.Model):
     nombre = models.CharField(max_length=100)
     camara = models.IntegerField(choices=NumeroCamara.choices)
     ruta_archivo = models.FileField(upload_to='videos/')
     hora_inicio = models.TimeField()
     duracion = models.IntegerField(null=True, blank=True)
+    estado = models.CharField(
+        max_length=20,
+        choices=EstadoVideo.choices,
+        default=EstadoVideo.PROCESANDO,
+    )
     id_turno = models.ForeignKey(Turno, on_delete=models.CASCADE)
 
     def __str__(self):

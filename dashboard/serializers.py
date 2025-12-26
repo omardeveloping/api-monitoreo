@@ -1,5 +1,5 @@
 from rest_framework import serializers
-from .models import Camion, Turno, Video
+from .models import Camion, Turno, Video, EstadoVideo
 
 class CamionSerializer(serializers.ModelSerializer):
     class Meta:
@@ -12,6 +12,13 @@ class TurnoSerializer(serializers.ModelSerializer):
         fields = ['id', 'hora_inicio', 'hora_fin', 'id_camion']
 
 class VideoSerializer(serializers.ModelSerializer):
+    def to_representation(self, instance):
+        data = super().to_representation(instance)
+        if instance.estado != EstadoVideo.LISTO:
+            data["duracion"] = None
+            data["ruta_archivo"] = None
+        return data
+
     class Meta:
         model = Video
-        fields = ['id', 'nombre', 'camara', 'ruta_archivo', 'hora_inicio', 'duracion', 'id_turno']
+        fields = ['id', 'nombre', 'camara', 'ruta_archivo', 'hora_inicio', 'duracion', 'estado', 'id_turno']

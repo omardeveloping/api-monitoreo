@@ -1,5 +1,6 @@
 from rest_framework.exceptions import ValidationError
 from django.conf import settings
+from dashboard.models import EstadoVideo
 import datetime, json, os, subprocess
 
 ### Tengo que acordarme de poner constantes en mayusculas
@@ -74,16 +75,19 @@ def procesar_video_subida(video_obj, archivo):
             video_obj.ruta_archivo.name = os.path.relpath(ruta_convertida, settings.MEDIA_ROOT)
 
         video_obj.duracion = calcular_duracion_video(video_obj.ruta_archivo.path)
-        campos = ["duracion", "ruta_archivo"] if ruta_convertida else ["duracion"]
+        video_obj.estado = EstadoVideo.LISTO
+        campos = ["duracion", "estado"]
+        if ruta_convertida:
+            campos.append("ruta_archivo")
         video_obj.save(update_fields=campos)
 
         if ruta_convertida and ruta_convertida != ruta_original and os.path.exists(ruta_original):
             os.remove(ruta_original)
     except Exception:
-        for ruta in {ruta_original, ruta_convertida}:
-            if ruta and os.path.exists(ruta):
-                os.remove(ruta)
-        video_obj.delete()
+        if ruta_convertida and ruta_convertida != ruta_original and os.path.exists(ruta_convertida):
+            os.remove(ruta_convertida)
+        video_obj.estado = EstadoVideo.ERROR
+        video_obj.save(update_fields=["estado"])
         raise
 
     return video_obj
