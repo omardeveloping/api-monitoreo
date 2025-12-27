@@ -1,3 +1,4 @@
+from datetime import time
 from django.db import models
 
 # Create your models here.
@@ -32,10 +33,11 @@ class Video(models.Model):
     nombre = models.CharField(max_length=100)
     camara = models.IntegerField(choices=NumeroCamara.choices)
     ruta_archivo = models.FileField(upload_to='videos/')
-    hora_inicio = models.TimeField()
+    mimetype = models.CharField(max_length=100, blank=True, default="")
+    hora_inicio = models.TimeField(null=True, blank=True)
     duracion = models.IntegerField(null=True, blank=True)
-    inicio_timestamp = models.DateTimeField(null=True, blank=True)
-    fin_timestamp = models.DateTimeField(null=True, blank=True)
+    inicio_timestamp = models.TimeField(default=time(0, 0), null=True, blank=True)
+    fin_timestamp = models.TimeField(null=True, blank=True)
     estado = models.CharField(
         max_length=20,
         choices=EstadoVideo.choices,

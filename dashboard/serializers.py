@@ -17,6 +17,8 @@ class VideoSerializer(serializers.ModelSerializer):
         if instance.estado != EstadoVideo.LISTO:
             data["duracion"] = None
             data["ruta_archivo"] = None
+            data["fin_timestamp"] = None
+            data["mimetype"] = None
         return data
 
     class Meta:
@@ -30,6 +32,7 @@ class VideoSerializer(serializers.ModelSerializer):
             'duracion',
             'inicio_timestamp',
             'fin_timestamp',
+            'mimetype',
             'estado',
             'id_turno',
         ]

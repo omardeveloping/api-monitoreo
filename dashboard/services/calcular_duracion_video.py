@@ -1,7 +1,14 @@
-from rest_framework.exceptions import ValidationError
+import datetime
+import json
+import math
+import mimetypes
+import os
+import subprocess
+
 from django.conf import settings
+from rest_framework.exceptions import ValidationError
+
 from dashboard.models import EstadoVideo
-import datetime, json, os, subprocess
 
 ### Tengo que acordarme de poner constantes en mayusculas
 FORMATO_VIDEO_VALIDO = {"video/mp4", "video/h264", "video/x-h264"}
@@ -74,9 +81,23 @@ def procesar_video_subida(video_obj, archivo):
             ruta_convertida = envolver_h264_en_mp4(ruta_original)
             video_obj.ruta_archivo.name = os.path.relpath(ruta_convertida, settings.MEDIA_ROOT)
 
-        video_obj.duracion = calcular_duracion_video(video_obj.ruta_archivo.path)
+        video_obj.duracion = math.floor(calcular_duracion_video(video_obj.ruta_archivo.path))
         video_obj.estado = EstadoVideo.LISTO
-        campos = ["duracion", "estado"]
+
+        inicio = video_obj.inicio_timestamp or datetime.time(0, 0)
+        if isinstance(inicio, datetime.datetime):
+            inicio = inicio.time()
+        fin = (
+            datetime.datetime.combine(datetime.date.today(), inicio)
+            + datetime.timedelta(seconds=video_obj.duracion or 0)
+        ).time()
+        video_obj.inicio_timestamp = inicio
+        video_obj.fin_timestamp = fin
+
+        final_mimetype = mimetypes.guess_type(video_obj.ruta_archivo.path)[0] or content_type or ""
+        video_obj.mimetype = final_mimetype
+
+        campos = ["duracion", "estado", "inicio_timestamp", "fin_timestamp", "mimetype"]
         if ruta_convertida:
             campos.append("ruta_archivo")
         video_obj.save(update_fields=campos)
