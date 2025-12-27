@@ -115,6 +115,7 @@ if DEBUG:
 else:
     CORS_ALLOWED_ORIGINS = [
         "https://mdvr.life",
+        "http://localhost:8080",
         "https://www.mdvr.life",
         "https://camaras.omarmontanares.com",
     ]
