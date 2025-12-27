@@ -43,6 +43,15 @@ ALLOWED_HOSTS = [
     if host.strip()
 ]
 
+# Trust Cloudflare/other reverse proxy TLS headers
+SECURE_PROXY_SSL_HEADER = ("HTTP_X_FORWARDED_PROTO", "https")
+
+CSRF_TRUSTED_ORIGINS = [
+    "https://mdvr.life",
+    "https://www.mdvr.life",
+    "https://camaras.omarmontanares.com",
+]
+
 
 # Application definition
 
