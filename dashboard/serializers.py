@@ -1,5 +1,5 @@
 from rest_framework import serializers
-from .models import Camion, Turno, Video, EstadoVideo
+from .models import Camion, Turno, Video, EstadoVideo, Operador, Incidente
 
 class CamionSerializer(serializers.ModelSerializer):
     class Meta:
@@ -9,7 +9,7 @@ class CamionSerializer(serializers.ModelSerializer):
 class TurnoSerializer(serializers.ModelSerializer):
     class Meta:
         model = Turno
-        fields = ['id', 'hora_inicio', 'hora_fin', 'id_camion']
+        fields = ['id', 'hora_inicio', 'hora_fin', 'id_camion', 'operador']
 
 class VideoSerializer(serializers.ModelSerializer):
     def to_representation(self, instance):
@@ -35,4 +35,31 @@ class VideoSerializer(serializers.ModelSerializer):
             'mimetype',
             'estado',
             'id_turno',
+        ]
+
+
+class OperadorSerializer(serializers.ModelSerializer):
+    class Meta:
+        model = Operador
+        fields = [
+            'id',
+            'nombre',
+            'apellido',
+            'licencia',
+            'certificaciones',
+            'correo',
+            'telefono',
+        ]
+
+
+class IncidenteSerializer(serializers.ModelSerializer):
+    class Meta:
+        model = Incidente
+        fields = [
+            'id',
+            'tipo_incidente',
+            'severidad',
+            'tiempo_en_video',
+            'descripcion',
+            'turno',
         ]
