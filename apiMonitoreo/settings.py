@@ -119,6 +119,10 @@ else:
         "https://www.mdvr.life",
         "https://camaras.omarmontanares.com",
     ]
+    CORS_ALLOWED_ORIGIN_REGEXES = [
+        r"^http://localhost(:[0-9]+)?$",
+        r"^http://127\\.0\\.0\\.1(:[0-9]+)?$",
+    ]
 
 ROOT_URLCONF = 'apiMonitoreo.urls'
 
