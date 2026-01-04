@@ -15,6 +15,7 @@ from pathlib import Path
 
 # Build paths inside the project like this: BASE_DIR / 'subdir'.
 BASE_DIR = Path(__file__).resolve().parent.parent
+DJANGO_SETTINGS_MODULE = "apiMonitoreo.settings"
 
 
 # Quick-start development settings - unsuitable for production
@@ -206,6 +207,22 @@ STATIC_ROOT = BASE_DIR / "staticfiles"
 # Media files (user uploads)
 MEDIA_URL = '/media/'
 MEDIA_ROOT = BASE_DIR / "media"
+
+# Ruta a monitorear para uso de disco. Cambia con la variable de entorno ESPACIO_DISCO_RUTA.
+ESPACIO_DISCO_RUTA = os.environ.get("ESPACIO_DISCO_RUTA", "/")
+
+# Celery
+CELERY_BROKER_URL = os.environ.get("CELERY_BROKER_URL", "redis://redis:6379/0")
+CELERY_RESULT_BACKEND = os.environ.get(
+    "CELERY_RESULT_BACKEND", CELERY_BROKER_URL
+)
+CELERY_TIMEZONE = TIME_ZONE
+CELERY_BEAT_SCHEDULE = {
+    "actualizar-turnos-activos": {
+        "task": "dashboard.tasks.actualizar_turnos_activos",
+        "schedule": 60.0,  # cada minuto
+    },
+}
 
 # Default primary key field type
 # https://docs.djangoproject.com/en/5.2/ref/settings/#default-auto-field

@@ -1,5 +1,6 @@
 from datetime import time
 from django.db import models
+from django.utils import timezone
 
 # Create your models here.
 class Camion(models.Model):
@@ -9,19 +10,32 @@ class Camion(models.Model):
         return self.patente
 
 class Turno(models.Model):
+    fecha = models.DateField(default=timezone.localdate)
     hora_inicio = models.TimeField()
     hora_fin = models.TimeField()
     id_camion = models.ForeignKey(Camion, on_delete=models.CASCADE)
     operador = models.ForeignKey('Operador', on_delete=models.CASCADE, null=True, blank=True)
+    tipo_turno = models.ForeignKey('TipoTurno', on_delete=models.SET_NULL, null=True, blank=True)
+    activo = models.BooleanField(default=False)
 
     def __str__(self):
-        return self.hora_inicio.strftime("%H:%M") + " - " + self.hora_fin.strftime("%H:%M") + " (" + self.id_camion.patente + ")"
+        base = f"{self.fecha} {self.hora_inicio.strftime('%H:%M')} - {self.hora_fin.strftime('%H:%M')} ({self.id_camion.patente})"
+        if self.tipo_turno:
+            return f"{base} [{self.tipo_turno.get_nombre_display()}]"
+        return base
     
 class NumeroCamara(models.IntegerChoices):
     CAMARA_1 = 1, "Cámara 1"
     CAMARA_2 = 2, "Cámara 2"
     CAMARA_3 = 3, "Cámara 3"
     CAMARA_4 = 4, "Cámara 4"
+
+
+class NombreTurno(models.TextChoices):
+    MANANA = "manana", "Mañana"
+    TARDE = "tarde", "Tarde"
+    NOCHE = "noche", "Noche"
+    VARIABLE = "variable", "Variable"
 
 
 class EstadoVideo(models.TextChoices):
@@ -45,6 +59,8 @@ class Video(models.Model):
         default=EstadoVideo.PROCESANDO,
     )
     id_turno = models.ForeignKey(Turno, on_delete=models.CASCADE)
+    creado_en = models.DateTimeField(auto_now_add=True)
+    fecha_subida = models.DateField(default=timezone.localdate)
 
     def __str__(self):
         return self.nombre
@@ -88,3 +104,20 @@ class Incidente(models.Model):
 
     def __str__(self):
         return f"{self.tipo_incidente} ({self.severidad})"
+
+
+class TipoTurno(models.Model):
+    nombre = models.CharField(max_length=20, choices=NombreTurno.choices, unique=True)
+    hora_inicio = models.TimeField()
+    hora_fin = models.TimeField()
+
+    def __str__(self):
+        return f"{self.get_nombre_display()} {self.hora_inicio.strftime('%H:%M')} - {self.hora_fin.strftime('%H:%M')}"
+
+
+class EstadisticaVideoDiaria(models.Model):
+    fecha = models.DateField(unique=True)
+    cantidad_videos = models.PositiveIntegerField(default=0)
+
+    def __str__(self):
+        return f"{self.fecha}: {self.cantidad_videos}"

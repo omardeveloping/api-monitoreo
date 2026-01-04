@@ -1,12 +1,17 @@
+import shutil
 from rest_framework import viewsets, status
 from rest_framework.response import Response
-from .models import Camion, Turno, Video, Operador, Incidente
+from rest_framework.decorators import action
+from django.conf import settings
+from django.utils import timezone
+from .models import Camion, Turno, Video, Operador, Incidente, TipoTurno
 from .serializers import (
     CamionSerializer,
     TurnoSerializer,
     VideoSerializer,
     OperadorSerializer,
     IncidenteSerializer,
+    TipoTurnoSerializer,
 )
 from dashboard.services.calcular_duracion_video import (
     procesar_video_subida,
@@ -20,6 +25,12 @@ class CamionViewSet(viewsets.ModelViewSet):
 class TurnoViewSet(viewsets.ModelViewSet):
     queryset = Turno.objects.all()
     serializer_class = TurnoSerializer
+
+    @action(detail=False, methods=["get"], url_path="estadisticas")
+    def estadisticas(self, request):
+        """Devuelve turnos activos."""
+        activos = Turno.objects.filter(activo=True).count()
+        return Response({"activos": activos})
 
 class VideoViewSet(viewsets.ModelViewSet):
     queryset = Video.objects.all()
@@ -37,12 +48,54 @@ class VideoViewSet(viewsets.ModelViewSet):
         headers = self.get_success_headers(serializer.data)
         return Response(serializer.data, status=status.HTTP_201_CREATED, headers=headers)
 
+    @action(detail=False, methods=["get"], url_path="conteo-hoy")
+    def conteo_hoy(self, request):
+        """Devuelve la cantidad de videos subidos hoy."""
+        hoy = timezone.localdate()
+        cantidad = Video.objects.filter(fecha_subida=hoy).count()
+        return Response({"fecha": hoy, "cantidad": cantidad})
+
 
 class OperadorViewSet(viewsets.ModelViewSet):
     queryset = Operador.objects.all()
     serializer_class = OperadorSerializer
 
 
+class TipoTurnoViewSet(viewsets.ModelViewSet):
+    queryset = TipoTurno.objects.all()
+    serializer_class = TipoTurnoSerializer
+
+
 class IncidenteViewSet(viewsets.ModelViewSet):
     queryset = Incidente.objects.all()
     serializer_class = IncidenteSerializer
+
+    @action(detail=False, methods=["get"], url_path="contar-alta")
+    def contar_alta(self, request):
+        """Cuenta incidentes con severidad alta."""
+        cantidad_incidentes = self.get_queryset().filter(
+            severidad=Incidente.Severidad.ALTA
+        ).count()
+        return Response({"cantidad": cantidad_incidentes})
+
+
+class EspacioDiscoViewSet(viewsets.ViewSet):
+    """Devuelve el uso de disco del servidor."""
+
+    def list(self, request):
+        ruta = getattr(settings, "ESPACIO_DISCO_RUTA", "/")
+        uso = shutil.disk_usage(ruta)
+        total = uso.total
+        usado = uso.used
+        libre = uso.free
+        porcentaje_usado = round((usado / total) * 100, 2) if total else 0
+        gb = 1024 ** 3
+        return Response(
+            {
+                "ruta": ruta,
+                "total_gb": round(total / gb, 2),
+                "usado_gb": round(usado / gb, 2),
+                "libre_gb": round(libre / gb, 2),
+                "porcentaje_usado": porcentaje_usado,
+            }
+        )
