@@ -9,33 +9,65 @@ class Camion(models.Model):
     def __str__(self):
         return self.patente
 
+
+class TipoTurnoChoices(models.TextChoices):
+    MANANA = "manana", "Mañana"
+    TARDE = "tarde", "Tarde"
+    NOCHE = "noche", "Noche"
+
 class Turno(models.Model):
+    HORARIO_TIPO_TURNO = {
+        TipoTurnoChoices.MANANA: (time(6, 0), time(14, 0)),
+        TipoTurnoChoices.TARDE: (time(14, 0), time(22, 0)),
+        TipoTurnoChoices.NOCHE: (time(22, 0), time(6, 0)),
+    }
+
     fecha = models.DateField(default=timezone.localdate)
     hora_inicio = models.TimeField()
     hora_fin = models.TimeField()
     id_camion = models.ForeignKey(Camion, on_delete=models.CASCADE)
     operador = models.ForeignKey('Operador', on_delete=models.CASCADE, null=True, blank=True)
-    tipo_turno = models.ForeignKey('TipoTurno', on_delete=models.SET_NULL, null=True, blank=True)
+    tipo_turno = models.CharField(max_length=10, choices=TipoTurnoChoices.choices, null=True, blank=True)
     activo = models.BooleanField(default=False)
+    completado = models.BooleanField(default=False)
 
     def __str__(self):
         base = f"{self.fecha} {self.hora_inicio.strftime('%H:%M')} - {self.hora_fin.strftime('%H:%M')} ({self.id_camion.patente})"
         if self.tipo_turno:
-            return f"{base} [{self.tipo_turno.get_nombre_display()}]"
+            return f"{base} [{self.get_tipo_turno_display()}]"
         return base
-    
+
+    def save(self, *args, **kwargs):
+        update_fields = set(kwargs.get("update_fields") or [])
+
+        if self.tipo_turno:
+            horario = self.HORARIO_TIPO_TURNO.get(self.tipo_turno)
+            if horario:
+                self.hora_inicio, self.hora_fin = horario
+                update_fields.update({"hora_inicio", "hora_fin"})
+
+        if kwargs.get("update_fields") is not None:
+            kwargs["update_fields"] = list(update_fields)
+
+        super().save(*args, **kwargs)
+
+
+class AsignacionTurno(models.Model):
+    turno = models.ForeignKey(Turno, on_delete=models.CASCADE, related_name="asignaciones")
+    operador = models.ForeignKey('Operador', on_delete=models.CASCADE, related_name="asignaciones")
+    semana = models.PositiveIntegerField()
+
+    class Meta:
+        unique_together = ("semana", "turno")
+
+    def __str__(self):
+        return f"Semana {self.semana}: {self.turno} -> {self.operador}"
+
 class NumeroCamara(models.IntegerChoices):
     CAMARA_1 = 1, "Cámara 1"
     CAMARA_2 = 2, "Cámara 2"
     CAMARA_3 = 3, "Cámara 3"
     CAMARA_4 = 4, "Cámara 4"
-
-
-class NombreTurno(models.TextChoices):
-    MANANA = "manana", "Mañana"
-    TARDE = "tarde", "Tarde"
-    NOCHE = "noche", "Noche"
-    VARIABLE = "variable", "Variable"
 
 
 class EstadoVideo(models.TextChoices):
@@ -104,15 +136,6 @@ class Incidente(models.Model):
 
     def __str__(self):
         return f"{self.tipo_incidente} ({self.severidad})"
-
-
-class TipoTurno(models.Model):
-    nombre = models.CharField(max_length=20, choices=NombreTurno.choices, unique=True)
-    hora_inicio = models.TimeField()
-    hora_fin = models.TimeField()
-
-    def __str__(self):
-        return f"{self.get_nombre_display()} {self.hora_inicio.strftime('%H:%M')} - {self.hora_fin.strftime('%H:%M')}"
 
 
 class EstadisticaVideoDiaria(models.Model):

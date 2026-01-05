@@ -12,6 +12,7 @@ https://docs.djangoproject.com/en/5.2/ref/settings/
 
 import os
 from pathlib import Path
+from celery.schedules import crontab
 
 # Build paths inside the project like this: BASE_DIR / 'subdir'.
 BASE_DIR = Path(__file__).resolve().parent.parent
@@ -221,6 +222,16 @@ CELERY_BEAT_SCHEDULE = {
     "actualizar-turnos-activos": {
         "task": "dashboard.tasks.actualizar_turnos_activos",
         "schedule": 60.0,  # cada minuto
+    },
+    "generar-turnos-diarios": {
+        "task": "dashboard.tasks.generar_turnos_diarios",
+        # 00:05 L-S (no domingos)
+        "schedule": crontab(minute=5, hour=0, day_of_week="mon,tue,wed,thu,fri,sat"),
+    },
+    "generar-asignaciones-semanales": {
+        "task": "dashboard.tasks.generar_asignaciones_semanales",
+        # 00:10 cada lunes
+        "schedule": crontab(minute=10, hour=0, day_of_week="mon"),
     },
 }
 

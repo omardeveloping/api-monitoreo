@@ -4,14 +4,14 @@ from rest_framework.response import Response
 from rest_framework.decorators import action
 from django.conf import settings
 from django.utils import timezone
-from .models import Camion, Turno, Video, Operador, Incidente, TipoTurno
+from .models import Camion, Turno, Video, Operador, Incidente, AsignacionTurno
 from .serializers import (
     CamionSerializer,
     TurnoSerializer,
     VideoSerializer,
     OperadorSerializer,
     IncidenteSerializer,
-    TipoTurnoSerializer,
+    AsignacionTurnoSerializer,
 )
 from dashboard.services.calcular_duracion_video import (
     procesar_video_subida,
@@ -61,9 +61,9 @@ class OperadorViewSet(viewsets.ModelViewSet):
     serializer_class = OperadorSerializer
 
 
-class TipoTurnoViewSet(viewsets.ModelViewSet):
-    queryset = TipoTurno.objects.all()
-    serializer_class = TipoTurnoSerializer
+class AsignacionTurnoViewSet(viewsets.ModelViewSet):
+    queryset = AsignacionTurno.objects.all()
+    serializer_class = AsignacionTurnoSerializer
 
 
 class IncidenteViewSet(viewsets.ModelViewSet):

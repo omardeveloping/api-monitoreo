@@ -7,7 +7,7 @@ from .views import (
     OperadorViewSet,
     IncidenteViewSet,
     EspacioDiscoViewSet,
-    TipoTurnoViewSet,
+    AsignacionTurnoViewSet,
 )
 
 router = routers.DefaultRouter()
@@ -17,7 +17,7 @@ router.register(r'videos', VideoViewSet)
 router.register(r'operadores', OperadorViewSet)
 router.register(r'incidentes', IncidenteViewSet)
 router.register(r'espacio-disco', EspacioDiscoViewSet, basename='espacio-disco')
-router.register(r'tipos-turno', TipoTurnoViewSet)
+router.register(r'asignaciones-turno', AsignacionTurnoViewSet)
 
 urlpatterns = [
     path('dashboard/', include(router.urls)),
