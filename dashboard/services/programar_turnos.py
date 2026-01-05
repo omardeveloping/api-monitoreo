@@ -26,8 +26,9 @@ def _asignacion_para_semana_y_tipo(semana, tipo_turno):
 
 def crear_turnos_diarios(fecha=None):
     """
-    Crea turnos diarios para cada camión (mañana, tarde, noche) excepto los domingos.
-    Si existe una asignación semanal para el tipo de turno, asigna ese operador.
+    Crea 3 turnos diarios (mañana, tarde, noche) excepto los domingos.
+    Usa el primer camión disponible. Si existe una asignación semanal para el tipo
+    de turno, asigna ese operador.
     """
     fecha = fecha or timezone.localdate()
 
@@ -35,31 +36,30 @@ def crear_turnos_diarios(fecha=None):
     if fecha.weekday() == 6:
         return 0
 
-    camiones = list(Camion.objects.all())
-    if not camiones:
+    camion = Camion.objects.order_by("id").first()
+    if not camion:
         return 0
 
     semana_actual = _semana_iso(fecha)
     turnos_creados = 0
 
-    for camion in camiones:
-        for tipo_turno in (
-            TipoTurnoChoices.MANANA,
-            TipoTurnoChoices.TARDE,
-            TipoTurnoChoices.NOCHE,
-        ):
-            turno, creado = Turno.objects.get_or_create(
-                fecha=fecha,
-                id_camion=camion,
-                tipo_turno=tipo_turno,
-                defaults={"activo": False},
-            )
-            if creado:
-                asignacion = _asignacion_para_semana_y_tipo(semana_actual, tipo_turno)
-                if asignacion and asignacion.operador_id:
-                    turno.operador = asignacion.operador
-                    turno.save(update_fields=["operador"])
-                turnos_creados += 1
+    for tipo_turno in (
+        TipoTurnoChoices.MANANA,
+        TipoTurnoChoices.TARDE,
+        TipoTurnoChoices.NOCHE,
+    ):
+        turno, creado = Turno.objects.get_or_create(
+            fecha=fecha,
+            id_camion=camion,
+            tipo_turno=tipo_turno,
+            defaults={"activo": False},
+        )
+        if creado:
+            asignacion = _asignacion_para_semana_y_tipo(semana_actual, tipo_turno)
+            if asignacion and asignacion.operador_id:
+                turno.operador = asignacion.operador
+                turno.save(update_fields=["operador"])
+            turnos_creados += 1
 
     return turnos_creados
 
