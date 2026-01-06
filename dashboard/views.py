@@ -1,10 +1,11 @@
 import shutil
+from datetime import datetime, timedelta
 from rest_framework import viewsets, status
 from rest_framework.response import Response
 from rest_framework.decorators import action
 from django.conf import settings
 from django.utils import timezone
-from .models import Camion, Turno, Video, Operador, Incidente, AsignacionTurno
+from .models import Camion, Turno, Video, Operador, Incidente, AsignacionTurno, Mantenimiento
 from .serializers import (
     CamionSerializer,
     TurnoSerializer,
@@ -12,6 +13,7 @@ from .serializers import (
     OperadorSerializer,
     IncidenteSerializer,
     AsignacionTurnoSerializer,
+    MantenimientoSerializer,
 )
 from dashboard.services.calcular_duracion_video import (
     procesar_video_subida,
@@ -31,6 +33,21 @@ class TurnoViewSet(viewsets.ModelViewSet):
         """Devuelve turnos activos."""
         activos = Turno.objects.filter(activo=True).count()
         return Response({"activos": activos})
+
+    @action(detail=True, methods=["get"], url_path="videos-por-turno")
+    def videos_por_turno(self, request, pk=None):
+        """Devuelve la cantidad de videos asociados a un turno."""
+        turno = self.get_object()
+        total_videos = Video.objects.filter(id_turno=turno).count()
+        return Response(
+            {
+                "turno_id": turno.id,
+                "fecha": turno.fecha,
+                "tipo_turno": turno.tipo_turno,
+                "camion_id": turno.id_camion_id,
+                "total_videos": total_videos,
+            }
+        )
 
 class VideoViewSet(viewsets.ModelViewSet):
     queryset = Video.objects.all()
@@ -60,10 +77,40 @@ class OperadorViewSet(viewsets.ModelViewSet):
     queryset = Operador.objects.all()
     serializer_class = OperadorSerializer
 
+    @action(detail=True, methods=["get"], url_path="estadisticas")
+    def estadisticas(self, request, pk=None):
+        """Devuelve total de turnos y horas trabajadas por un operador."""
+        operador = self.get_object()
+        turnos = Turno.objects.filter(operador=operador)
+
+        total_segundos = 0
+        for turno in turnos:
+            if turno.hora_inicio and turno.hora_fin:
+                inicio = datetime.combine(timezone.localdate(), turno.hora_inicio)
+                fin = datetime.combine(timezone.localdate(), turno.hora_fin)
+                if fin <= inicio:
+                    fin += timedelta(days=1)  # Turnos que pasan medianoche
+                total_segundos += (fin - inicio).total_seconds()
+
+        total_horas = round(total_segundos / 3600, 2)
+        return Response(
+            {
+                "operador_id": operador.id,
+                "total_turnos": turnos.count(),
+                "total_horas": total_horas,
+                "total_segundos": int(total_segundos),
+            }
+        )
+
 
 class AsignacionTurnoViewSet(viewsets.ModelViewSet):
     queryset = AsignacionTurno.objects.all()
     serializer_class = AsignacionTurnoSerializer
+
+
+class MantenimientoViewSet(viewsets.ModelViewSet):
+    queryset = Mantenimiento.objects.all()
+    serializer_class = MantenimientoSerializer
 
 
 class IncidenteViewSet(viewsets.ModelViewSet):

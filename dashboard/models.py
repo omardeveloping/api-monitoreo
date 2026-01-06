@@ -5,6 +5,16 @@ from django.utils import timezone
 # Create your models here.
 class Camion(models.Model):
     patente = models.CharField(max_length=10, unique=True)
+    marca = models.CharField(max_length=100, blank=True, default="")
+    ano = models.PositiveIntegerField(null=True, blank=True)
+    disponible = models.BooleanField(default=True)
+    ultimo_mantenimiento = models.ForeignKey(
+        "Mantenimiento",
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name="+",
+    )
 
     def __str__(self):
         return self.patente
@@ -99,12 +109,21 @@ class Video(models.Model):
 
 
 class Operador(models.Model):
+    class EstadoOperador(models.TextChoices):
+        ACTIVO = "activo", "Activo"
+        INACTIVO = "inactivo", "Inactivo"
+
     nombre = models.CharField(max_length=100)
     apellido = models.CharField(max_length=100)
     licencia = models.CharField(max_length=50, blank=True, default="")
     certificaciones = models.JSONField(default=list, blank=True)
     correo = models.EmailField(unique=True)
     telefono = models.CharField(max_length=30, blank=True, default="")
+    estado = models.CharField(
+        max_length=10,
+        choices=EstadoOperador.choices,
+        default=EstadoOperador.ACTIVO,
+    )
 
     def __str__(self):
         return f"{self.nombre} {self.apellido}"
@@ -112,9 +131,11 @@ class Operador(models.Model):
 
 class Incidente(models.Model):
     class TipoIncidente(models.TextChoices):
-        EXCESO_VELOCIDAD = "exceso_velocidad", "Exceso de velocidad"
-        FRENADO_BRUSCO = "frenado_brusco", "Frenado brusco"
+        FRENADO_BRUSCO = "frenado_brusco", "Frenado Brusco"
+        EXCESO_VELOCIDAD = "exceso_velocidad", "Exceso Velocidad"
         COLISION = "colision", "Colisión"
+        DISTRACCION = "distraccion", "Distracción"
+        FATIGA_SUENO = "fatiga_sueno", "Fatiga / Sueño"
         OTRO = "otro", "Otro"
 
     class Severidad(models.TextChoices):
@@ -144,3 +165,24 @@ class EstadisticaVideoDiaria(models.Model):
 
     def __str__(self):
         return f"{self.fecha}: {self.cantidad_videos}"
+
+
+class Mantenimiento(models.Model):
+    camion = models.ForeignKey(Camion, on_delete=models.CASCADE, related_name="mantenimientos")
+    fecha = models.DateField(default=timezone.localdate)
+    descripcion = models.TextField(blank=True, default="")
+    costo = models.DecimalField(max_digits=10, decimal_places=2, null=True, blank=True)
+
+    def save(self, *args, **kwargs):
+        super().save(*args, **kwargs)
+        # Actualiza la referencia al último mantenimiento si corresponde.
+        camion = self.camion
+        if (
+            camion.ultimo_mantenimiento is None
+            or (camion.ultimo_mantenimiento.fecha <= self.fecha)
+        ):
+            camion.ultimo_mantenimiento = self
+            camion.save(update_fields=["ultimo_mantenimiento"])
+
+    def __str__(self):
+        return f"{self.camion} - {self.fecha}"

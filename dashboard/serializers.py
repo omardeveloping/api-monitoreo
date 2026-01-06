@@ -1,10 +1,10 @@
 from rest_framework import serializers
-from .models import Camion, Turno, Video, EstadoVideo, Operador, Incidente, AsignacionTurno
+from .models import Camion, Turno, Video, EstadoVideo, Operador, Incidente, AsignacionTurno, Mantenimiento
 
 class CamionSerializer(serializers.ModelSerializer):
     class Meta:
         model = Camion
-        fields = ['id', 'patente']
+        fields = ['id', 'patente', 'marca', 'ano', 'disponible', 'ultimo_mantenimiento']
 
 class TurnoSerializer(serializers.ModelSerializer):
     class Meta:
@@ -57,6 +57,7 @@ class OperadorSerializer(serializers.ModelSerializer):
             'certificaciones',
             'correo',
             'telefono',
+            'estado',
         ]
 
 
@@ -71,3 +72,9 @@ class IncidenteSerializer(serializers.ModelSerializer):
             'descripcion',
             'turno',
         ]
+
+
+class MantenimientoSerializer(serializers.ModelSerializer):
+    class Meta:
+        model = Mantenimiento
+        fields = ['id', 'camion', 'fecha', 'descripcion', 'costo']
