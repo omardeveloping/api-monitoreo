@@ -49,6 +49,18 @@ class TurnoViewSet(viewsets.ModelViewSet):
             }
         )
 
+    @action(detail=True, methods=["get"], url_path="videos")
+    def videos(self, request, pk=None):
+        """Devuelve todos los videos asociados a un turno."""
+        turno = self.get_object()
+        videos = Video.objects.filter(id_turno=turno).order_by("id")
+        page = self.paginate_queryset(videos)
+        if page is not None:
+            serializer = VideoSerializer(page, many=True)
+            return self.get_paginated_response(serializer.data)
+        serializer = VideoSerializer(videos, many=True)
+        return Response(serializer.data)
+
 class VideoViewSet(viewsets.ModelViewSet):
     queryset = Video.objects.all()
     serializer_class = VideoSerializer
