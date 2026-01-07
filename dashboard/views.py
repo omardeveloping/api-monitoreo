@@ -55,10 +55,11 @@ class TurnoViewSet(viewsets.ModelViewSet):
         turno = self.get_object()
         videos = Video.objects.filter(id_turno=turno).order_by("id")
         page = self.paginate_queryset(videos)
+        serializer_context = {"request": request}
         if page is not None:
-            serializer = VideoSerializer(page, many=True)
+            serializer = VideoSerializer(page, many=True, context=serializer_context)
             return self.get_paginated_response(serializer.data)
-        serializer = VideoSerializer(videos, many=True)
+        serializer = VideoSerializer(videos, many=True, context=serializer_context)
         return Response(serializer.data)
 
 class VideoViewSet(viewsets.ModelViewSet):
