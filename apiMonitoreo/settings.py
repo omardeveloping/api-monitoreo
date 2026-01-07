@@ -52,6 +52,8 @@ CSRF_TRUSTED_ORIGINS = [
     "https://mdvr.life",
     "https://www.mdvr.life",
     "https://camaras.omarmontanares.com",
+    "http://localhost:8080",
+    "http://127.0.0.1:8080",
 ]
 
 
@@ -121,19 +123,18 @@ MIDDLEWARE = [
     'django.middleware.clickjacking.XFrameOptionsMiddleware',
 ]
 
-if DEBUG:
-    CORS_ALLOW_ALL_ORIGINS = True
-else:
-    CORS_ALLOWED_ORIGINS = [
-        "https://mdvr.life",
-        "http://localhost:8080",
-        "https://www.mdvr.life",
-        "https://camaras.omarmontanares.com",
-    ]
-    CORS_ALLOWED_ORIGIN_REGEXES = [
-        r"^http://localhost(:[0-9]+)?$",
-        r"^http://127\\.0\\.0\\.1(:[0-9]+)?$",
-    ]
+CORS_ALLOW_ALL_ORIGINS = env_bool("CORS_ALLOW_ALL_ORIGINS", DEBUG)
+CORS_ALLOWED_ORIGINS = [
+    "https://mdvr.life",
+    "https://www.mdvr.life",
+    "https://camaras.omarmontanares.com",
+    "http://localhost:8080",
+    "http://127.0.0.1:8080",
+]
+CORS_ALLOWED_ORIGIN_REGEXES = [
+    r"^http://localhost(:[0-9]+)?$",
+    r"^http://127\.0\.0\.1(:[0-9]+)?$",
+]
 
 ROOT_URLCONF = 'apiMonitoreo.urls'
 
