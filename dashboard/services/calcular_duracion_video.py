@@ -4,6 +4,7 @@ import math
 import mimetypes
 import os
 import subprocess
+import tempfile
 
 from django.conf import settings
 from rest_framework.exceptions import ValidationError
@@ -13,6 +14,41 @@ from dashboard.models import EstadoVideo
 ### Tengo que acordarme de poner constantes en mayusculas
 FORMATO_VIDEO_VALIDO = {"video/mp4", "video/h264", "video/x-h264"}
 EXTENSIONES_VALIDAS = {".mp4", ".h264"}
+MAX_BYTES_START_CODES = 1024 * 1024
+MAX_TAMANO_NAL = 50 * 1024 * 1024
+LONGITUDES_NAL_H264 = (4, 3)
+
+
+def _tiene_start_codes(ruta_h264):
+    with open(ruta_h264, "rb") as archivo:
+        data = archivo.read(MAX_BYTES_START_CODES)
+    return b"\x00\x00\x00\x01" in data or b"\x00\x00\x01" in data
+
+
+def _convertir_longitudes_a_annexb(ruta_h264, ruta_salida, longitud_nal):
+    nals = 0
+    try:
+        with open(ruta_h264, "rb") as entrada, open(ruta_salida, "wb") as salida:
+            while True:
+                size_bytes = entrada.read(longitud_nal)
+                if not size_bytes:
+                    return nals > 0
+                if len(size_bytes) != longitud_nal:
+                    return False
+                nal_size = int.from_bytes(size_bytes, "big")
+                if nal_size <= 0 or nal_size > MAX_TAMANO_NAL:
+                    return False
+                nal = entrada.read(nal_size)
+                if len(nal) != nal_size:
+                    return False
+                nal_type = nal[0] & 0x1F
+                if not 1 <= nal_type <= 31:
+                    return False
+                salida.write(b"\x00\x00\x00\x01")
+                salida.write(nal)
+                nals += 1
+    except OSError:
+        return False
 
 def validar_formato(video):
     content_type = (getattr(video, "content_type", "") or "").lower()
@@ -31,72 +67,97 @@ def envolver_h264_en_mp4(ruta_h264):
         raise ValidationError("No se encontró la ruta del archivo H264.")
 
     ruta_salida = os.path.splitext(ruta_h264)[0] + ".mp4"
-    comandos = [
-        [
-            "ffmpeg",
-            "-y",
-            "-i",
-            ruta_h264,
-            "-c",
-            "copy",
-            "-movflags",
-            "+faststart",
-            ruta_salida,
-        ],
-        [
-            "ffmpeg",
-            "-y",
-            "-probesize",
-            "50M",
-            "-analyzeduration",
-            "50M",
-            "-fflags",
-            "+genpts",
-            "-i",
-            ruta_h264,
-            "-c",
-            "copy",
-            "-movflags",
-            "+faststart",
-            ruta_salida,
-        ],
-        [
-            "ffmpeg",
-            "-y",
-            "-probesize",
-            "50M",
-            "-analyzeduration",
-            "50M",
-            "-fflags",
-            "+genpts",
-            "-i",
-            ruta_h264,
-            "-c:v",
-            "libx264",
-            "-preset",
-            "veryfast",
-            "-crf",
-            "23",
-            "-pix_fmt",
-            "yuv420p",
-            "-movflags",
-            "+faststart",
-            ruta_salida,
-        ],
-    ]
+
+    def construir_comandos_ffmpeg(ruta_entrada):
+        return [
+            [
+                "ffmpeg",
+                "-y",
+                "-i",
+                ruta_entrada,
+                "-c",
+                "copy",
+                "-movflags",
+                "+faststart",
+                ruta_salida,
+            ],
+            [
+                "ffmpeg",
+                "-y",
+                "-probesize",
+                "50M",
+                "-analyzeduration",
+                "50M",
+                "-fflags",
+                "+genpts",
+                "-i",
+                ruta_entrada,
+                "-c",
+                "copy",
+                "-movflags",
+                "+faststart",
+                ruta_salida,
+            ],
+            [
+                "ffmpeg",
+                "-y",
+                "-probesize",
+                "50M",
+                "-analyzeduration",
+                "50M",
+                "-fflags",
+                "+genpts",
+                "-i",
+                ruta_entrada,
+                "-c:v",
+                "libx264",
+                "-preset",
+                "veryfast",
+                "-crf",
+                "23",
+                "-pix_fmt",
+                "yuv420p",
+                "-movflags",
+                "+faststart",
+                ruta_salida,
+            ],
+        ]
+
+    def intentar_conversion(ruta_entrada, etiqueta):
+        for idx, cmd in enumerate(construir_comandos_ffmpeg(ruta_entrada), start=1):
+            try:
+                subprocess.run(
+                    cmd,
+                    check=True,
+                    capture_output=True,
+                    text=True,
+                )
+                return True
+            except subprocess.CalledProcessError as exc:
+                stderr = (exc.stderr or exc.stdout or str(exc)).strip()
+                errores.append(f"{etiqueta} {idx}: {stderr}")
+        return False
+
     errores = []
-    for idx, cmd in enumerate(comandos, start=1):
-        try:
-            subprocess.run(
-                cmd,
-                check=True,
-                capture_output=True,
-                text=True,
-            )
-            return ruta_salida
-        except subprocess.CalledProcessError as exc:
-            stderr = (exc.stderr or exc.stdout or str(exc)).strip()
-            errores.append(f"Intento {idx}: {stderr}")
+    if intentar_conversion(ruta_h264, "Intento"):
+        return ruta_salida
+
+    ruta_annexb = None
+    if not _tiene_start_codes(ruta_h264):
+        for longitud in LONGITUDES_NAL_H264:
+            with tempfile.NamedTemporaryFile(delete=False, suffix=".annexb.h264") as tmp:
+                ruta_annexb = tmp.name
+            if _convertir_longitudes_a_annexb(ruta_h264, ruta_annexb, longitud):
+                if intentar_conversion(ruta_annexb, f"Intento annexb-{longitud}"):
+                    os.remove(ruta_annexb)
+                    return ruta_salida
+            else:
+                errores.append(
+                    f"Intento annexb-{longitud}: no se pudo convertir longitudes a start codes"
+                )
+            if ruta_annexb and os.path.exists(ruta_annexb):
+                os.remove(ruta_annexb)
+            ruta_annexb = None
 
     if os.path.exists(ruta_salida):
         os.remove(ruta_salida)
