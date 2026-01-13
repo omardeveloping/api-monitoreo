@@ -17,6 +17,7 @@ EXTENSIONES_VALIDAS = {".mp4", ".h264"}
 MAX_BYTES_START_CODES = 1024 * 1024
 MAX_TAMANO_NAL = 50 * 1024 * 1024
 LONGITUDES_NAL_H264 = (4, 3)
+MAX_BYTES_SCAN_LONGITUD = 8 * 1024 * 1024
 
 
 def _tiene_start_codes(ruta_h264):
@@ -25,10 +26,12 @@ def _tiene_start_codes(ruta_h264):
     return b"\x00\x00\x00\x01" in data or b"\x00\x00\x01" in data
 
 
-def _convertir_longitudes_a_annexb(ruta_h264, ruta_salida, longitud_nal):
+def _convertir_longitudes_a_annexb(ruta_h264, ruta_salida, longitud_nal, offset=0):
     nals = 0
     try:
         with open(ruta_h264, "rb") as entrada, open(ruta_salida, "wb") as salida:
+            if offset:
+                entrada.seek(offset)
             while True:
                 size_bytes = entrada.read(longitud_nal)
                 if not size_bytes:
@@ -49,6 +52,79 @@ def _convertir_longitudes_a_annexb(ruta_h264, ruta_salida, longitud_nal):
                 nals += 1
     except OSError:
         return False
+
+
+def _buscar_offset_start_code(ruta_h264, max_bytes=None):
+    patrones = (b"\x00\x00\x00\x01", b"\x00\x00\x01")
+    chunk_size = 1024 * 1024
+    offset = 0
+    tail = b""
+    try:
+        with open(ruta_h264, "rb") as archivo:
+            while True:
+                if max_bytes is not None and offset >= max_bytes:
+                    return None
+                to_read = chunk_size
+                if max_bytes is not None:
+                    to_read = min(chunk_size, max_bytes - offset)
+                    if to_read <= 0:
+                        return None
+                chunk = archivo.read(to_read)
+                if not chunk:
+                    return None
+                data = tail + chunk
+                for patron in patrones:
+                    idx = data.find(patron)
+                    if idx != -1:
+                        return offset - len(tail) + idx
+                offset += len(chunk)
+                tail = data[-3:]
+    except OSError:
+        return None
+
+
+def _copiar_desde_offset(ruta_entrada, ruta_salida, offset):
+    try:
+        with open(ruta_entrada, "rb") as entrada, open(ruta_salida, "wb") as salida:
+            entrada.seek(offset)
+            while True:
+                chunk = entrada.read(1024 * 1024)
+                if not chunk:
+                    return True
+                salida.write(chunk)
+    except OSError:
+        return False
+
+
+def _parece_stream_longitudes(data, offset, longitud_nal, min_nals):
+    idx = offset
+    for _ in range(min_nals):
+        if idx + longitud_nal > len(data):
+            return False
+        nal_size = int.from_bytes(data[idx : idx + longitud_nal], "big")
+        if nal_size <= 0 or nal_size > MAX_TAMANO_NAL:
+            return False
+        idx += longitud_nal
+        if idx + nal_size > len(data):
+            return False
+        nal_type = data[idx] & 0x1F
+        if not 1 <= nal_type <= 31:
+            return False
+        idx += nal_size
+    return True
+
+
+def _buscar_offset_longitudes(ruta_h264, longitud_nal, max_scan=MAX_BYTES_SCAN_LONGITUD, min_nals=3):
+    try:
+        with open(ruta_h264, "rb") as archivo:
+            data = archivo.read(max_scan)
+    except OSError:
+        return None
+    data_len = len(data)
+    for offset in range(0, data_len - (longitud_nal + 1)):
+        if _parece_stream_longitudes(data, offset, longitud_nal, min_nals):
+            return offset
+    return None
 
 def validar_formato(video):
     content_type = (getattr(video, "content_type", "") or "").lower()
@@ -147,13 +223,58 @@ def envolver_h264_en_mp4(ruta_h264):
         for longitud in LONGITUDES_NAL_H264:
             with tempfile.NamedTemporaryFile(delete=False, suffix=".annexb.h264") as tmp:
                 ruta_annexb = tmp.name
-            if _convertir_longitudes_a_annexb(ruta_h264, ruta_annexb, longitud):
+            if _convertir_longitudes_a_annexb(ruta_h264, ruta_annexb, longitud, offset=0):
                 if intentar_conversion(ruta_annexb, f"Intento annexb-{longitud}"):
                     os.remove(ruta_annexb)
                     return ruta_salida
             else:
                 errores.append(
                     f"Intento annexb-{longitud}: no se pudo convertir longitudes a start codes"
+                )
+            if ruta_annexb and os.path.exists(ruta_annexb):
+                os.remove(ruta_annexb)
+            ruta_annexb = None
+
+        offset_start = _buscar_offset_start_code(ruta_h264)
+        ruta_recortada = None
+        if offset_start is not None and offset_start > 0:
+            with tempfile.NamedTemporaryFile(delete=False, suffix=".h264") as tmp:
+                ruta_recortada = tmp.name
+            if _copiar_desde_offset(ruta_h264, ruta_recortada, offset_start):
+                if intentar_conversion(
+                    ruta_recortada, f"Intento recorte-startcode@{offset_start}"
+                ):
+                    os.remove(ruta_recortada)
+                    return ruta_salida
+            else:
+                errores.append(
+                    "Intento recorte-startcode: no se pudo copiar el stream desde el offset"
+                )
+            if ruta_recortada and os.path.exists(ruta_recortada):
+                os.remove(ruta_recortada)
+        else:
+            errores.append("Intento recorte-startcode: no se encontró start code en el archivo")
+
+        for longitud in LONGITUDES_NAL_H264:
+            offset = _buscar_offset_longitudes(ruta_h264, longitud)
+            if offset is None:
+                errores.append(
+                    f"Intento annexb-{longitud}-offset: no se encontró un offset válido"
+                )
+                continue
+            if offset == 0:
+                continue
+            with tempfile.NamedTemporaryFile(delete=False, suffix=".annexb.h264") as tmp:
+                ruta_annexb = tmp.name
+            if _convertir_longitudes_a_annexb(ruta_h264, ruta_annexb, longitud, offset=offset):
+                if intentar_conversion(
+                    ruta_annexb, f"Intento annexb-{longitud}-offset@{offset}"
+                ):
+                    os.remove(ruta_annexb)
+                    return ruta_salida
+            else:
+                errores.append(
+                    f"Intento annexb-{longitud}-offset@{offset}: no se pudo convertir longitudes a start codes"
                 )
             if ruta_annexb and os.path.exists(ruta_annexb):
                 os.remove(ruta_annexb)
