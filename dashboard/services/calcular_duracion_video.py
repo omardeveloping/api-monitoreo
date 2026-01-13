@@ -31,27 +31,80 @@ def envolver_h264_en_mp4(ruta_h264):
         raise ValidationError("No se encontró la ruta del archivo H264.")
 
     ruta_salida = os.path.splitext(ruta_h264)[0] + ".mp4"
-    try:
-        subprocess.run(
-            [
-                "ffmpeg",
-                "-y",
-                "-i",
-                ruta_h264,
-                "-c",
-                "copy",
-                "-movflags",
-                "+faststart",
-                ruta_salida,
-            ],
-            check=True,
-            capture_output=True,
-            text=True,
-        )
-    except subprocess.CalledProcessError as exc:
-        raise ValidationError(f"No se pudo convertir el video a MP4: {exc.stderr}") from exc
+    comandos = [
+        [
+            "ffmpeg",
+            "-y",
+            "-i",
+            ruta_h264,
+            "-c",
+            "copy",
+            "-movflags",
+            "+faststart",
+            ruta_salida,
+        ],
+        [
+            "ffmpeg",
+            "-y",
+            "-probesize",
+            "50M",
+            "-analyzeduration",
+            "50M",
+            "-fflags",
+            "+genpts",
+            "-i",
+            ruta_h264,
+            "-c",
+            "copy",
+            "-movflags",
+            "+faststart",
+            ruta_salida,
+        ],
+        [
+            "ffmpeg",
+            "-y",
+            "-probesize",
+            "50M",
+            "-analyzeduration",
+            "50M",
+            "-fflags",
+            "+genpts",
+            "-i",
+            ruta_h264,
+            "-c:v",
+            "libx264",
+            "-preset",
+            "veryfast",
+            "-crf",
+            "23",
+            "-pix_fmt",
+            "yuv420p",
+            "-movflags",
+            "+faststart",
+            ruta_salida,
+        ],
+    ]
+    errores = []
+    for idx, cmd in enumerate(comandos, start=1):
+        try:
+            subprocess.run(
+                cmd,
+                check=True,
+                capture_output=True,
+                text=True,
+            )
+            return ruta_salida
+        except subprocess.CalledProcessError as exc:
+            stderr = (exc.stderr or exc.stdout or str(exc)).strip()
+            errores.append(f"Intento {idx}: {stderr}")
 
-    return ruta_salida
+    if os.path.exists(ruta_salida):
+        os.remove(ruta_salida)
+
+    detalles = "\n\n".join(errores) if errores else "Sin detalles del error."
+    raise ValidationError(
+        f"No se pudo convertir el video a MP4 tras varios intentos:\n{detalles}"
+    )
 
 
 def calcular_duracion_video(video):
