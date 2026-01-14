@@ -1,6 +1,7 @@
 services:
   web:
     build: .
+    restart: unless-stopped
     expose:
       - "8000"
     ports:
@@ -20,6 +21,7 @@ services:
 
   celery:
     build: .
+    restart: unless-stopped
     command: celery -A apiMonitoreo worker -l info
     environment:
       DJANGO_DEBUG: "${DJANGO_DEBUG:-1}"
@@ -36,6 +38,7 @@ services:
 
   celery-beat:
     build: .
+    restart: unless-stopped
     command: celery -A apiMonitoreo beat -l info
     environment:
       DJANGO_DEBUG: "${DJANGO_DEBUG:-1}"
@@ -52,6 +55,7 @@ services:
 
   redis:
     image: redis:7-alpine
+    restart: unless-stopped
 
 volumes:
   sqlite_data:
