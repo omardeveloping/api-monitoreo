@@ -18,6 +18,8 @@ MAX_BYTES_START_CODES = 1024 * 1024
 MAX_TAMANO_NAL = 50 * 1024 * 1024
 LONGITUDES_NAL_H264 = (4, 3)
 MAX_BYTES_SCAN_LONGITUD = 8 * 1024 * 1024
+CODECS_VIDEO_MP4_COMPATIBLES = {"h264"}
+PIX_FMT_MP4_COMPATIBLES = {"yuv420p"}
 
 
 def _tiene_start_codes(ruta_h264):
@@ -125,6 +127,86 @@ def _buscar_offset_longitudes(ruta_h264, longitud_nal, max_scan=MAX_BYTES_SCAN_L
         if _parece_stream_longitudes(data, offset, longitud_nal, min_nals):
             return offset
     return None
+
+
+def _obtener_stream_video(ruta_video):
+    probe = subprocess.run(
+        [
+            "ffprobe",
+            "-v",
+            "error",
+            "-select_streams",
+            "v:0",
+            "-show_entries",
+            "stream=codec_name,codec_tag_string,pix_fmt,profile,level",
+            "-of",
+            "json",
+            ruta_video,
+        ],
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+    data = json.loads(probe.stdout)
+    streams = data.get("streams", [])
+    return streams[0] if streams else None
+
+
+def _mp4_es_compatible(stream_info):
+    codec = (stream_info.get("codec_name") or "").lower()
+    pix_fmt = (stream_info.get("pix_fmt") or "").lower()
+    return codec in CODECS_VIDEO_MP4_COMPATIBLES and pix_fmt in PIX_FMT_MP4_COMPATIBLES
+
+
+def asegurar_mp4_compatible(ruta_mp4):
+    stream_info = _obtener_stream_video(ruta_mp4)
+    if not stream_info:
+        raise ValidationError("El archivo MP4 no contiene pista de video.")
+    if _mp4_es_compatible(stream_info):
+        return False
+
+    with tempfile.NamedTemporaryFile(delete=False, suffix=".mp4") as tmp:
+        ruta_salida = tmp.name
+
+    cmd = [
+        "ffmpeg",
+        "-y",
+        "-i",
+        ruta_mp4,
+        "-map",
+        "0:v:0",
+        "-map",
+        "0:a?",
+        "-c:v",
+        "libx264",
+        "-preset",
+        "veryfast",
+        "-crf",
+        "23",
+        "-pix_fmt",
+        "yuv420p",
+        "-profile:v",
+        "high",
+        "-level",
+        "4.1",
+        "-c:a",
+        "aac",
+        "-b:a",
+        "128k",
+        "-movflags",
+        "+faststart",
+        ruta_salida,
+    ]
+    try:
+        subprocess.run(cmd, check=True, capture_output=True, text=True)
+    except subprocess.CalledProcessError as exc:
+        stderr = (exc.stderr or exc.stdout or str(exc)).strip()
+        if os.path.exists(ruta_salida):
+            os.remove(ruta_salida)
+        raise ValidationError(f"No se pudo convertir el MP4 a un formato compatible: {stderr}")
+
+    os.replace(ruta_salida, ruta_mp4)
+    return True
 
 def validar_formato(video):
     content_type = (getattr(video, "content_type", "") or "").lower()
@@ -315,6 +397,10 @@ def procesar_video_subida(video_obj, archivo):
         if content_type in {"video/h264", "video/x-h264"} or ruta_original.lower().endswith(".h264"):
             ruta_convertida = envolver_h264_en_mp4(ruta_original)
             video_obj.ruta_archivo.name = os.path.relpath(ruta_convertida, settings.MEDIA_ROOT)
+
+        ruta_final = video_obj.ruta_archivo.path
+        if ruta_final.lower().endswith(".mp4"):
+            asegurar_mp4_compatible(ruta_final)
 
         video_obj.duracion = math.floor(calcular_duracion_video(video_obj.ruta_archivo.path))
         video_obj.estado = EstadoVideo.LISTO
