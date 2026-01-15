@@ -344,7 +344,7 @@ def _transcodificar_mp4(ruta_mp4, stream_info):
             os.remove(ruta_salida)
         raise ValidationError(f"No se pudo convertir el MP4 a un formato compatible: {stderr}")
 
-    salida_stream = _seleccionar_stream_video(_obtener_streams_video(ruta_salida))
+    salida_stream = _seleccionar_stream_video(_obtener_streams(ruta_salida))
     if not salida_stream:
         if os.path.exists(ruta_salida):
             os.remove(ruta_salida)
