@@ -7,10 +7,31 @@ class CamionSerializer(serializers.ModelSerializer):
         fields = ['id', 'patente', 'marca', 'ano', 'disponible', 'ultimo_mantenimiento']
 
 class TurnoSerializer(serializers.ModelSerializer):
+    def validate(self, attrs):
+        tipo_turno = attrs.get("tipo_turno")
+        if self.instance is not None and tipo_turno is None:
+            tipo_turno = self.instance.tipo_turno
+        if tipo_turno:
+            return attrs
+
+        hora_inicio = attrs.get("hora_inicio")
+        hora_fin = attrs.get("hora_fin")
+        if self.instance is not None:
+            if hora_inicio is None:
+                hora_inicio = self.instance.hora_inicio
+            if hora_fin is None:
+                hora_fin = self.instance.hora_fin
+
+        if not hora_inicio or not hora_fin:
+            raise serializers.ValidationError(
+                "Debe indicar tipo_turno o ambas horas (hora_inicio y hora_fin)."
+            )
+        return attrs
+
     class Meta:
         model = Turno
         fields = ['id', 'fecha', 'hora_inicio', 'hora_fin', 'id_camion', 'operador', 'tipo_turno', 'activo', 'completado']
-        read_only_fields = ['hora_inicio', 'hora_fin', 'completado']
+        read_only_fields = ['completado']
 
 class VideoSerializer(serializers.ModelSerializer):
     def to_representation(self, instance):
