@@ -290,7 +290,8 @@ def _mp4_requiere_transcodificacion(stream_info, audio_stream):
 
 
 def _transcodificar_mp4(ruta_mp4, stream_info):
-    with tempfile.NamedTemporaryFile(delete=False, suffix=".mp4") as tmp:
+    destino_dir = os.path.dirname(ruta_mp4) or "."
+    with tempfile.NamedTemporaryFile(delete=False, suffix=".mp4", dir=destino_dir) as tmp:
         ruta_salida = tmp.name
 
     video_index = stream_info.get("index")
