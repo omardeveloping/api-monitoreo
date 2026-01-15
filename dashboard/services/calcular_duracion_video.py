@@ -28,6 +28,14 @@ PERFILES_VIDEO_MP4_COMPATIBLES = {
     "high",
 }
 NIVEL_MP4_COMPATIBLE_MAX = 41
+FORZAR_TRANSCODIFICACION_MP4 = os.environ.get("FORZAR_TRANSCODIFICACION_MP4", "0") == "1"
+_AUDIO_SAMPLE_RATE_MP4_DEFAULT = 44100
+try:
+    AUDIO_SAMPLE_RATE_MP4 = int(
+        os.environ.get("MP4_AUDIO_SAMPLE_RATE", _AUDIO_SAMPLE_RATE_MP4_DEFAULT)
+    )
+except ValueError:
+    AUDIO_SAMPLE_RATE_MP4 = _AUDIO_SAMPLE_RATE_MP4_DEFAULT
 
 
 def _tiene_start_codes(ruta_h264):
@@ -192,26 +200,18 @@ def _mp4_es_compatible(stream_info):
     return True
 
 
-def asegurar_mp4_compatible(ruta_mp4):
-    streams = _obtener_streams_video(ruta_mp4)
-    stream_info = _seleccionar_stream_video(streams)
-    if not stream_info:
-        raise ValidationError("El archivo MP4 no contiene pista de video.")
-    if _mp4_es_compatible(stream_info):
-        return False
-
+def _transcodificar_mp4(ruta_mp4, stream_info):
     with tempfile.NamedTemporaryFile(delete=False, suffix=".mp4") as tmp:
         ruta_salida = tmp.name
 
     video_index = stream_info.get("index")
-    if video_index is None:
-        map_video = "0:v:0"
-    else:
-        map_video = f"0:{video_index}"
+    map_video = f"0:{video_index}" if video_index is not None else "0:v:0"
 
     cmd = [
         "ffmpeg",
         "-y",
+        "-fflags",
+        "+genpts",
         "-i",
         ruta_mp4,
         "-map",
@@ -226,14 +226,12 @@ def asegurar_mp4_compatible(ruta_mp4):
         "23",
         "-pix_fmt",
         "yuv420p",
-        "-profile:v",
-        "high",
-        "-level",
-        "4.1",
         "-c:a",
         "aac",
         "-b:a",
         "128k",
+        "-ar",
+        str(AUDIO_SAMPLE_RATE_MP4),
         "-movflags",
         "+faststart",
         ruta_salida,
@@ -258,6 +256,16 @@ def asegurar_mp4_compatible(ruta_mp4):
 
     os.replace(ruta_salida, ruta_mp4)
     return True
+
+
+def asegurar_mp4_compatible(ruta_mp4):
+    streams = _obtener_streams_video(ruta_mp4)
+    stream_info = _seleccionar_stream_video(streams)
+    if not stream_info:
+        raise ValidationError("El archivo MP4 no contiene pista de video.")
+    if not FORZAR_TRANSCODIFICACION_MP4 and _mp4_es_compatible(stream_info):
+        return False
+    return _transcodificar_mp4(ruta_mp4, stream_info)
 
 def validar_formato(video):
     content_type = (getattr(video, "content_type", "") or "").lower()
