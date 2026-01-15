@@ -20,6 +20,14 @@ LONGITUDES_NAL_H264 = (4, 3)
 MAX_BYTES_SCAN_LONGITUD = 8 * 1024 * 1024
 CODECS_VIDEO_MP4_COMPATIBLES = {"h264"}
 PIX_FMT_MP4_COMPATIBLES = {"yuv420p"}
+CODEC_TAGS_VIDEO_MP4_COMPATIBLES = {"avc1"}
+PERFILES_VIDEO_MP4_COMPATIBLES = {
+    "baseline",
+    "constrained baseline",
+    "main",
+    "high",
+}
+NIVEL_MP4_COMPATIBLE_MAX = 41
 
 
 def _tiene_start_codes(ruta_h264):
@@ -129,16 +137,16 @@ def _buscar_offset_longitudes(ruta_h264, longitud_nal, max_scan=MAX_BYTES_SCAN_L
     return None
 
 
-def _obtener_stream_video(ruta_video):
+def _obtener_streams_video(ruta_video):
     probe = subprocess.run(
         [
             "ffprobe",
             "-v",
             "error",
             "-select_streams",
-            "v:0",
+            "v",
             "-show_entries",
-            "stream=codec_name,codec_tag_string,pix_fmt,profile,level",
+            "stream=index,codec_name,codec_tag_string,pix_fmt,profile,level,disposition",
             "-of",
             "json",
             ruta_video,
@@ -148,18 +156,45 @@ def _obtener_stream_video(ruta_video):
         check=True,
     )
     data = json.loads(probe.stdout)
-    streams = data.get("streams", [])
-    return streams[0] if streams else None
+    return data.get("streams", [])
+
+
+def _seleccionar_stream_video(streams):
+    for stream in streams:
+        disposition = stream.get("disposition") or {}
+        if disposition.get("attached_pic"):
+            continue
+        return stream
+    return None
 
 
 def _mp4_es_compatible(stream_info):
     codec = (stream_info.get("codec_name") or "").lower()
     pix_fmt = (stream_info.get("pix_fmt") or "").lower()
-    return codec in CODECS_VIDEO_MP4_COMPATIBLES and pix_fmt in PIX_FMT_MP4_COMPATIBLES
+    codec_tag = (stream_info.get("codec_tag_string") or "").lower()
+    profile = (stream_info.get("profile") or "").lower()
+    level = stream_info.get("level")
+
+    if codec not in CODECS_VIDEO_MP4_COMPATIBLES:
+        return False
+    if pix_fmt not in PIX_FMT_MP4_COMPATIBLES:
+        return False
+    if not codec_tag or codec_tag not in CODEC_TAGS_VIDEO_MP4_COMPATIBLES:
+        return False
+    if not profile or profile not in PERFILES_VIDEO_MP4_COMPATIBLES:
+        return False
+    if level is not None:
+        try:
+            if int(level) > NIVEL_MP4_COMPATIBLE_MAX:
+                return False
+        except (TypeError, ValueError):
+            return False
+    return True
 
 
 def asegurar_mp4_compatible(ruta_mp4):
-    stream_info = _obtener_stream_video(ruta_mp4)
+    streams = _obtener_streams_video(ruta_mp4)
+    stream_info = _seleccionar_stream_video(streams)
     if not stream_info:
         raise ValidationError("El archivo MP4 no contiene pista de video.")
     if _mp4_es_compatible(stream_info):
@@ -168,13 +203,19 @@ def asegurar_mp4_compatible(ruta_mp4):
     with tempfile.NamedTemporaryFile(delete=False, suffix=".mp4") as tmp:
         ruta_salida = tmp.name
 
+    video_index = stream_info.get("index")
+    if video_index is None:
+        map_video = "0:v:0"
+    else:
+        map_video = f"0:{video_index}"
+
     cmd = [
         "ffmpeg",
         "-y",
         "-i",
         ruta_mp4,
         "-map",
-        "0:v:0",
+        map_video,
         "-map",
         "0:a?",
         "-c:v",
@@ -204,6 +245,16 @@ def asegurar_mp4_compatible(ruta_mp4):
         if os.path.exists(ruta_salida):
             os.remove(ruta_salida)
         raise ValidationError(f"No se pudo convertir el MP4 a un formato compatible: {stderr}")
+
+    salida_stream = _seleccionar_stream_video(_obtener_streams_video(ruta_salida))
+    if not salida_stream:
+        if os.path.exists(ruta_salida):
+            os.remove(ruta_salida)
+        raise ValidationError("El MP4 convertido no contiene pista de video.")
+    if not _mp4_es_compatible(salida_stream):
+        if os.path.exists(ruta_salida):
+            os.remove(ruta_salida)
+        raise ValidationError("El MP4 convertido no es compatible con navegadores.")
 
     os.replace(ruta_salida, ruta_mp4)
     return True
