@@ -29,6 +29,7 @@ PERFILES_VIDEO_MP4_COMPATIBLES = {
 }
 NIVEL_MP4_COMPATIBLE_MAX = 41
 FORZAR_TRANSCODIFICACION_MP4 = os.environ.get("FORZAR_TRANSCODIFICACION_MP4", "0") == "1"
+PERMISOS_ARCHIVO_VIDEO = 0o644
 _AUDIO_SAMPLE_RATE_MP4_DEFAULT = 44100
 _AUDIO_SAMPLE_RATE_MIN_DEFAULT = 22050
 _FPS_DIFF_UMBRAL_DEFAULT = 0.02
@@ -356,6 +357,10 @@ def _transcodificar_mp4(ruta_mp4, stream_info):
         raise ValidationError("El MP4 convertido no es compatible con navegadores.")
 
     os.replace(ruta_salida, ruta_mp4)
+    try:
+        os.chmod(ruta_mp4, PERMISOS_ARCHIVO_VIDEO)
+    except OSError:
+        pass
     return True
 
 
