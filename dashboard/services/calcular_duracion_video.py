@@ -30,12 +30,27 @@ PERFILES_VIDEO_MP4_COMPATIBLES = {
 NIVEL_MP4_COMPATIBLE_MAX = 41
 FORZAR_TRANSCODIFICACION_MP4 = os.environ.get("FORZAR_TRANSCODIFICACION_MP4", "0") == "1"
 _AUDIO_SAMPLE_RATE_MP4_DEFAULT = 44100
+_AUDIO_SAMPLE_RATE_MIN_DEFAULT = 22050
+_FPS_DIFF_UMBRAL_DEFAULT = 0.02
+MP4_VIDEO_PROFILE = (os.environ.get("MP4_VIDEO_PROFILE", "baseline") or "").strip().lower()
+MP4_VIDEO_LEVEL = (os.environ.get("MP4_VIDEO_LEVEL", "") or "").strip()
+MP4_TARGET_FPS = (os.environ.get("MP4_TARGET_FPS", "") or "").strip()
 try:
     AUDIO_SAMPLE_RATE_MP4 = int(
         os.environ.get("MP4_AUDIO_SAMPLE_RATE", _AUDIO_SAMPLE_RATE_MP4_DEFAULT)
     )
 except ValueError:
     AUDIO_SAMPLE_RATE_MP4 = _AUDIO_SAMPLE_RATE_MP4_DEFAULT
+try:
+    AUDIO_SAMPLE_RATE_MIN_MP4 = int(
+        os.environ.get("MP4_AUDIO_SAMPLE_RATE_MIN", _AUDIO_SAMPLE_RATE_MIN_DEFAULT)
+    )
+except ValueError:
+    AUDIO_SAMPLE_RATE_MIN_MP4 = _AUDIO_SAMPLE_RATE_MIN_DEFAULT
+try:
+    FPS_DIFF_UMBRAL = float(os.environ.get("MP4_FPS_DIFF_UMBRAL", _FPS_DIFF_UMBRAL_DEFAULT))
+except ValueError:
+    FPS_DIFF_UMBRAL = _FPS_DIFF_UMBRAL_DEFAULT
 
 
 def _tiene_start_codes(ruta_h264):
@@ -145,16 +160,14 @@ def _buscar_offset_longitudes(ruta_h264, longitud_nal, max_scan=MAX_BYTES_SCAN_L
     return None
 
 
-def _obtener_streams_video(ruta_video):
+def _obtener_streams(ruta_video):
     probe = subprocess.run(
         [
             "ffprobe",
             "-v",
             "error",
-            "-select_streams",
-            "v",
             "-show_entries",
-            "stream=index,codec_name,codec_tag_string,pix_fmt,profile,level,disposition",
+            "stream=index,codec_type,codec_name,codec_tag_string,pix_fmt,profile,level,disposition,r_frame_rate,avg_frame_rate,sample_rate",
             "-of",
             "json",
             ruta_video,
@@ -172,8 +185,38 @@ def _seleccionar_stream_video(streams):
         disposition = stream.get("disposition") or {}
         if disposition.get("attached_pic"):
             continue
+        if stream.get("codec_type") != "video":
+            continue
         return stream
     return None
+
+
+def _seleccionar_stream_audio(streams):
+    for stream in streams:
+        if stream.get("codec_type") == "audio":
+            return stream
+    return None
+
+
+def _parsear_fraccion(valor):
+    if not valor or valor == "0/0":
+        return None
+    if isinstance(valor, (int, float)):
+        return float(valor)
+    if "/" not in valor:
+        try:
+            return float(valor)
+        except ValueError:
+            return None
+    num, den = valor.split("/", 1)
+    try:
+        num = float(num)
+        den = float(den)
+    except ValueError:
+        return None
+    if den == 0:
+        return None
+    return num / den
 
 
 def _mp4_es_compatible(stream_info):
@@ -200,12 +243,63 @@ def _mp4_es_compatible(stream_info):
     return True
 
 
+def _debe_normalizar_fps(stream_info):
+    if MP4_TARGET_FPS:
+        return True
+    r_fps = _parsear_fraccion(stream_info.get("r_frame_rate"))
+    avg_fps = _parsear_fraccion(stream_info.get("avg_frame_rate"))
+    if not r_fps or not avg_fps:
+        return False
+    if r_fps == 0:
+        return False
+    return abs(r_fps - avg_fps) / r_fps > FPS_DIFF_UMBRAL
+
+
+def _obtener_fps_expr(stream_info):
+    if MP4_TARGET_FPS:
+        return MP4_TARGET_FPS
+    r_rate = stream_info.get("r_frame_rate")
+    avg_rate = stream_info.get("avg_frame_rate")
+    r_fps = _parsear_fraccion(r_rate)
+    avg_fps = _parsear_fraccion(avg_rate)
+    if r_fps and avg_fps:
+        if abs(r_fps - avg_fps) / r_fps > FPS_DIFF_UMBRAL:
+            return r_rate
+        return avg_rate
+    return r_rate or avg_rate
+
+
+def _audio_muy_baja(audio_stream):
+    if not audio_stream:
+        return False
+    sample_rate = audio_stream.get("sample_rate")
+    try:
+        return int(sample_rate) < AUDIO_SAMPLE_RATE_MIN_MP4
+    except (TypeError, ValueError):
+        return False
+
+
+def _mp4_requiere_transcodificacion(stream_info, audio_stream):
+    if not _mp4_es_compatible(stream_info):
+        return True
+    if _debe_normalizar_fps(stream_info):
+        return True
+    if _audio_muy_baja(audio_stream):
+        return True
+    return False
+
+
 def _transcodificar_mp4(ruta_mp4, stream_info):
     with tempfile.NamedTemporaryFile(delete=False, suffix=".mp4") as tmp:
         ruta_salida = tmp.name
 
     video_index = stream_info.get("index")
     map_video = f"0:{video_index}" if video_index is not None else "0:v:0"
+
+    fps_expr = _obtener_fps_expr(stream_info)
+    filtro_video = "format=yuv420p"
+    if fps_expr:
+        filtro_video = f"fps={fps_expr},{filtro_video}"
 
     cmd = [
         "ffmpeg",
@@ -226,6 +320,8 @@ def _transcodificar_mp4(ruta_mp4, stream_info):
         "23",
         "-pix_fmt",
         "yuv420p",
+        "-vf",
+        filtro_video,
         "-c:a",
         "aac",
         "-b:a",
@@ -236,6 +332,10 @@ def _transcodificar_mp4(ruta_mp4, stream_info):
         "+faststart",
         ruta_salida,
     ]
+    if MP4_VIDEO_PROFILE:
+        cmd.extend(["-profile:v", MP4_VIDEO_PROFILE])
+    if MP4_VIDEO_LEVEL:
+        cmd.extend(["-level", MP4_VIDEO_LEVEL])
     try:
         subprocess.run(cmd, check=True, capture_output=True, text=True)
     except subprocess.CalledProcessError as exc:
@@ -259,11 +359,14 @@ def _transcodificar_mp4(ruta_mp4, stream_info):
 
 
 def asegurar_mp4_compatible(ruta_mp4):
-    streams = _obtener_streams_video(ruta_mp4)
+    streams = _obtener_streams(ruta_mp4)
     stream_info = _seleccionar_stream_video(streams)
+    audio_stream = _seleccionar_stream_audio(streams)
     if not stream_info:
         raise ValidationError("El archivo MP4 no contiene pista de video.")
-    if not FORZAR_TRANSCODIFICACION_MP4 and _mp4_es_compatible(stream_info):
+    if not FORZAR_TRANSCODIFICACION_MP4 and not _mp4_requiere_transcodificacion(
+        stream_info, audio_stream
+    ):
         return False
     return _transcodificar_mp4(ruta_mp4, stream_info)
 
