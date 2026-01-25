@@ -1,6 +1,8 @@
 import shutil
 from datetime import datetime, timedelta
 from rest_framework import viewsets, status
+from rest_framework.exceptions import ValidationError
+from rest_framework.parsers import FormParser, MultiPartParser
 from rest_framework.response import Response
 from rest_framework.decorators import action
 from django.conf import settings
@@ -10,6 +12,7 @@ from .serializers import (
     CamionSerializer,
     TurnoSerializer,
     VideoSerializer,
+    VelocidadVideoSerializer,
     OperadorSerializer,
     IncidenteSerializer,
     AsignacionTurnoSerializer,
@@ -18,6 +21,7 @@ from .serializers import (
 from dashboard.services.calcular_duracion_video import (
     procesar_video_subida,
 )
+from dashboard.services.importar_velocidades_csv import importar_velocidades_csv
 
 
 class CamionViewSet(viewsets.ModelViewSet):
@@ -77,6 +81,48 @@ class VideoViewSet(viewsets.ModelViewSet):
         self.perform_create(serializer)
         headers = self.get_success_headers(serializer.data)
         return Response(serializer.data, status=status.HTTP_201_CREATED, headers=headers)
+
+    @action(
+        detail=True,
+        methods=["post"],
+        url_path="velocidades-csv",
+        parser_classes=[MultiPartParser, FormParser],
+    )
+    def cargar_velocidades_csv(self, request, pk=None):
+        video = self.get_object()
+        archivo = request.FILES.get("archivo") or request.FILES.get("csv")
+        if not archivo:
+            raise ValidationError("Debe adjuntar un archivo CSV en el campo 'archivo'.")
+        resultado = importar_velocidades_csv(video, archivo)
+        return Response(resultado, status=status.HTTP_201_CREATED)
+
+    @action(detail=True, methods=["get"], url_path="velocidades")
+    def velocidades(self, request, pk=None):
+        video = self.get_object()
+        queryset = video.velocidades.all().order_by("segundo")
+
+        desde = request.query_params.get("desde")
+        if desde is not None:
+            try:
+                desde = int(desde)
+            except ValueError as exc:
+                raise ValidationError("Parametro 'desde' invalido.") from exc
+            queryset = queryset.filter(segundo__gte=desde)
+
+        hasta = request.query_params.get("hasta")
+        if hasta is not None:
+            try:
+                hasta = int(hasta)
+            except ValueError as exc:
+                raise ValidationError("Parametro 'hasta' invalido.") from exc
+            queryset = queryset.filter(segundo__lte=hasta)
+
+        page = self.paginate_queryset(queryset)
+        if page is not None:
+            serializer = VelocidadVideoSerializer(page, many=True)
+            return self.get_paginated_response(serializer.data)
+        serializer = VelocidadVideoSerializer(queryset, many=True)
+        return Response(serializer.data)
 
     @action(detail=False, methods=["get"], url_path="conteo-hoy")
     def conteo_hoy(self, request):

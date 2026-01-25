@@ -91,7 +91,7 @@ class Video(models.Model):
     camara = models.IntegerField(choices=NumeroCamara.choices)
     ruta_archivo = models.FileField(upload_to='videos/')
     mimetype = models.CharField(max_length=100, blank=True, default="")
-    hora_inicio = models.TimeField(null=True, blank=True)
+    fecha_inicio = models.DateTimeField(null=True, blank=True)
     duracion = models.IntegerField(null=True, blank=True)
     inicio_timestamp = models.TimeField(default=time(0, 0), null=True, blank=True)
     fin_timestamp = models.TimeField(null=True, blank=True)
@@ -106,6 +106,25 @@ class Video(models.Model):
 
     def __str__(self):
         return self.nombre
+
+
+class VelocidadVideo(models.Model):
+    video = models.ForeignKey(Video, on_delete=models.CASCADE, related_name="velocidades")
+    segundo = models.PositiveIntegerField()
+    velocidad_kmh = models.FloatField()
+    timestamp_csv = models.DateTimeField(null=True, blank=True)
+    interpolado = models.BooleanField(default=False)
+    sin_datos = models.BooleanField(default=False)
+    creado_en = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        unique_together = ("video", "segundo")
+        indexes = [
+            models.Index(fields=["video", "segundo"], name="velocidad_video_segundo_idx"),
+        ]
+
+    def __str__(self):
+        return f"{self.video_id} @ {self.segundo}s: {self.velocidad_kmh} km/h"
 
 
 class Operador(models.Model):

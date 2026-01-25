@@ -1,5 +1,15 @@
 from rest_framework import serializers
-from .models import Camion, Turno, Video, EstadoVideo, Operador, Incidente, AsignacionTurno, Mantenimiento
+from .models import (
+    Camion,
+    Turno,
+    Video,
+    EstadoVideo,
+    Operador,
+    Incidente,
+    AsignacionTurno,
+    Mantenimiento,
+    VelocidadVideo,
+)
 
 class CamionSerializer(serializers.ModelSerializer):
     class Meta:
@@ -51,7 +61,7 @@ class VideoSerializer(serializers.ModelSerializer):
             'camara',
             'ruta_archivo',
             'fecha_subida',
-            'hora_inicio',
+            'fecha_inicio',
             'duracion',
             'inicio_timestamp',
             'fin_timestamp',
@@ -59,6 +69,21 @@ class VideoSerializer(serializers.ModelSerializer):
             'estado',
             'id_turno',
         ]
+
+
+class VelocidadVideoSerializer(serializers.ModelSerializer):
+    class Meta:
+        model = VelocidadVideo
+        fields = [
+            "id",
+            "video",
+            "segundo",
+            "velocidad_kmh",
+            "timestamp_csv",
+            "interpolado",
+            "sin_datos",
+        ]
+        read_only_fields = ["id", "video"]
 
 
 class AsignacionTurnoSerializer(serializers.ModelSerializer):
