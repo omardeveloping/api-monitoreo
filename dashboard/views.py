@@ -1,4 +1,5 @@
 import os
+import re
 import shutil
 from datetime import datetime, timedelta
 from rest_framework import viewsets, status
@@ -27,6 +28,48 @@ from dashboard.services.calcular_duracion_video import (
     procesar_video_subida,
 )
 from dashboard.services.importar_velocidades_csv import importar_velocidades_csv
+
+_PATRON_NOMBRE_VIDEO = re.compile(
+    r"^(?P<equipo>\d+)-(?P<fecha>\d{6})-(?P<inicio>\d{6})-(?P<fin>\d{6})-(?P<codigo>\d+)$"
+)
+
+
+def _formatear_nombre_archivo(nombre_archivo: str) -> str:
+    base, _ext = os.path.splitext(nombre_archivo or "")
+    match = _PATRON_NOMBRE_VIDEO.match(base)
+    if not match:
+        return nombre_archivo
+
+    fecha = match.group("fecha")
+    try:
+        dia = int(fecha[0:2])
+        mes = int(fecha[2:4])
+        ano = 2000 + int(fecha[4:6])
+        datetime(ano, mes, dia)
+    except (ValueError, TypeError):
+        return nombre_archivo
+
+    def _formatear_hora(valor: str) -> str | None:
+        try:
+            hh = int(valor[0:2])
+            mm = int(valor[2:4])
+            ss = int(valor[4:6])
+        except (ValueError, TypeError):
+            return None
+        if not (0 <= hh < 24 and 0 <= mm < 60 and 0 <= ss < 60):
+            return None
+        return f"{hh:02d}:{mm:02d}:{ss:02d}"
+
+    inicio = _formatear_hora(match.group("inicio"))
+    fin = _formatear_hora(match.group("fin"))
+    if not inicio or not fin:
+        return nombre_archivo
+
+    fecha_formateada = f"{ano:04d}-{mes:02d}-{dia:02d}"
+    return (
+        f"{match.group('equipo')} | {fecha_formateada} | {inicio}-{fin} | "
+        f"{match.group('codigo')}"
+    )
 
 
 class CamionViewSet(viewsets.ModelViewSet):
@@ -184,6 +227,7 @@ class VideoViewSet(viewsets.ModelViewSet):
                     {
                         "ruta_origen": ruta_relativa.replace(os.sep, "/"),
                         "nombre_archivo": nombre,
+                        "nombre_formateado": _formatear_nombre_archivo(nombre),
                         "tamano_bytes": stat.st_size,
                         "modificado_en": datetime.fromtimestamp(
                             stat.st_mtime, tz=timezone.get_current_timezone()
