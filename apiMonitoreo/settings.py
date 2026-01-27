@@ -210,6 +210,9 @@ STATIC_ROOT = BASE_DIR / "staticfiles"
 MEDIA_URL = '/media/'
 MEDIA_ROOT = BASE_DIR / "media"
 
+# Directorio base para importar videos locales (sin subirlos por HTTP).
+VIDEOS_IMPORT_DIR = os.environ.get("VIDEOS_IMPORT_DIR", "")
+
 # Ruta a monitorear para uso de disco. Cambia con la variable de entorno ESPACIO_DISCO_RUTA.
 ESPACIO_DISCO_RUTA = os.environ.get("ESPACIO_DISCO_RUTA", "/")
 

@@ -13,7 +13,8 @@ from dashboard.models import EstadoVideo
 
 ### Tengo que acordarme de poner constantes en mayusculas
 FORMATO_VIDEO_VALIDO = {"video/mp4", "video/h264", "video/x-h264"}
-EXTENSIONES_VALIDAS = {".mp4", ".h264"}
+H264_EXTENSIONS = {".h264", ".grec"}
+EXTENSIONES_VALIDAS = {".mp4", *H264_EXTENSIONS}
 MAX_BYTES_START_CODES = 1024 * 1024
 MAX_TAMANO_NAL = 50 * 1024 * 1024
 LONGITUDES_NAL_H264 = (4, 3)
@@ -385,7 +386,9 @@ def validar_formato(video):
     permitido_por_extension = extension in EXTENSIONES_VALIDAS
 
     if not video or not (permitido_por_content_type or permitido_por_extension):
-        raise ValidationError("Formato de video no válido. Solo se permiten archivos MP4 o H264.")
+        raise ValidationError(
+            "Formato de video no válido. Solo se permiten archivos MP4, H264 o GREC."
+        )
 
 
 def envolver_h264_en_mp4(ruta_h264):
@@ -562,7 +565,8 @@ def procesar_video_subida(video_obj, archivo):
     ruta_convertida = None
 
     try:
-        if content_type in {"video/h264", "video/x-h264"} or ruta_original.lower().endswith(".h264"):
+        extension = os.path.splitext(ruta_original)[1].lower()
+        if content_type in {"video/h264", "video/x-h264"} or extension in H264_EXTENSIONS:
             ruta_convertida = envolver_h264_en_mp4(ruta_original)
             video_obj.ruta_archivo.name = os.path.relpath(ruta_convertida, settings.MEDIA_ROOT)
 

@@ -1,3 +1,4 @@
+import os
 import shutil
 from datetime import datetime, timedelta
 from rest_framework import viewsets, status
@@ -6,12 +7,16 @@ from rest_framework.parsers import FormParser, MultiPartParser
 from rest_framework.response import Response
 from rest_framework.decorators import action
 from django.conf import settings
+from django.core.files import File
+from django.core.files.storage import default_storage
 from django.utils import timezone
+from django.utils.text import get_valid_filename
 from .models import Camion, Turno, Video, Operador, Incidente, AsignacionTurno, Mantenimiento
 from .serializers import (
     CamionSerializer,
     TurnoSerializer,
     VideoSerializer,
+    VideoImportSerializer,
     VelocidadVideoSerializer,
     OperadorSerializer,
     IncidenteSerializer,
@@ -81,6 +86,124 @@ class VideoViewSet(viewsets.ModelViewSet):
         self.perform_create(serializer)
         headers = self.get_success_headers(serializer.data)
         return Response(serializer.data, status=status.HTTP_201_CREATED, headers=headers)
+
+    @action(detail=False, methods=["post"], url_path="importar-desde-servidor")
+    def importar_desde_servidor(self, request):
+        serializer = VideoImportSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+
+        base_dir = getattr(settings, "VIDEOS_IMPORT_DIR", "")
+        if not base_dir:
+            raise ValidationError("VIDEOS_IMPORT_DIR no está configurado en el servidor.")
+
+        base_dir_real = os.path.realpath(base_dir)
+        if not os.path.isdir(base_dir_real):
+            raise ValidationError("VIDEOS_IMPORT_DIR no apunta a un directorio válido.")
+
+        ruta_origen = serializer.validated_data["ruta_origen"].strip()
+        if not ruta_origen:
+            raise ValidationError("Debe indicar 'ruta_origen'.")
+        if os.path.isabs(ruta_origen):
+            raise ValidationError("La ruta debe ser relativa al directorio configurado.")
+
+        origen_real = os.path.realpath(os.path.join(base_dir_real, ruta_origen))
+        if not (origen_real == base_dir_real or origen_real.startswith(base_dir_real + os.sep)):
+            raise ValidationError("La ruta indicada sale del directorio permitido.")
+        if not os.path.isfile(origen_real):
+            raise ValidationError("El archivo indicado no existe.")
+
+        nombre_archivo = get_valid_filename(os.path.basename(origen_real))
+        if not nombre_archivo:
+            raise ValidationError("Nombre de archivo inválido.")
+
+        destino_rel = default_storage.get_available_name(os.path.join("videos", nombre_archivo))
+        with open(origen_real, "rb") as archivo_origen:
+            destino_rel = default_storage.save(destino_rel, File(archivo_origen))
+
+        nombre = serializer.validated_data.get("nombre") or os.path.splitext(nombre_archivo)[0]
+        video = Video.objects.create(
+            nombre=nombre,
+            camara=serializer.validated_data["camara"],
+            ruta_archivo=destino_rel,
+            fecha_inicio=serializer.validated_data.get("fecha_inicio"),
+            fecha_subida=serializer.validated_data.get("fecha_subida") or timezone.localdate(),
+            inicio_timestamp=serializer.validated_data.get("inicio_timestamp"),
+            id_turno=serializer.validated_data["id_turno"],
+        )
+
+        procesar_video_subida(video, video.ruta_archivo)
+
+        response_serializer = VideoSerializer(video, context={"request": request})
+        return Response(response_serializer.data, status=status.HTTP_201_CREATED)
+
+    @action(detail=False, methods=["get"], url_path="archivos-servidor")
+    def archivos_servidor(self, request):
+        base_dir = getattr(settings, "VIDEOS_IMPORT_DIR", "")
+        if not base_dir:
+            raise ValidationError("VIDEOS_IMPORT_DIR no está configurado en el servidor.")
+
+        base_dir_real = os.path.realpath(base_dir)
+        if not os.path.isdir(base_dir_real):
+            raise ValidationError("VIDEOS_IMPORT_DIR no apunta a un directorio válido.")
+
+        include_all = request.query_params.get("todo", "").lower() in {"1", "true", "yes"}
+        exts_param = (request.query_params.get("extensiones") or "").strip()
+        if exts_param:
+            extensiones = {
+                ext.strip().lower()
+                for ext in exts_param.split(",")
+                if ext.strip()
+            }
+        else:
+            extensiones = {".mp4", ".h264", ".grec"}
+
+        try:
+            limit = int(request.query_params.get("limit", 500))
+            offset = int(request.query_params.get("offset", 0))
+        except ValueError as exc:
+            raise ValidationError("Los parámetros 'limit' y 'offset' deben ser enteros.") from exc
+
+        if limit < 0 or offset < 0:
+            raise ValidationError("Los parámetros 'limit' y 'offset' deben ser >= 0.")
+
+        limit = min(limit, 5000)
+
+        archivos = []
+        for raiz, _dirs, files in os.walk(base_dir_real):
+            for nombre in files:
+                ext = os.path.splitext(nombre)[1].lower()
+                if not include_all and ext not in extensiones:
+                    continue
+                ruta_absoluta = os.path.join(raiz, nombre)
+                ruta_relativa = os.path.relpath(ruta_absoluta, base_dir_real)
+                try:
+                    stat = os.stat(ruta_absoluta)
+                except OSError:
+                    continue
+                archivos.append(
+                    {
+                        "ruta_origen": ruta_relativa.replace(os.sep, "/"),
+                        "nombre_archivo": nombre,
+                        "tamano_bytes": stat.st_size,
+                        "modificado_en": datetime.fromtimestamp(
+                            stat.st_mtime, tz=timezone.get_current_timezone()
+                        ).isoformat(),
+                    }
+                )
+
+        archivos.sort(key=lambda item: item["ruta_origen"])
+        total = len(archivos)
+        resultados = archivos[offset : offset + limit] if limit else archivos[offset:]
+
+        return Response(
+            {
+                "total": total,
+                "count": len(resultados),
+                "limit": limit,
+                "offset": offset,
+                "resultados": resultados,
+            }
+        )
 
     @action(
         detail=True,
