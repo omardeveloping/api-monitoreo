@@ -28,6 +28,7 @@ from dashboard.services.calcular_duracion_video import (
     procesar_video_subida,
 )
 from dashboard.services.importar_velocidades_csv import importar_velocidades_csv
+from dashboard.services.preview_video import obtener_preview_video
 
 _PATRON_NOMBRE_VIDEO = re.compile(
     r"^(?P<equipo>\d+)-(?P<fecha>\d{6})-(?P<inicio>\d{6})-(?P<fin>\d{6})-(?P<codigo>\d+)$"
@@ -246,6 +247,45 @@ class VideoViewSet(viewsets.ModelViewSet):
                 "limit": limit,
                 "offset": offset,
                 "resultados": resultados,
+            }
+        )
+
+    @action(detail=False, methods=["get"], url_path="preview-servidor")
+    def preview_servidor(self, request):
+        base_dir = getattr(settings, "VIDEOS_IMPORT_DIR", "")
+        if not base_dir:
+            raise ValidationError("VIDEOS_IMPORT_DIR no está configurado en el servidor.")
+
+        base_dir_real = os.path.realpath(base_dir)
+        if not os.path.isdir(base_dir_real):
+            raise ValidationError("VIDEOS_IMPORT_DIR no apunta a un directorio válido.")
+
+        ruta_origen = (request.query_params.get("ruta_origen") or "").strip()
+        if not ruta_origen:
+            raise ValidationError("Debe indicar 'ruta_origen'.")
+        if os.path.isabs(ruta_origen):
+            raise ValidationError("La ruta debe ser relativa al directorio configurado.")
+
+        origen_real = os.path.realpath(os.path.join(base_dir_real, ruta_origen))
+        if not (origen_real == base_dir_real or origen_real.startswith(base_dir_real + os.sep)):
+            raise ValidationError("La ruta indicada sale del directorio permitido.")
+        if not os.path.isfile(origen_real):
+            raise ValidationError("El archivo indicado no existe.")
+
+        preview_rel, cached = obtener_preview_video(origen_real, ruta_origen)
+
+        media_url = settings.MEDIA_URL or "/media/"
+        if not media_url.endswith("/"):
+            media_url = f"{media_url}/"
+        preview_url = request.build_absolute_uri(f"{media_url}{preview_rel}")
+
+        return Response(
+            {
+                "ruta_origen": ruta_origen.replace(os.sep, "/"),
+                "preview_rel": preview_rel,
+                "preview_url": preview_url,
+                "cached": cached,
+                "duracion_segundos": 5,
             }
         )
 
