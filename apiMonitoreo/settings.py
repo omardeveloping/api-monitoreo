@@ -232,11 +232,6 @@ CELERY_BEAT_SCHEDULE = {
         # 00:05 L-S (no domingos)
         "schedule": crontab(minute=5, hour=0, day_of_week="mon,tue,wed,thu,fri,sat"),
     },
-    "generar-asignaciones-semanales": {
-        "task": "dashboard.tasks.generar_asignaciones_semanales",
-        # 00:10 cada lunes
-        "schedule": crontab(minute=10, hour=0, day_of_week="mon"),
-    },
 }
 
 # Default primary key field type

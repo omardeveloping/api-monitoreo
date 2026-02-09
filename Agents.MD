@@ -1,7 +1,7 @@
 # Agents
 
 This repo is a Django REST API for monitoring operations (camiones, turnos, videos,
-operadores, incidentes) with Celery jobs and video processing via ffmpeg.
+incidentes) with Celery jobs and video processing via ffmpeg.
 
 ## Stack
 - Python 3.13 (Docker image)
@@ -19,12 +19,12 @@ operadores, incidentes) with Celery jobs and video processing via ffmpeg.
 - `docker-compose.yml`, `Dockerfile`, `docker-entrypoint.sh`: containerized run
 
 ## Key data models (dashboard)
-- `Camion`, `Turno` (tipo_turno auto-sets horas), `AsignacionTurno`
-- `Operador`, `Video`, `Incidente`, `Mantenimiento`, `EstadisticaVideoDiaria`
+- `Camion`, `Turno` (tipo_turno auto-sets horas)
+- `Video`, `VelocidadVideo`, `Incidente`, `EstadisticaVideoDiaria`
 
 ## API routes
-- `/api/dashboard/` router: `camiones`, `turnos`, `videos`, `operadores`,
-  `incidentes`, `asignaciones-turno`, `mantenimientos`, `espacio-disco`
+- `/api/dashboard/` router: `camiones`, `turnos`, `videos`,
+  `incidentes`, `espacio-disco`
 - Auth endpoints in `apiMonitoreo/urls.py`:
   `/api/auth/` (dj-rest-auth), custom login/register, JWT refresh/verify
 
@@ -33,7 +33,6 @@ operadores, incidentes) with Celery jobs and video processing via ffmpeg.
 - Beat schedule in `apiMonitoreo/settings.py`:
   - `actualizar_turnos_activos` every minute
   - `generar_turnos_diarios` 00:05 mon-sat
-  - `generar_asignaciones_semanales` 00:10 mon
 
 ## Video processing workflow
 - `VideoViewSet.perform_create` calls `procesar_video_subida`

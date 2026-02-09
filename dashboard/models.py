@@ -8,35 +8,27 @@ class Camion(models.Model):
     marca = models.CharField(max_length=100, blank=True, default="")
     ano = models.PositiveIntegerField(null=True, blank=True)
     disponible = models.BooleanField(default=True)
-    ultimo_mantenimiento = models.ForeignKey(
-        "Mantenimiento",
-        on_delete=models.SET_NULL,
-        null=True,
-        blank=True,
-        related_name="+",
-    )
 
     def __str__(self):
         return self.patente
 
 
 class TipoTurnoChoices(models.TextChoices):
-    MANANA = "manana", "Mañana"
+    MANANA = "manana", "Día"
     TARDE = "tarde", "Tarde"
     NOCHE = "noche", "Noche"
 
 class Turno(models.Model):
     HORARIO_TIPO_TURNO = {
-        TipoTurnoChoices.MANANA: (time(6, 0), time(14, 0)),
-        TipoTurnoChoices.TARDE: (time(14, 0), time(22, 0)),
-        TipoTurnoChoices.NOCHE: (time(22, 0), time(6, 0)),
+        TipoTurnoChoices.NOCHE: (time(0, 0), time(8, 0)),
+        TipoTurnoChoices.MANANA: (time(8, 0), time(16, 0)),
+        TipoTurnoChoices.TARDE: (time(16, 0), time(0, 0)),
     }
 
     fecha = models.DateField(default=timezone.localdate)
     hora_inicio = models.TimeField()
     hora_fin = models.TimeField()
     id_camion = models.ForeignKey(Camion, on_delete=models.CASCADE)
-    operador = models.ForeignKey('Operador', on_delete=models.CASCADE, null=True, blank=True)
     tipo_turno = models.CharField(max_length=10, choices=TipoTurnoChoices.choices, null=True, blank=True)
     activo = models.BooleanField(default=False)
     completado = models.BooleanField(default=False)
@@ -61,17 +53,6 @@ class Turno(models.Model):
 
         super().save(*args, **kwargs)
 
-
-class AsignacionTurno(models.Model):
-    turno = models.ForeignKey(Turno, on_delete=models.CASCADE, related_name="asignaciones")
-    operador = models.ForeignKey('Operador', on_delete=models.CASCADE, related_name="asignaciones")
-    semana = models.PositiveIntegerField()
-
-    class Meta:
-        unique_together = ("semana", "turno")
-
-    def __str__(self):
-        return f"Semana {self.semana}: {self.turno} -> {self.operador}"
 
 class NumeroCamara(models.IntegerChoices):
     CAMARA_1 = 1, "Cámara 1"
@@ -126,28 +107,6 @@ class VelocidadVideo(models.Model):
     def __str__(self):
         return f"{self.video_id} @ {self.segundo}s: {self.velocidad_kmh} km/h"
 
-
-class Operador(models.Model):
-    class EstadoOperador(models.TextChoices):
-        ACTIVO = "activo", "Activo"
-        INACTIVO = "inactivo", "Inactivo"
-
-    nombre = models.CharField(max_length=100)
-    apellido = models.CharField(max_length=100)
-    licencia = models.CharField(max_length=50, blank=True, default="")
-    certificaciones = models.JSONField(default=list, blank=True)
-    correo = models.EmailField(unique=True)
-    telefono = models.CharField(max_length=30, blank=True, default="")
-    estado = models.CharField(
-        max_length=10,
-        choices=EstadoOperador.choices,
-        default=EstadoOperador.ACTIVO,
-    )
-
-    def __str__(self):
-        return f"{self.nombre} {self.apellido}"
-
-
 class Incidente(models.Model):
     class TipoIncidente(models.TextChoices):
         FRENADO_BRUSCO = "frenado_brusco", "Frenado Brusco"
@@ -186,22 +145,47 @@ class EstadisticaVideoDiaria(models.Model):
         return f"{self.fecha}: {self.cantidad_videos}"
 
 
-class Mantenimiento(models.Model):
-    camion = models.ForeignKey(Camion, on_delete=models.CASCADE, related_name="mantenimientos")
-    fecha = models.DateField(default=timezone.localdate)
-    descripcion = models.TextField(blank=True, default="")
-    costo = models.DecimalField(max_digits=10, decimal_places=2, null=True, blank=True)
+# Clases comentadas por ahora, serán necesarias más adelante.
 
-    def save(self, *args, **kwargs):
-        super().save(*args, **kwargs)
-        # Actualiza la referencia al último mantenimiento si corresponde.
-        camion = self.camion
-        if (
-            camion.ultimo_mantenimiento is None
-            or (camion.ultimo_mantenimiento.fecha <= self.fecha)
-        ):
-            camion.ultimo_mantenimiento = self
-            camion.save(update_fields=["ultimo_mantenimiento"])
+# class Operador(models.Model):
+#     class EstadoOperador(models.TextChoices):
+#         ACTIVO = "activo", "Activo"
+#         INACTIVO = "inactivo", "Inactivo"
 
-    def __str__(self):
-        return f"{self.camion} - {self.fecha}"
+#     nombre = models.CharField(max_length=100)
+#     apellido = models.CharField(max_length=100)
+#     licencia = models.CharField(max_length=50, blank=True, default="")
+#     certificaciones = models.JSONField(default=list, blank=True)
+#     correo = models.EmailField(unique=True)
+#     telefono = models.CharField(max_length=30, blank=True, default="")
+#     estado = models.CharField(
+#         max_length=10,
+#         choices=EstadoOperador.choices,
+#         default=EstadoOperador.ACTIVO,
+#     )
+
+#     def __str__(self):
+#         return f"{self.nombre} {self.apellido}"
+
+
+# class Mantenimiento(models.Model):
+#     camion = models.ForeignKey(Camion, on_delete=models.CASCADE, related_name="mantenimientos")
+#     fecha = models.DateField(default=timezone.localdate)
+#     descripcion = models.TextField(blank=True, default="")
+#     costo = models.DecimalField(max_digits=10, decimal_places=2, null=True, blank=True)
+
+#     def save(self, *args, **kwargs):
+#         super().save(*args, **kwargs)
+#         # Actualiza la referencia al último mantenimiento si corresponde.
+#         camion = self.camion
+#         if (
+#             camion.ultimo_mantenimiento is None
+#             or (camion.ultimo_mantenimiento.fecha <= self.fecha)
+#         ):
+#             camion.ultimo_mantenimiento = self
+#             camion.save(update_fields=["ultimo_mantenimiento"])
+
+#     def __str__(self):
+#         return f"{self.camion} - {self.fecha}"
+
+

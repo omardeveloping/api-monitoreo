@@ -5,7 +5,6 @@ from django.utils import timezone
 
 from .models import Turno
 from dashboard.services.programar_turnos import (
-    crear_asignaciones_semanales,
     crear_turnos_diarios,
 )
 
@@ -59,7 +58,3 @@ def generar_turnos_diarios():
     return crear_turnos_diarios()
 
 
-@shared_task
-def generar_asignaciones_semanales():
-    """Crea las asignaciones semanales de operadores (rotación A/B/C) cada lunes."""
-    return crear_asignaciones_semanales()

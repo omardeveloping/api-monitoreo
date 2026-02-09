@@ -4,10 +4,7 @@ from .models import (
     Turno,
     Video,
     EstadoVideo,
-    Operador,
     Incidente,
-    AsignacionTurno,
-    Mantenimiento,
     VelocidadVideo,
     NumeroCamara,
 )
@@ -15,7 +12,7 @@ from .models import (
 class CamionSerializer(serializers.ModelSerializer):
     class Meta:
         model = Camion
-        fields = ['id', 'patente', 'marca', 'ano', 'disponible', 'ultimo_mantenimiento']
+        fields = ['id', 'patente', 'marca', 'ano', 'disponible']
 
 class TurnoSerializer(serializers.ModelSerializer):
     def validate(self, attrs):
@@ -41,7 +38,7 @@ class TurnoSerializer(serializers.ModelSerializer):
 
     class Meta:
         model = Turno
-        fields = ['id', 'fecha', 'hora_inicio', 'hora_fin', 'id_camion', 'operador', 'tipo_turno', 'activo', 'completado']
+        fields = ['id', 'fecha', 'hora_inicio', 'hora_fin', 'id_camion', 'tipo_turno', 'activo', 'completado']
         read_only_fields = ['completado']
 
 class VideoSerializer(serializers.ModelSerializer):
@@ -97,25 +94,24 @@ class VelocidadVideoSerializer(serializers.ModelSerializer):
         read_only_fields = ["id", "video"]
 
 
-class AsignacionTurnoSerializer(serializers.ModelSerializer):
-    class Meta:
-        model = AsignacionTurno
-        fields = ['id', 'semana', 'turno', 'operador']
+# class OperadorSerializer(serializers.ModelSerializer):
+#     class Meta:
+#         model = Operador
+#         fields = [
+#             'id',
+#             'nombre',
+#             'apellido',
+#             'licencia',
+#             'certificaciones',
+#             'correo',
+#             'telefono',
+#             'estado',
+#         ]
 
-
-class OperadorSerializer(serializers.ModelSerializer):
-    class Meta:
-        model = Operador
-        fields = [
-            'id',
-            'nombre',
-            'apellido',
-            'licencia',
-            'certificaciones',
-            'correo',
-            'telefono',
-            'estado',
-        ]
+# class MantenimientoSerializer(serializers.ModelSerializer):
+#     class Meta:
+#         model = Mantenimiento
+#         fields = ['id', 'camion', 'fecha', 'descripcion', 'costo']
 
 
 class IncidenteSerializer(serializers.ModelSerializer):
@@ -130,8 +126,3 @@ class IncidenteSerializer(serializers.ModelSerializer):
             'turno',
         ]
 
-
-class MantenimientoSerializer(serializers.ModelSerializer):
-    class Meta:
-        model = Mantenimiento
-        fields = ['id', 'camion', 'fecha', 'descripcion', 'costo']
