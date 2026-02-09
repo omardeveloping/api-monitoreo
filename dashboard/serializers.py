@@ -10,6 +10,13 @@ from .models import (
 )
 
 class CamionSerializer(serializers.ModelSerializer):
+    def validate(self, attrs):
+        if self.instance is None and Camion.objects.exists():
+            raise serializers.ValidationError(
+                "Solo puede existir un camión/maquinaria en el sistema."
+            )
+        return attrs
+
     class Meta:
         model = Camion
         fields = ['id', 'patente', 'marca', 'ano', 'disponible']
@@ -125,4 +132,3 @@ class IncidenteSerializer(serializers.ModelSerializer):
             'descripcion',
             'turno',
         ]
-
