@@ -25,6 +25,8 @@ from dashboard.services.calcular_duracion_video import (
     procesar_video_subida,
 )
 from dashboard.services.importar_velocidades_csv import importar_velocidades_csv
+from dashboard.services.importar_velocidades_xlsx import importar_velocidades_xlsx
+from dashboard.services.importar_videos_mdvr import importar_videos_mdvr
 from dashboard.services.preview_video import obtener_preview_video
 
 _PATRON_NOMBRE_VIDEO = re.compile(
@@ -111,6 +113,80 @@ class TurnoViewSet(viewsets.ModelViewSet):
             return self.get_paginated_response(serializer.data)
         serializer = VideoSerializer(videos, many=True, context=serializer_context)
         return Response(serializer.data)
+
+    @action(detail=False, methods=["get"], url_path="por-dia")
+    def por_dia(self, request):
+        """
+        Devuelve turnos por día.
+        - Si se pasa 'fecha' (YYYY-MM-DD): devuelve los turnos de ese día.
+        - Si se pasan 'desde'/'hasta': devuelve turnos agrupados por fecha.
+        - Si no se pasa nada: usa la fecha de hoy.
+        """
+        fecha_param = (request.query_params.get("fecha") or "").strip()
+        desde_param = (request.query_params.get("desde") or "").strip()
+        hasta_param = (request.query_params.get("hasta") or "").strip()
+
+        if fecha_param and (desde_param or hasta_param):
+            raise ValidationError("Use 'fecha' o 'desde'/'hasta', no ambos.")
+
+        def _parse_fecha(valor: str, nombre: str):
+            try:
+                return datetime.strptime(valor, "%Y-%m-%d").date()
+            except ValueError as exc:
+                raise ValidationError(
+                    f"Parametro '{nombre}' invalido. Use formato YYYY-MM-DD."
+                ) from exc
+
+        if fecha_param:
+            fecha = _parse_fecha(fecha_param, "fecha")
+            queryset = Turno.objects.filter(fecha=fecha).order_by("hora_inicio", "id")
+            serializer = TurnoSerializer(queryset, many=True)
+            return Response(
+                {
+                    "fecha": fecha,
+                    "count": queryset.count(),
+                    "resultados": serializer.data,
+                }
+            )
+
+        if not desde_param and not hasta_param:
+            fecha = timezone.localdate()
+            queryset = Turno.objects.filter(fecha=fecha).order_by("hora_inicio", "id")
+            serializer = TurnoSerializer(queryset, many=True)
+            return Response(
+                {
+                    "fecha": fecha,
+                    "count": queryset.count(),
+                    "resultados": serializer.data,
+                }
+            )
+
+        desde = _parse_fecha(desde_param, "desde") if desde_param else None
+        hasta = _parse_fecha(hasta_param, "hasta") if hasta_param else None
+
+        if desde and hasta and desde > hasta:
+            raise ValidationError("Parametro 'desde' no puede ser mayor que 'hasta'.")
+
+        queryset = Turno.objects.all()
+        if desde:
+            queryset = queryset.filter(fecha__gte=desde)
+        if hasta:
+            queryset = queryset.filter(fecha__lte=hasta)
+        queryset = queryset.order_by("fecha", "hora_inicio", "id")
+
+        serializer = TurnoSerializer(queryset, many=True)
+        agrupados = {}
+        for item in serializer.data:
+            agrupados.setdefault(item["fecha"], []).append(item)
+
+        return Response(
+            {
+                "desde": desde,
+                "hasta": hasta,
+                "total": len(serializer.data),
+                "resultados": agrupados,
+            }
+        )
 
 class VideoViewSet(viewsets.ModelViewSet):
     queryset = Video.objects.all()
@@ -296,8 +372,12 @@ class VideoViewSet(viewsets.ModelViewSet):
         video = self.get_object()
         archivo = request.FILES.get("archivo") or request.FILES.get("csv")
         if not archivo:
-            raise ValidationError("Debe adjuntar un archivo CSV en el campo 'archivo'.")
-        resultado = importar_velocidades_csv(video, archivo)
+            raise ValidationError("Debe adjuntar un archivo CSV o XLSX en 'archivo'.")
+        ext = os.path.splitext(getattr(archivo, "name", "") or "")[1].lower()
+        if ext in {".xlsx", ".xls"}:
+            resultado = importar_velocidades_xlsx(video, archivo)
+        else:
+            resultado = importar_velocidades_csv(video, archivo)
         return Response(resultado, status=status.HTTP_201_CREATED)
 
     @action(detail=True, methods=["get"], url_path="velocidades")
@@ -334,6 +414,17 @@ class VideoViewSet(viewsets.ModelViewSet):
         hoy = timezone.localdate()
         cantidad = Video.objects.filter(fecha_subida=hoy).count()
         return Response({"fecha": hoy, "cantidad": cantidad})
+
+    @action(detail=False, methods=["post"], url_path="importar-mdvr")
+    def importar_mdvr(self, request):
+        """Importa videos MDVR desde el servidor."""
+        incluir_velocidades = request.query_params.get("velocidades", "1").lower() in {
+            "1",
+            "true",
+            "yes",
+        }
+        resultado = importar_videos_mdvr(importar_velocidades=incluir_velocidades)
+        return Response(resultado, status=status.HTTP_201_CREATED)
 
 
 # class OperadorViewSet(viewsets.ModelViewSet):
@@ -385,19 +476,78 @@ class EspacioDiscoViewSet(viewsets.ViewSet):
     """Devuelve el uso de disco del servidor."""
 
     def list(self, request):
-        ruta = getattr(settings, "ESPACIO_DISCO_RUTA", "/")
-        uso = shutil.disk_usage(ruta)
-        total = uso.total
-        usado = uso.used
-        libre = uso.free
-        porcentaje_usado = round((usado / total) * 100, 2) if total else 0
+        rutas_param = (request.query_params.get("rutas") or "").strip()
+        rutas_env = (os.environ.get("ESPACIO_DISCO_RUTAS") or "").strip()
+        if rutas_param:
+            rutas = [ruta.strip() for ruta in rutas_param.split(",") if ruta.strip()]
+        elif rutas_env:
+            rutas = [ruta.strip() for ruta in rutas_env.split(",") if ruta.strip()]
+        else:
+            ruta = getattr(settings, "ESPACIO_DISCO_RUTA", "/")
+            rutas = [ruta] if ruta else []
+
+        if not rutas:
+            raise ValidationError("No hay rutas configuradas para calcular espacio.")
+
+        discos = []
+        errores = []
         gb = 1024 ** 3
+        dispositivos_vistos = set()
+        total = usado = libre = 0
+
+        for ruta in rutas:
+            if not os.path.exists(ruta):
+                errores.append({"ruta": ruta, "error": "La ruta no existe."})
+                continue
+
+            try:
+                uso = shutil.disk_usage(ruta)
+            except OSError as exc:
+                errores.append({"ruta": ruta, "error": str(exc)})
+                continue
+
+            porcentaje_usado = round((uso.used / uso.total) * 100, 2) if uso.total else 0
+            discos.append(
+                {
+                    "ruta": ruta,
+                    "total_gb": round(uso.total / gb, 2),
+                    "usado_gb": round(uso.used / gb, 2),
+                    "libre_gb": round(uso.free / gb, 2),
+                    "porcentaje_usado": porcentaje_usado,
+                }
+            )
+
+            try:
+                device_id = os.stat(ruta).st_dev
+            except OSError:
+                device_id = None
+
+            if device_id in dispositivos_vistos:
+                continue
+            dispositivos_vistos.add(device_id)
+            total += uso.total
+            usado += uso.used
+            libre += uso.free
+
+        porcentaje_usado_total = round((usado / total) * 100, 2) if total else 0
+
         return Response(
             {
-                "ruta": ruta,
+                "rutas": rutas,
+                "count": len(discos),
+                "discos": discos,
+                "totales": {
+                    "total_gb": round(total / gb, 2),
+                    "usado_gb": round(usado / gb, 2),
+                    "libre_gb": round(libre / gb, 2),
+                    "porcentaje_usado": porcentaje_usado_total,
+                },
+                # Compatibilidad con el formato anterior (totales combinados).
+                "ruta": ",".join(rutas),
                 "total_gb": round(total / gb, 2),
                 "usado_gb": round(usado / gb, 2),
                 "libre_gb": round(libre / gb, 2),
-                "porcentaje_usado": porcentaje_usado,
+                "porcentaje_usado": porcentaje_usado_total,
+                "errores": errores,
             }
         )

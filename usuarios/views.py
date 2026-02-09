@@ -1,21 +1,24 @@
 from dj_rest_auth.views import LoginView
-from dj_rest_auth.registration.views import RegisterView
+from django.contrib.auth import get_user_model
 from rest_framework import status
 from rest_framework.generics import GenericAPIView
 from rest_framework.response import Response
 from rest_framework_simplejwt.tokens import RefreshToken
 from rest_framework_simplejwt.views import TokenObtainPairView
+from rest_framework import viewsets
+from rest_framework.permissions import IsAuthenticated
 
 from .serializers import (
     CustomLoginSerializer,
     CustomRegisterSerializer,
     CustomTokenObtainPairSerializer,
+    UsuarioSerializer,
 )
 
 
 class CustomRegisterAPIView(GenericAPIView):
     """
-    Registration endpoint that returns JWT access/refresh (email + passwords only).
+    Registration endpoint that returns JWT access/refresh (username + passwords only).
     Uses GenericAPIView so DRF browsable API renders a form.
     """
 
@@ -39,3 +42,9 @@ class CustomLoginView(LoginView):
 
 class CustomTokenObtainPairView(TokenObtainPairView):
     serializer_class = CustomTokenObtainPairSerializer
+
+
+class UsuarioViewSet(viewsets.ReadOnlyModelViewSet):
+    queryset = get_user_model().objects.all()
+    serializer_class = UsuarioSerializer
+    permission_classes = [IsAuthenticated]

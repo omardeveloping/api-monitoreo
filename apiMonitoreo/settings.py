@@ -88,11 +88,14 @@ REST_AUTH_TOKEN_MODEL = None
 
 # USUARIOS PERSONALIZADOS
 AUTH_USER_MODEL = "usuarios.Usuario"
-ACCOUNT_USER_MODEL_USERNAME_FIELD = None
-ACCOUNT_USERNAME_REQUIRED = False
-ACCOUNT_LOGIN_METHODS = {"email"}
-ACCOUNT_SIGNUP_FIELDS = ["email*", "password1*", "password2*"]
-ACCOUNT_UNIQUE_EMAIL = True  # default True
+ACCOUNT_USER_MODEL_USERNAME_FIELD = "username"
+ACCOUNT_USER_MODEL_EMAIL_FIELD = None
+ACCOUNT_USERNAME_REQUIRED = True
+ACCOUNT_AUTHENTICATION_METHOD = "username"
+ACCOUNT_LOGIN_METHODS = {"username"}
+ACCOUNT_SIGNUP_FIELDS = ["username*", "password1*", "password2*"]
+ACCOUNT_EMAIL_REQUIRED = False
+ACCOUNT_UNIQUE_EMAIL = False
 ACCOUNT_EMAIL_VERIFICATION = "none"
 
 REST_AUTH_REGISTER_SERIALIZERS = {
@@ -212,6 +215,8 @@ MEDIA_ROOT = BASE_DIR / "media"
 
 # Directorio base para importar videos locales (sin subirlos por HTTP).
 VIDEOS_IMPORT_DIR = os.environ.get("VIDEOS_IMPORT_DIR", "")
+# Directorio base para estructura MDVR (por defecto, usa VIDEOS_IMPORT_DIR).
+VIDEOS_MDVR_DIR = os.environ.get("VIDEOS_MDVR_DIR", VIDEOS_IMPORT_DIR)
 
 # Ruta a monitorear para uso de disco. Cambia con la variable de entorno ESPACIO_DISCO_RUTA.
 ESPACIO_DISCO_RUTA = os.environ.get("ESPACIO_DISCO_RUTA", "/")
@@ -231,6 +236,10 @@ CELERY_BEAT_SCHEDULE = {
         "task": "dashboard.tasks.generar_turnos_diarios",
         # 00:05 L-S (no domingos)
         "schedule": crontab(minute=5, hour=0, day_of_week="mon,tue,wed,thu,fri,sat"),
+    },
+    "importar-videos-mdvr": {
+        "task": "dashboard.tasks.importar_videos_mdvr_task",
+        "schedule": 60.0 * 15,  # cada 15 minutos
     },
 }
 

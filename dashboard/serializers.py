@@ -19,7 +19,7 @@ class CamionSerializer(serializers.ModelSerializer):
 
     class Meta:
         model = Camion
-        fields = ['id', 'patente', 'marca', 'ano', 'disponible']
+        fields = ['id', 'patente', 'marca', 'ano', 'disponible', 'carpeta_id']
 
 class TurnoSerializer(serializers.ModelSerializer):
     def validate(self, attrs):

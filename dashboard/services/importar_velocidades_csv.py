@@ -65,7 +65,7 @@ def _detectar_dialecto(texto):
         return csv.excel_tab
 
 
-def importar_velocidades_csv(video, archivo):
+def importar_velocidades_tabulares(video, fieldnames, filas_iterable):
     duracion = video.duracion
     if duracion is None or duracion <= 0:
         raise ValidationError("El video no tiene una duracion valida.")
@@ -73,36 +73,24 @@ def importar_velocidades_csv(video, archivo):
     if ultimo_segundo < 0:
         raise ValidationError("El video no tiene segundos disponibles.")
 
-    contenido = archivo.read()
-    if isinstance(contenido, bytes):
-        texto = contenido.decode("utf-8-sig", errors="replace")
-    else:
-        texto = str(contenido)
+    if not fieldnames:
+        raise ValidationError("El archivo no tiene encabezados.")
 
-    if not texto.strip():
-        raise ValidationError("El CSV esta vacio.")
-
-    muestra = texto[:4096]
-    dialecto = _detectar_dialecto(muestra)
-    lector = csv.DictReader(io.StringIO(texto), dialect=dialecto)
-    if not lector.fieldnames:
-        raise ValidationError("El CSV no tiene encabezados.")
-
-    campo_velocidad = _buscar_columna(lector.fieldnames, _CANDIDATOS_VELOCIDAD)
+    campo_velocidad = _buscar_columna(fieldnames, _CANDIDATOS_VELOCIDAD)
     if not campo_velocidad:
         raise ValidationError("No se encontro la columna de velocidad.")
 
-    campo_hora = _buscar_columna(lector.fieldnames, {"hora"})
-    campo_recibir = _buscar_columna(lector.fieldnames, {"recibirtiempo"})
+    campo_hora = _buscar_columna(fieldnames, {"hora"})
+    campo_recibir = _buscar_columna(fieldnames, {"recibirtiempo"})
     campo_alterno = None
     if not campo_hora and not campo_recibir:
-        campo_alterno = _buscar_columna(lector.fieldnames, _CANDIDATOS_HORA)
+        campo_alterno = _buscar_columna(fieldnames, _CANDIDATOS_HORA)
 
     muestras_raw = []
     filas = 0
     descartadas = 0
 
-    for idx, fila in enumerate(lector):
+    for idx, fila in enumerate(filas_iterable):
         filas += 1
         velocidad = _parsear_velocidad(fila.get(campo_velocidad))
         if velocidad is None:
@@ -198,3 +186,22 @@ def importar_velocidades_csv(video, archivo):
         "interpoladas": interpoladas,
         "reemplazadas": True,
     }
+
+
+def importar_velocidades_csv(video, archivo):
+    contenido = archivo.read()
+    if isinstance(contenido, bytes):
+        texto = contenido.decode("utf-8-sig", errors="replace")
+    else:
+        texto = str(contenido)
+
+    if not texto.strip():
+        raise ValidationError("El CSV esta vacio.")
+
+    muestra = texto[:4096]
+    dialecto = _detectar_dialecto(muestra)
+    lector = csv.DictReader(io.StringIO(texto), dialect=dialecto)
+    if not lector.fieldnames:
+        raise ValidationError("El CSV no tiene encabezados.")
+
+    return importar_velocidades_tabulares(video, lector.fieldnames, lector)

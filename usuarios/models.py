@@ -1,9 +1,8 @@
 from django.contrib.auth.models import AbstractUser
-from django.db import models
 
 class Usuario(AbstractUser):
-    username = None
-    email = models.EmailField(unique=True)
+    email = None
 
-    USERNAME_FIELD = "email"
+    USERNAME_FIELD = "username"
     REQUIRED_FIELDS = []
+    EMAIL_FIELD = None

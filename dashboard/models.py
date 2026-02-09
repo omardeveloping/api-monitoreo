@@ -8,6 +8,7 @@ class Camion(models.Model):
     marca = models.CharField(max_length=100, blank=True, default="")
     ano = models.PositiveIntegerField(null=True, blank=True)
     disponible = models.BooleanField(default=True)
+    carpeta_id = models.CharField(max_length=64, blank=True, default="", db_index=True)
 
     def __str__(self):
         return self.patente

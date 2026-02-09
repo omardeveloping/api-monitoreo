@@ -7,6 +7,7 @@ from .models import Turno
 from dashboard.services.programar_turnos import (
     crear_turnos_diarios,
 )
+from dashboard.services.importar_videos_mdvr import importar_videos_mdvr
 
 
 def _limites_turno(turno: Turno):
@@ -56,5 +57,11 @@ def actualizar_turnos_activos():
 def generar_turnos_diarios():
     """Crea turnos para cada camión (mañana, tarde, noche) cada día excepto domingo."""
     return crear_turnos_diarios()
+
+
+@shared_task
+def importar_videos_mdvr_task():
+    """Importa videos MDVR desde el servidor y los asocia a turnos."""
+    return importar_videos_mdvr()
 
 
