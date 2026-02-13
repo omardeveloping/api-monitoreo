@@ -214,3 +214,4 @@ __marimo__/
 .env
 # Django collected static files
 staticfiles/
+/test/
