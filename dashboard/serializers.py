@@ -1,3 +1,5 @@
+from urllib.parse import parse_qsl, urlencode, urlparse, urlunparse
+
 from rest_framework import serializers
 from .models import (
     Camion,
@@ -8,6 +10,14 @@ from .models import (
     VelocidadVideo,
     NumeroCamara,
 )
+
+
+def _with_query_param(url: str, key: str, value: str) -> str:
+    parsed = urlparse(url)
+    query = dict(parse_qsl(parsed.query, keep_blank_values=True))
+    query[key] = value
+    return urlunparse(parsed._replace(query=urlencode(query)))
+
 
 class CamionSerializer(serializers.ModelSerializer):
     def validate(self, attrs):
@@ -56,6 +66,12 @@ class VideoSerializer(serializers.ModelSerializer):
             data["ruta_archivo"] = None
             data["fin_timestamp"] = None
             data["mimetype"] = None
+        else:
+            ruta = data.get("ruta_archivo")
+            if ruta:
+                # Keep URL stable per object state while busting stale browser/CDN cache.
+                token = f"{instance.id}-{instance.duracion or 0}-{instance.fin_timestamp or ''}"
+                data["ruta_archivo"] = _with_query_param(ruta, "v", token)
         return data
 
     class Meta:

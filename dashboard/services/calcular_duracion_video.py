@@ -578,15 +578,19 @@ def procesar_video_subida(video_obj, archivo):
 
     ruta_original = video_obj.ruta_archivo.path
     ruta_convertida = None
+    convertido_desde_h264 = False
 
     try:
         extension = os.path.splitext(ruta_original)[1].lower()
         if content_type in {"video/h264", "video/x-h264"} or extension in H264_EXTENSIONS:
             ruta_convertida = envolver_h264_en_mp4(ruta_original)
             video_obj.ruta_archivo.name = os.path.relpath(ruta_convertida, settings.MEDIA_ROOT)
+            convertido_desde_h264 = True
 
         ruta_final = video_obj.ruta_archivo.path
-        if ruta_final.lower().endswith(".mp4"):
+        # MP4 result from H264 conversion is already encoded by our pipeline.
+        # Re-normalizing it again can damage timestamps on some MDVR streams.
+        if ruta_final.lower().endswith(".mp4") and not convertido_desde_h264:
             asegurar_mp4_compatible(ruta_final)
 
         video_obj.duracion = math.floor(calcular_duracion_video(video_obj.ruta_archivo.path))
