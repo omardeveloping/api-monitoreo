@@ -2,6 +2,7 @@ import datetime
 import math
 import os
 import re
+import shutil
 import subprocess
 import tempfile
 from dataclasses import dataclass
@@ -206,31 +207,16 @@ def _crear_lista_concat(segmentos: list[str]) -> str:
 
 
 def _concat_h264(segmentos: list[str], salida: str) -> tuple[bool, str | None]:
-    lista = _crear_lista_concat(segmentos)
     try:
-        comando = [
-            "ffmpeg",
-            "-hide_banner",
-            "-loglevel",
-            "error",
-            "-f",
-            "concat",
-            "-safe",
-            "0",
-            "-i",
-            lista,
-            "-c",
-            "copy",
-            "-y",
-            salida,
-        ]
-        subprocess.run(comando, capture_output=True, text=True, check=True)
+        with open(salida, "wb") as out_file:
+            for ruta in segmentos:
+                with open(ruta, "rb") as in_file:
+                    shutil.copyfileobj(in_file, out_file, length=1024 * 1024)
+        if os.path.getsize(salida) <= 0:
+            return False, "salida vacía tras concatenación binaria."
         return True, None
-    except (subprocess.CalledProcessError, FileNotFoundError) as exc:
+    except OSError as exc:
         return False, str(exc)
-    finally:
-        if os.path.exists(lista):
-            os.remove(lista)
 
 
 def _concat_h264_transcodificando(segmentos: list[str], salida: str) -> tuple[bool, str | None]:
@@ -456,8 +442,10 @@ def _importar_camion_mdvr(camion: Camion, base_dir: str, importar_velocidades: b
                 )
                 ok, error = _concat_h264(segmentos_paths, ruta_salida)
                 if not ok:
+                    ok, error = _concat_h264_transcodificando(segmentos_paths, ruta_salida)
+                if not ok:
                     segmentos_validos = [p for p in segmentos_paths if _ffprobe_ok(p)]
-                    if segmentos_validos:
+                    if segmentos_validos and len(segmentos_validos) < len(segmentos_paths):
                         ok, error = _concat_h264_transcodificando(segmentos_validos, ruta_salida)
                     if not ok:
                         detalles["errores"].append(

@@ -9,8 +9,6 @@ import tempfile
 from django.conf import settings
 from rest_framework.exceptions import ValidationError
 
-from dashboard.models import EstadoVideo
-
 ### Tengo que acordarme de poner constantes en mayusculas
 FORMATO_VIDEO_VALIDO = {"video/mp4", "video/h264", "video/x-h264"}
 H264_EXTENSIONS = {".h264", ".grec"}
@@ -573,6 +571,8 @@ def procesar_video_subida(video_obj, archivo):
     Valida, convierte H264 a MP4 si es necesario, calcula duración y persiste cambios.
     Elimina archivos y el registro si ocurre algún error para evitar residuos.
     """
+    from dashboard.models import EstadoVideo
+
     validar_formato(archivo)
     content_type = (getattr(archivo, "content_type", "") or "").lower()
 
