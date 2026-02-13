@@ -9,3 +9,15 @@ venv/
 dist/
 build/
 *.egg-info/
+.venv/
+.pytest_cache/
+.mypy_cache/
+
+# Runtime/generated data (very large, should not be in build context)
+media/
+staticfiles/
+data/
+db.sqlite3
+
+# Local test assets
+test/
