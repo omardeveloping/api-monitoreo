@@ -140,6 +140,33 @@ def _listar_xlsx(base_dir: str, carpeta_id: str) -> list[XlsxInfo]:
     return resultados
 
 
+def _obtener_o_crear_turno(
+    *, fecha: datetime.date, camion: Camion, tipo_turno: str, errores: list[str]
+) -> Turno:
+    """
+    Resuelve duplicados de turnos sin abortar la importación completa.
+    Si hay más de un turno para la misma clave, reutiliza el más antiguo.
+    """
+    qs = Turno.objects.filter(
+        fecha=fecha,
+        id_camion=camion,
+        tipo_turno=tipo_turno,
+    ).order_by("id")
+    turno = qs.first()
+    if turno:
+        if qs.count() > 1:
+            errores.append(
+                f"Turno duplicado detectado para {fecha} ({tipo_turno}); se usará id={turno.id}."
+            )
+        return turno
+    return Turno.objects.create(
+        fecha=fecha,
+        id_camion=camion,
+        tipo_turno=tipo_turno,
+        activo=False,
+    )
+
+
 def _seleccionar_xlsx(xlsx_files: list[XlsxInfo], fecha_inicio: datetime.datetime) -> XlsxInfo | None:
     candidatos = [
         info
@@ -326,7 +353,27 @@ def _alinear_duraciones(videos: list[Video]) -> int:
     return recortados
 
 
-def importar_videos_mdvr(base_dir: str | None = None, importar_velocidades: bool = True):
+def _parse_fecha_objetivo(
+    fecha_objetivo: datetime.date | str | None,
+) -> datetime.date | None:
+    if fecha_objetivo is None:
+        return None
+    if isinstance(fecha_objetivo, datetime.date):
+        return fecha_objetivo
+    valor = str(fecha_objetivo).strip()
+    if not valor:
+        return None
+    try:
+        return datetime.date.fromisoformat(valor)
+    except ValueError as exc:
+        raise ValidationError("Parametro 'fecha' invalido. Use formato YYYY-MM-DD.") from exc
+
+
+def importar_videos_mdvr(
+    base_dir: str | None = None,
+    importar_velocidades: bool = True,
+    fecha_objetivo: datetime.date | str | None = None,
+):
     base = (base_dir or "").strip()
     if not base:
         base = getattr(settings, "VIDEOS_MDVR_DIR", "") or getattr(
@@ -339,6 +386,8 @@ def importar_videos_mdvr(base_dir: str | None = None, importar_velocidades: bool
     if not os.path.isdir(base_real):
         raise ValidationError("La ruta de videos MDVR no es un directorio válido.")
 
+    fecha_filtrada = _parse_fecha_objetivo(fecha_objetivo)
+
     camiones = Camion.objects.exclude(carpeta_id="").all()
     if not camiones:
         return {"camiones": 0, "videos_creados": 0, "errores": ["No hay camiones con carpeta_id."]}
@@ -347,7 +396,10 @@ def importar_videos_mdvr(base_dir: str | None = None, importar_velocidades: bool
 
     for camion in camiones:
         detalle = _importar_camion_mdvr(
-            camion, base_real, importar_velocidades=importar_velocidades
+            camion,
+            base_real,
+            importar_velocidades=importar_velocidades,
+            fecha_objetivo=fecha_filtrada,
         )
         respuesta["camiones"] += 1
         respuesta["videos_creados"] += detalle.get("videos_creados", 0)
@@ -357,7 +409,12 @@ def importar_videos_mdvr(base_dir: str | None = None, importar_velocidades: bool
     return respuesta
 
 
-def _importar_camion_mdvr(camion: Camion, base_dir: str, importar_velocidades: bool = True):
+def _importar_camion_mdvr(
+    camion: Camion,
+    base_dir: str,
+    importar_velocidades: bool = True,
+    fecha_objetivo: datetime.date | None = None,
+):
     carpeta_id = (camion.carpeta_id or "").strip()
     if not carpeta_id:
         return {"camion_id": camion.id, "videos_creados": 0, "errores": ["carpeta_id vacío."]}
@@ -391,6 +448,8 @@ def _importar_camion_mdvr(camion: Camion, base_dir: str, importar_velocidades: b
             fecha = datetime.date.fromisoformat(nombre)
         except ValueError:
             continue
+        if fecha_objetivo and fecha != fecha_objetivo:
+            continue
 
         segmentos = []
         for archivo in os.listdir(ruta_dia):
@@ -419,11 +478,11 @@ def _importar_camion_mdvr(camion: Camion, base_dir: str, importar_velocidades: b
             lista.sort(key=lambda s: s.inicio_dt)
             turno = turnos_creados.get(tipo_turno)
             if turno is None:
-                turno, _ = Turno.objects.get_or_create(
+                turno = _obtener_o_crear_turno(
                     fecha=fecha,
-                    id_camion=camion,
+                    camion=camion,
                     tipo_turno=tipo_turno,
-                    defaults={"activo": False},
+                    errores=detalles["errores"],
                 )
                 turnos_creados[tipo_turno] = turno
 

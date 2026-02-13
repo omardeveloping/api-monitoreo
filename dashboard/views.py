@@ -424,12 +424,27 @@ class VideoViewSet(viewsets.ModelViewSet):
             "true",
             "yes",
         }
-        task = importar_videos_mdvr_task.delay(importar_velocidades=incluir_velocidades)
+        fecha_param = (request.query_params.get("fecha") or "").strip()
+        fecha_objetivo = None
+        if fecha_param:
+            try:
+                datetime.strptime(fecha_param, "%Y-%m-%d")
+            except ValueError as exc:
+                raise ValidationError(
+                    "Parametro 'fecha' invalido. Use formato YYYY-MM-DD."
+                ) from exc
+            fecha_objetivo = fecha_param
+
+        task = importar_videos_mdvr_task.delay(
+            importar_velocidades=incluir_velocidades,
+            fecha_objetivo=fecha_objetivo,
+        )
         return Response(
             {
                 "task_id": task.id,
                 "status": "queued",
                 "importar_velocidades": incluir_velocidades,
+                "fecha": fecha_objetivo,
             },
             status=status.HTTP_202_ACCEPTED,
         )

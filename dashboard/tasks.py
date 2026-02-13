@@ -60,8 +60,12 @@ def generar_turnos_diarios():
 
 
 @shared_task
-def importar_videos_mdvr_task(importar_velocidades: bool = True):
+def importar_videos_mdvr_task(
+    importar_velocidades: bool = True, fecha_objetivo: str | None = None
+):
     """Importa videos MDVR desde el servidor y los asocia a turnos."""
-    return importar_videos_mdvr(importar_velocidades=importar_velocidades)
-
+    return importar_videos_mdvr(
+        importar_velocidades=importar_velocidades,
+        fecha_objetivo=fecha_objetivo,
+    )
 
