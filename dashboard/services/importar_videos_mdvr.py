@@ -10,6 +10,7 @@ from dataclasses import dataclass
 from django.conf import settings
 from django.core.files import File
 from django.core.files.storage import default_storage
+from django.utils import timezone
 from rest_framework.exceptions import ValidationError
 
 from dashboard.models import Camion, TipoTurnoChoices, Turno, Video
@@ -523,7 +524,7 @@ def _importar_camion_mdvr(
                     camara=camara,
                     ruta_archivo=destino_rel,
                     fecha_inicio=inicio_dt,
-                    fecha_subida=fecha,
+                    fecha_subida=timezone.localdate(),
                     inicio_timestamp=inicio_dt.time(),
                     id_turno=turno,
                 )

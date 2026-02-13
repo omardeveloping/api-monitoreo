@@ -411,10 +411,17 @@ class VideoViewSet(viewsets.ModelViewSet):
 
     @action(detail=False, methods=["get"], url_path="conteo-hoy")
     def conteo_hoy(self, request):
-        """Devuelve la cantidad de videos subidos hoy."""
+        """Devuelve el total histórico de videos y el conteo del día actual."""
         hoy = timezone.localdate()
-        cantidad = Video.objects.filter(fecha_subida=hoy).count()
-        return Response({"fecha": hoy, "cantidad": cantidad})
+        cantidad_total = Video.objects.count()
+        cantidad_hoy = Video.objects.filter(fecha_subida=hoy).count()
+        return Response(
+            {
+                "cantidad": cantidad_total,
+                "cantidad_hoy": cantidad_hoy,
+                "fecha_hoy": hoy,
+            }
+        )
 
     @action(detail=False, methods=["post"], url_path="importar-mdvr")
     def importar_mdvr(self, request):
