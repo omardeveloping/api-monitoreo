@@ -483,6 +483,12 @@ def _importar_camion_mdvr(camion: Camion, base_dir: str, importar_velocidades: b
                             detalles["errores"].append(
                                 f"{nombre_video}: error importando velocidades ({exc})."
                             )
+            except Exception as exc:
+                detalles["errores"].append(
+                    f"{nombre_video}: error procesando video ({exc})."
+                )
+                detalles["videos_omitidos"] += 1
+                continue
             finally:
                 if os.path.exists(tmp_dir):
                     for root, _dirs, files in os.walk(tmp_dir):

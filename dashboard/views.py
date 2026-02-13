@@ -1,6 +1,7 @@
 import os
 import re
 import shutil
+from celery.result import AsyncResult
 from datetime import datetime
 from rest_framework import viewsets, status
 from rest_framework.exceptions import ValidationError
@@ -26,8 +27,8 @@ from dashboard.services.calcular_duracion_video import (
 )
 from dashboard.services.importar_velocidades_csv import importar_velocidades_csv
 from dashboard.services.importar_velocidades_xlsx import importar_velocidades_xlsx
-from dashboard.services.importar_videos_mdvr import importar_videos_mdvr
 from dashboard.services.preview_video import obtener_preview_video
+from dashboard.tasks import importar_videos_mdvr_task
 
 _PATRON_NOMBRE_VIDEO = re.compile(
     r"^(?P<equipo>\d+)-(?P<fecha>\d{6})-(?P<inicio>\d{6})-(?P<fin>\d{6})-(?P<codigo>\d+)$"
@@ -417,14 +418,36 @@ class VideoViewSet(viewsets.ModelViewSet):
 
     @action(detail=False, methods=["post"], url_path="importar-mdvr")
     def importar_mdvr(self, request):
-        """Importa videos MDVR desde el servidor."""
+        """Encola importación MDVR en Celery para no bloquear el API."""
         incluir_velocidades = request.query_params.get("velocidades", "1").lower() in {
             "1",
             "true",
             "yes",
         }
-        resultado = importar_videos_mdvr(importar_velocidades=incluir_velocidades)
-        return Response(resultado, status=status.HTTP_201_CREATED)
+        task = importar_videos_mdvr_task.delay(importar_velocidades=incluir_velocidades)
+        return Response(
+            {
+                "task_id": task.id,
+                "status": "queued",
+                "importar_velocidades": incluir_velocidades,
+            },
+            status=status.HTTP_202_ACCEPTED,
+        )
+
+    @action(detail=False, methods=["get"], url_path="importar-mdvr-estado")
+    def importar_mdvr_estado(self, request):
+        task_id = (request.query_params.get("task_id") or "").strip()
+        if not task_id:
+            raise ValidationError("Debe indicar 'task_id'.")
+
+        task = AsyncResult(task_id)
+        response = {"task_id": task_id, "status": task.status}
+        if task.ready():
+            if task.successful():
+                response["resultado"] = task.result
+            else:
+                response["error"] = str(task.result)
+        return Response(response)
 
 
 # class OperadorViewSet(viewsets.ModelViewSet):
