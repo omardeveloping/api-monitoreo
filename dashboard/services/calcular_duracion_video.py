@@ -34,6 +34,7 @@ PERMISOS_ARCHIVO_VIDEO = 0o644
 _AUDIO_SAMPLE_RATE_MP4_DEFAULT = 44100
 _AUDIO_SAMPLE_RATE_MIN_DEFAULT = 22050
 _FPS_DIFF_UMBRAL_DEFAULT = 0.02
+_H264_OUTPUT_FPS_DEFAULT = "25"
 MP4_VIDEO_PROFILE = (os.environ.get("MP4_VIDEO_PROFILE", "baseline") or "").strip().lower()
 MP4_VIDEO_LEVEL = (os.environ.get("MP4_VIDEO_LEVEL", "") or "").strip()
 MP4_TARGET_FPS = (os.environ.get("MP4_TARGET_FPS", "") or "").strip()
@@ -396,48 +397,29 @@ def envolver_h264_en_mp4(ruta_h264):
         raise ValidationError("No se encontró la ruta del archivo H264.")
 
     ruta_salida = os.path.splitext(ruta_h264)[0] + ".mp4"
+    fps_salida = MP4_TARGET_FPS or _H264_OUTPUT_FPS_DEFAULT
 
     def construir_comandos_ffmpeg(ruta_entrada):
         return [
             [
                 "ffmpeg",
                 "-y",
-                "-i",
-                ruta_entrada,
-                "-c",
-                "copy",
-                "-movflags",
-                "+faststart",
-                ruta_salida,
-            ],
-            [
-                "ffmpeg",
-                "-y",
+                "-hide_banner",
+                "-loglevel",
+                "error",
                 "-probesize",
-                "50M",
+                "100M",
                 "-analyzeduration",
-                "50M",
+                "100M",
                 "-fflags",
-                "+genpts",
+                "+genpts+discardcorrupt",
+                "-err_detect",
+                "ignore_err",
+                "-f",
+                "h264",
                 "-i",
                 ruta_entrada,
-                "-c",
-                "copy",
-                "-movflags",
-                "+faststart",
-                ruta_salida,
-            ],
-            [
-                "ffmpeg",
-                "-y",
-                "-probesize",
-                "50M",
-                "-analyzeduration",
-                "50M",
-                "-fflags",
-                "+genpts",
-                "-i",
-                ruta_entrada,
+                "-an",
                 "-c:v",
                 "libx264",
                 "-preset",
@@ -446,6 +428,39 @@ def envolver_h264_en_mp4(ruta_h264):
                 "23",
                 "-pix_fmt",
                 "yuv420p",
+                "-r",
+                fps_salida,
+                "-movflags",
+                "+faststart",
+                ruta_salida,
+            ],
+            [
+                "ffmpeg",
+                "-y",
+                "-hide_banner",
+                "-loglevel",
+                "error",
+                "-probesize",
+                "100M",
+                "-analyzeduration",
+                "100M",
+                "-fflags",
+                "+genpts+discardcorrupt",
+                "-err_detect",
+                "ignore_err",
+                "-i",
+                ruta_entrada,
+                "-an",
+                "-c:v",
+                "libx264",
+                "-preset",
+                "veryfast",
+                "-crf",
+                "23",
+                "-pix_fmt",
+                "yuv420p",
+                "-r",
+                fps_salida,
                 "-movflags",
                 "+faststart",
                 ruta_salida,

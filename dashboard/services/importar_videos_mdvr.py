@@ -31,6 +31,16 @@ _XLSX_RE = re.compile(
     r"(?P<fin_fecha>\d{4}-\d{2}-\d{2})\s+(?P<fin_hora>\d{2}-\d{2}-\d{2})\.xlsx$",
     re.IGNORECASE,
 )
+_MIN_DURACION_ALINEACION_DEFAULT = 60
+try:
+    MIN_DURACION_ALINEACION_SEGUNDOS = int(
+        os.environ.get(
+            "MDVR_MIN_DURACION_ALINEACION_SEGUNDOS",
+            _MIN_DURACION_ALINEACION_DEFAULT,
+        )
+    )
+except ValueError:
+    MIN_DURACION_ALINEACION_SEGUNDOS = _MIN_DURACION_ALINEACION_DEFAULT
 
 
 @dataclass(frozen=True)
@@ -310,13 +320,21 @@ def _recortar_video(video: Video, segundos: int) -> bool:
 
 
 def _alinear_duraciones(videos: list[Video]) -> int:
-    duraciones = [video.duracion for video in videos if video.duracion]
-    if not duraciones:
+    duraciones_validas = [
+        video.duracion
+        for video in videos
+        if video.duracion and video.duracion >= MIN_DURACION_ALINEACION_SEGUNDOS
+    ]
+    if len(duraciones_validas) < 2:
         return 0
-    objetivo = min(duraciones)
+    objetivo = min(duraciones_validas)
     recortados = 0
     for video in videos:
-        if video.duracion and video.duracion > objetivo:
+        if (
+            video.duracion
+            and video.duracion >= MIN_DURACION_ALINEACION_SEGUNDOS
+            and video.duracion > objetivo
+        ):
             if _recortar_video(video, objetivo):
                 recortados += 1
     return recortados
