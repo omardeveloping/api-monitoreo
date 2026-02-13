@@ -30,7 +30,31 @@ services:
   celery:
     build: .
     restart: unless-stopped
-    command: celery -A apiMonitoreo worker -l info
+    command: celery -A apiMonitoreo worker -l info -Q celery -c 2 --prefetch-multiplier=1
+    env_file: .env
+    environment:
+      DJANGO_DEBUG: "${DJANGO_DEBUG:-1}"
+      DJANGO_ALLOWED_HOSTS: "${DJANGO_ALLOWED_HOSTS:-localhost,127.0.0.1,0.0.0.0}"
+      DJANGO_SECRET_KEY: "${DJANGO_SECRET_KEY:-}"
+      DJANGO_SQLITE_PATH: "${DJANGO_SQLITE_PATH:-/data/db.sqlite3}"
+      CELERY_BROKER_URL: "${CELERY_BROKER_URL:-redis://redis:6379/0}"
+      CELERY_RESULT_BACKEND: "${CELERY_RESULT_BACKEND:-redis://redis:6379/0}"
+      VIDEOS_IMPORT_DIR: "${VIDEOS_IMPORT_DIR:-/data/windows_share/videos_MDVR}"
+      FORZAR_TRANSCODIFICACION_MP4: "${FORZAR_TRANSCODIFICACION_MP4:-1}"
+      MP4_VIDEO_PROFILE: "${MP4_VIDEO_PROFILE:-baseline}"
+      MP4_VIDEO_LEVEL: "${MP4_VIDEO_LEVEL:-4.1}"
+      MP4_TARGET_FPS: "${MP4_TARGET_FPS:-25}"
+    volumes:
+      - .:/app
+      - sqlite_data:/data
+      - "${VIDEOS_IMPORT_DIR_HOST:-/data/windows_share/videos_MDVR}:/data/windows_share/videos_MDVR:ro"
+    depends_on:
+      - redis
+
+  celery-mdvr:
+    build: .
+    restart: unless-stopped
+    command: celery -A apiMonitoreo worker -l info -Q mdvr -c 1 --prefetch-multiplier=1 --max-tasks-per-child=5
     env_file: .env
     environment:
       DJANGO_DEBUG: "${DJANGO_DEBUG:-1}"

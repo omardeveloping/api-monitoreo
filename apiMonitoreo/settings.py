@@ -227,6 +227,18 @@ CELERY_RESULT_BACKEND = os.environ.get(
     "CELERY_RESULT_BACKEND", CELERY_BROKER_URL
 )
 CELERY_TIMEZONE = TIME_ZONE
+CELERY_TASK_TRACK_STARTED = True
+CELERY_WORKER_PREFETCH_MULTIPLIER = 1
+CELERY_TASK_ROUTES = {
+    "dashboard.tasks.importar_videos_mdvr_task": {"queue": "mdvr"},
+}
+CELERY_TASK_ANNOTATIONS = {
+    "dashboard.tasks.importar_videos_mdvr_task": {
+        "soft_time_limit": int(os.environ.get("MDVR_IMPORT_SOFT_TIME_LIMIT", "1800")),
+        "time_limit": int(os.environ.get("MDVR_IMPORT_TIME_LIMIT", "2100")),
+        "rate_limit": os.environ.get("MDVR_IMPORT_RATE_LIMIT", "1/m"),
+    }
+}
 CELERY_BEAT_SCHEDULE = {
     "actualizar-turnos-activos": {
         "task": "dashboard.tasks.actualizar_turnos_activos",
