@@ -27,6 +27,10 @@ _SEGMENTO_RE = re.compile(
     r"^(?P<equipo>\d+)-(?P<camara>\d{2})-(?P<inicio>\d{6})-(?P<fin>\d{6})-.*\.(?P<ext>h264|grec)$",
     re.IGNORECASE,
 )
+_SEGMENTO_GREC_NUEVO_RE = re.compile(
+    r"^(?P<equipo>\d+)-(?P<fecha>\d{6})-(?P<inicio>\d{6})-(?P<fin>\d{6})-(?P<codigo>\d+)\.grec$",
+    re.IGNORECASE,
+)
 _XLSX_RE = re.compile(
     r"^(?P<id>\d+)\s+"
     r"(?P<inicio_fecha>\d{4}-\d{2}-\d{2})\s+(?P<inicio_hora>\d{2}-\d{2}-\d{2})\s*~\s*"
@@ -72,6 +76,35 @@ def _parse_hora_hhmmss(valor: str) -> datetime.time | None:
     if not (0 <= hh < 24 and 0 <= mm < 60 and 0 <= ss < 60):
         return None
     return datetime.time(hh, mm, ss)
+
+
+def _parse_fecha_yymmdd(valor: str) -> datetime.date | None:
+    if not valor or len(valor) != 6 or not valor.isdigit():
+        return None
+    try:
+        ano = 2000 + int(valor[0:2])
+        mes = int(valor[2:4])
+        dia = int(valor[4:6])
+        return datetime.date(ano, mes, dia)
+    except ValueError:
+        return None
+
+
+def _extraer_camara_desde_codigo_nuevo(codigo: str) -> int | None:
+    """
+    Formato observado: 20010100 / 20010200 / 20010300.
+    Se toma la pareja central para inferir cámara (01..04).
+    """
+    if not codigo or len(codigo) < 6 or not codigo.isdigit():
+        return None
+    camara_txt = codigo[4:6]
+    try:
+        camara = int(camara_txt)
+    except ValueError:
+        return None
+    if camara not in {1, 2, 3, 4}:
+        return None
+    return camara
 
 
 def _parse_hora_hh_mm_ss(valor: str) -> datetime.time | None:
@@ -182,17 +215,35 @@ def _seleccionar_xlsx(xlsx_files: list[XlsxInfo], fecha_inicio: datetime.datetim
 def _segmento_desde_archivo(ruta: str, fecha: datetime.date) -> SegmentoVideo | None:
     nombre = os.path.basename(ruta)
     match = _SEGMENTO_RE.match(nombre)
-    if not match:
-        return None
-    camara_raw = match.group("camara")
-    try:
-        camara = int(camara_raw)
-    except ValueError:
-        return None
+    camara = None
+    inicio_raw = None
+    fin_raw = None
+
+    if match:
+        camara_raw = match.group("camara")
+        try:
+            camara = int(camara_raw)
+        except ValueError:
+            return None
+        inicio_raw = match.group("inicio")
+        fin_raw = match.group("fin")
+    else:
+        match_nuevo = _SEGMENTO_GREC_NUEVO_RE.match(nombre)
+        if not match_nuevo:
+            return None
+        fecha_archivo = _parse_fecha_yymmdd(match_nuevo.group("fecha"))
+        if not fecha_archivo or fecha_archivo != fecha:
+            return None
+        camara = _extraer_camara_desde_codigo_nuevo(match_nuevo.group("codigo"))
+        if camara is None:
+            return None
+        inicio_raw = match_nuevo.group("inicio")
+        fin_raw = match_nuevo.group("fin")
+
     if camara not in {1, 2, 3, 4}:
         return None
-    inicio = _parse_hora_hhmmss(match.group("inicio"))
-    fin = _parse_hora_hhmmss(match.group("fin"))
+    inicio = _parse_hora_hhmmss(inicio_raw)
+    fin = _parse_hora_hhmmss(fin_raw)
     if not inicio or not fin:
         return None
     inicio_dt = datetime.datetime.combine(fecha, inicio)
