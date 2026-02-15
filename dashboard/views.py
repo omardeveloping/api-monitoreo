@@ -34,6 +34,84 @@ _PATRON_NOMBRE_VIDEO = re.compile(
     r"^(?P<equipo>\d+)-(?P<fecha>\d{6})-(?P<inicio>\d{6})-(?P<fin>\d{6})-(?P<codigo>\d+)$"
 )
 
+_FS_IGNORADOS_MONTAJES = {
+    "autofs",
+    "binfmt_misc",
+    "bpf",
+    "cgroup",
+    "cgroup2",
+    "configfs",
+    "debugfs",
+    "devpts",
+    "devtmpfs",
+    "efivarfs",
+    "fusectl",
+    "hugetlbfs",
+    "mqueue",
+    "nsfs",
+    "overlay",
+    "proc",
+    "pstore",
+    "ramfs",
+    "rpc_pipefs",
+    "securityfs",
+    "squashfs",
+    "sysfs",
+    "tmpfs",
+    "tracefs",
+}
+
+
+def _desescapar_mount(valor: str) -> str:
+    return (
+        (valor or "")
+        .replace("\\040", " ")
+        .replace("\\011", "\t")
+        .replace("\\012", "\n")
+        .replace("\\134", "\\")
+    )
+
+
+def _normalizar_rutas_unicas(rutas):
+    vistas = set()
+    resultado = []
+    for ruta in rutas:
+        if not ruta:
+            continue
+        ruta_real = os.path.realpath(ruta.strip())
+        if not ruta_real or ruta_real in vistas:
+            continue
+        vistas.add(ruta_real)
+        resultado.append(ruta_real)
+    return resultado
+
+
+def _listar_montajes_disponibles():
+    montajes = []
+    try:
+        with open("/proc/mounts", "r", encoding="utf-8") as archivo:
+            for linea in archivo:
+                partes = linea.split()
+                if len(partes) < 3:
+                    continue
+                dispositivo = _desescapar_mount(partes[0])
+                punto_montaje = _desescapar_mount(partes[1])
+                fs_tipo = (partes[2] or "").lower()
+
+                if fs_tipo in _FS_IGNORADOS_MONTAJES:
+                    continue
+                if dispositivo.startswith("/dev/loop"):
+                    continue
+                if not punto_montaje.startswith("/"):
+                    continue
+                if not os.path.isdir(punto_montaje):
+                    continue
+
+                montajes.append(punto_montaje)
+    except OSError:
+        return []
+    return _normalizar_rutas_unicas(montajes)
+
 
 def _formatear_nombre_archivo(nombre_archivo: str) -> str:
     base, _ext = os.path.splitext(nombre_archivo or "")
@@ -523,6 +601,11 @@ class EspacioDiscoViewSet(viewsets.ViewSet):
     def list(self, request):
         rutas_param = (request.query_params.get("rutas") or "").strip()
         rutas_env = (os.environ.get("ESPACIO_DISCO_RUTAS") or "").strip()
+        auto_montajes = (
+            request.query_params.get("auto_montajes", "1").strip().lower()
+            in {"1", "true", "yes"}
+        )
+        rutas_detectadas = []
         if rutas_param:
             rutas = [ruta.strip() for ruta in rutas_param.split(",") if ruta.strip()]
         elif rutas_env:
@@ -530,6 +613,11 @@ class EspacioDiscoViewSet(viewsets.ViewSet):
         else:
             ruta = getattr(settings, "ESPACIO_DISCO_RUTA", "/")
             rutas = [ruta] if ruta else []
+            if auto_montajes:
+                rutas_detectadas = _listar_montajes_disponibles()
+                rutas.extend(rutas_detectadas)
+
+        rutas = _normalizar_rutas_unicas(rutas)
 
         if not rutas:
             raise ValidationError("No hay rutas configuradas para calcular espacio.")
@@ -579,6 +667,7 @@ class EspacioDiscoViewSet(viewsets.ViewSet):
         return Response(
             {
                 "rutas": rutas,
+                "rutas_detectadas_auto": rutas_detectadas,
                 "count": len(discos),
                 "discos": discos,
                 "totales": {
