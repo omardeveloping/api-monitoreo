@@ -47,6 +47,16 @@ try:
     )
 except ValueError:
     MIN_DURACION_ALINEACION_SEGUNDOS = _MIN_DURACION_ALINEACION_DEFAULT
+_MAX_DESFASE_INICIO_ALINEACION_DEFAULT = 15
+try:
+    MAX_DESFASE_INICIO_ALINEACION_SEGUNDOS = int(
+        os.environ.get(
+            "MDVR_MAX_DESFASE_INICIO_ALINEACION_SEGUNDOS",
+            _MAX_DESFASE_INICIO_ALINEACION_DEFAULT,
+        )
+    )
+except ValueError:
+    MAX_DESFASE_INICIO_ALINEACION_SEGUNDOS = _MAX_DESFASE_INICIO_ALINEACION_DEFAULT
 
 
 @dataclass(frozen=True)
@@ -340,51 +350,97 @@ def _subir_archivo_temporal(ruta_local: str, nombre_base: str) -> str:
     return destino
 
 
-def _recortar_video(video: Video, segundos: int) -> bool:
-    if segundos <= 0:
+def _recortar_video(video: Video, segundos: int, inicio_offset: int = 0) -> bool:
+    if segundos <= 0 or inicio_offset < 0:
         return False
+    segundos = int(segundos)
+    inicio_offset = int(inicio_offset)
     ruta = video.ruta_archivo.path
     base, ext = os.path.splitext(ruta)
     ruta_tmp = f"{base}.trim{ext}"
-    try:
-        subprocess.run(
-            [
-                "ffmpeg",
-                "-hide_banner",
-                "-loglevel",
-                "error",
-                "-i",
-                ruta,
+    base_cmd = ["ffmpeg", "-hide_banner", "-loglevel", "error", "-i", ruta]
+    if inicio_offset > 0:
+        # Con desplazamiento de inicio se transcodifica para evitar cortes en keyframe
+        # que dejen cámaras aún desfasadas.
+        comandos = [
+            base_cmd
+            + [
+                "-ss",
+                str(inicio_offset),
                 "-t",
                 str(segundos),
-                "-c",
-                "copy",
+                "-c:v",
+                "libx264",
+                "-preset",
+                "veryfast",
+                "-crf",
+                "23",
+                "-pix_fmt",
+                "yuv420p",
+                "-an",
+                "-y",
+                ruta_tmp,
+            ]
+        ]
+    else:
+        comandos = [
+            base_cmd + ["-t", str(segundos), "-c", "copy", "-y", ruta_tmp],
+            base_cmd
+            + [
+                "-t",
+                str(segundos),
+                "-c:v",
+                "libx264",
+                "-preset",
+                "veryfast",
+                "-crf",
+                "23",
+                "-pix_fmt",
+                "yuv420p",
+                "-an",
                 "-y",
                 ruta_tmp,
             ],
-            capture_output=True,
-            text=True,
-            check=True,
-        )
-    except (subprocess.CalledProcessError, FileNotFoundError):
-        if os.path.exists(ruta_tmp):
-            os.remove(ruta_tmp)
+        ]
+
+    ejecutado = False
+    for comando in comandos:
+        try:
+            subprocess.run(comando, capture_output=True, text=True, check=True)
+            ejecutado = True
+            break
+        except (subprocess.CalledProcessError, FileNotFoundError):
+            if os.path.exists(ruta_tmp):
+                os.remove(ruta_tmp)
+
+    if not ejecutado:
         return False
 
     os.replace(ruta_tmp, ruta)
     nueva_duracion = math.floor(calcular_duracion_video(ruta))
     video.duracion = nueva_duracion
     inicio = video.inicio_timestamp or datetime.time(0, 0)
-    fin = (
+    if isinstance(inicio, datetime.datetime):
+        inicio = inicio.time()
+    inicio_dt = (
         datetime.datetime.combine(datetime.date.today(), inicio)
+        + datetime.timedelta(seconds=inicio_offset)
+    )
+    video.inicio_timestamp = inicio_dt.time()
+    fin = (
+        datetime.datetime.combine(datetime.date.today(), video.inicio_timestamp)
         + datetime.timedelta(seconds=nueva_duracion)
     ).time()
     video.fin_timestamp = fin
-    video.save(update_fields=["duracion", "fin_timestamp"])
+    campos = ["duracion", "inicio_timestamp", "fin_timestamp"]
+    if video.fecha_inicio is not None:
+        video.fecha_inicio = video.fecha_inicio + datetime.timedelta(seconds=inicio_offset)
+        campos.append("fecha_inicio")
+    video.save(update_fields=campos)
     return True
 
 
-def _alinear_duraciones(videos: list[Video]) -> int:
+def _alinear_por_duracion_minima(videos: list[Video]) -> int:
     duraciones_validas = [
         video.duracion
         for video in videos
@@ -403,6 +459,52 @@ def _alinear_duraciones(videos: list[Video]) -> int:
             if _recortar_video(video, objetivo):
                 recortados += 1
     return recortados
+
+
+def _alinear_por_solape(videos: list[Video]) -> tuple[bool, int]:
+    ventanas = []
+    for video in videos:
+        if (
+            not video.fecha_inicio
+            or not video.duracion
+            or video.duracion < MIN_DURACION_ALINEACION_SEGUNDOS
+        ):
+            continue
+        inicio = video.fecha_inicio
+        fin = inicio + datetime.timedelta(seconds=video.duracion)
+        ventanas.append((video, inicio, fin))
+
+    if len(ventanas) < 2:
+        return False, 0
+
+    inicios = [inicio for _, inicio, _ in ventanas]
+    desfase_inicio = int((max(inicios) - min(inicios)).total_seconds())
+    if desfase_inicio > MAX_DESFASE_INICIO_ALINEACION_SEGUNDOS:
+        return False, 0
+
+    inicio_objetivo = max(inicios)
+    fin_objetivo = min(fin for _, _, fin in ventanas)
+    duracion_objetivo = int((fin_objetivo - inicio_objetivo).total_seconds())
+    if duracion_objetivo <= 0:
+        return True, 0
+
+    recortados = 0
+    for video, inicio, _ in ventanas:
+        inicio_offset = int((inicio_objetivo - inicio).total_seconds())
+        inicio_offset = max(0, inicio_offset)
+        if video.duracion == duracion_objetivo and inicio_offset == 0:
+            continue
+        if _recortar_video(video, duracion_objetivo, inicio_offset=inicio_offset):
+            recortados += 1
+
+    return True, recortados
+
+
+def _alinear_duraciones(videos: list[Video]) -> int:
+    aplicado_por_solape, recortados = _alinear_por_solape(videos)
+    if aplicado_por_solape:
+        return recortados
+    return _alinear_por_duracion_minima(videos)
 
 
 def _parse_fecha_objetivo(
@@ -525,6 +627,7 @@ def _importar_camion_mdvr(
 
         turnos_creados = {}
         videos_turno: dict[str, list[Video]] = {}
+        xlsx_por_video: dict[int, str] = {}
 
         for (tipo_turno, camara), lista in grupos.items():
             lista.sort(key=lambda s: s.inicio_dt)
@@ -587,13 +690,7 @@ def _importar_camion_mdvr(
                 if importar_velocidades:
                     xlsx_info = _seleccionar_xlsx(xlsx_files, inicio_dt)
                     if xlsx_info:
-                        try:
-                            with open(xlsx_info.ruta, "rb") as archivo:
-                                importar_velocidades_xlsx(video, archivo)
-                        except Exception as exc:
-                            detalles["errores"].append(
-                                f"{nombre_video}: error importando velocidades ({exc})."
-                            )
+                        xlsx_por_video[video.id] = xlsx_info.ruta
             except Exception as exc:
                 detalles["errores"].append(
                     f"{nombre_video}: error procesando video ({exc})."
@@ -616,5 +713,19 @@ def _importar_camion_mdvr(
         for tipo_turno, videos in videos_turno.items():
             detalles["turnos_procesados"] += 1
             detalles["recortados"] += _alinear_duraciones(videos)
+
+            if not importar_velocidades:
+                continue
+            for video in videos:
+                ruta_xlsx = xlsx_por_video.get(video.id)
+                if not ruta_xlsx:
+                    continue
+                try:
+                    with open(ruta_xlsx, "rb") as archivo:
+                        importar_velocidades_xlsx(video, archivo)
+                except Exception as exc:
+                    detalles["errores"].append(
+                        f"{video.nombre}: error importando velocidades ({exc})."
+                    )
 
     return detalles

@@ -1,11 +1,12 @@
 import datetime
 from collections import namedtuple
+from types import SimpleNamespace
 from unittest.mock import mock_open, patch
 
 from django.test import SimpleTestCase, override_settings
 from rest_framework.test import APIRequestFactory
 
-from dashboard.services.importar_videos_mdvr import _segmento_desde_archivo
+from dashboard.services.importar_videos_mdvr import _alinear_duraciones, _segmento_desde_archivo
 from dashboard.views import EspacioDiscoViewSet, _listar_montajes_disponibles
 
 
@@ -121,3 +122,51 @@ class EspacioDiscoMontajesTests(SimpleTestCase):
         self.assertEqual(response.status_code, 200)
         self.assertEqual(response.data["rutas"], ["/"])
         self.assertEqual(response.data["rutas_detectadas_auto"], [])
+
+
+class AlineacionVideosMdvrTests(SimpleTestCase):
+    def test_alinea_inicio_y_duracion_con_desfase_pequeno(self):
+        base = datetime.datetime(2026, 2, 15, 8, 0, 0)
+        video_1 = SimpleNamespace(duracion=600, fecha_inicio=base)
+        video_2 = SimpleNamespace(
+            duracion=600,
+            fecha_inicio=base + datetime.timedelta(seconds=10),
+        )
+
+        with patch(
+            "dashboard.services.importar_videos_mdvr._recortar_video",
+            return_value=True,
+        ) as recortar_mock, patch(
+            "dashboard.services.importar_videos_mdvr.MAX_DESFASE_INICIO_ALINEACION_SEGUNDOS",
+            15,
+        ):
+            recortados = _alinear_duraciones([video_1, video_2])
+
+        self.assertEqual(recortados, 2)
+        self.assertEqual(recortar_mock.call_count, 2)
+        self.assertEqual(recortar_mock.call_args_list[0].args[1], 590)
+        self.assertEqual(recortar_mock.call_args_list[0].kwargs["inicio_offset"], 10)
+        self.assertEqual(recortar_mock.call_args_list[1].args[1], 590)
+        self.assertEqual(recortar_mock.call_args_list[1].kwargs["inicio_offset"], 0)
+
+    def test_desfase_grande_ca_e_a_recorte_por_duracion(self):
+        base = datetime.datetime(2026, 2, 15, 8, 0, 0)
+        video_1 = SimpleNamespace(duracion=600, fecha_inicio=base)
+        video_2 = SimpleNamespace(
+            duracion=590,
+            fecha_inicio=base + datetime.timedelta(seconds=30),
+        )
+
+        with patch(
+            "dashboard.services.importar_videos_mdvr._recortar_video",
+            return_value=True,
+        ) as recortar_mock, patch(
+            "dashboard.services.importar_videos_mdvr.MAX_DESFASE_INICIO_ALINEACION_SEGUNDOS",
+            15,
+        ):
+            recortados = _alinear_duraciones([video_1, video_2])
+
+        self.assertEqual(recortados, 1)
+        self.assertEqual(recortar_mock.call_count, 1)
+        self.assertEqual(recortar_mock.call_args.args[1], 590)
+        self.assertEqual(recortar_mock.call_args.kwargs, {})
