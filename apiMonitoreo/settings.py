@@ -83,7 +83,7 @@ INSTALLED_APPS = [
 REST_USE_JWT = True
 SIMPLE_JWT = {"AUTH_HEADER_TYPES": ("Bearer",)}
 SITE_ID = 1
-REST_SESSION_LOGIN = False
+REST_SESSION_LOGIN = True
 REST_AUTH_TOKEN_MODEL = None
 
 # USUARIOS PERSONALIZADOS
@@ -111,6 +111,7 @@ REST_AUTH_SERIALIZERS = {
 REST_FRAMEWORK = {
     "DEFAULT_AUTHENTICATION_CLASSES": [
         "rest_framework_simplejwt.authentication.JWTAuthentication",
+        "rest_framework.authentication.SessionAuthentication",
     ],
 }
 
