@@ -6,6 +6,7 @@ from datetime import datetime
 from rest_framework import viewsets, status
 from rest_framework.exceptions import ValidationError
 from rest_framework.parsers import FormParser, MultiPartParser
+from rest_framework.permissions import DjangoModelPermissions, IsAuthenticated
 from rest_framework.response import Response
 from rest_framework.decorators import action
 from django.conf import settings
@@ -270,6 +271,7 @@ class TurnoViewSet(viewsets.ModelViewSet):
 class VideoViewSet(viewsets.ModelViewSet):
     queryset = Video.objects.all()
     serializer_class = VideoSerializer
+    permission_classes = [IsAuthenticated, DjangoModelPermissions]
 
     def perform_create(self, serializer):
         video = serializer.save()
@@ -585,6 +587,7 @@ class VideoViewSet(viewsets.ModelViewSet):
 class IncidenteViewSet(viewsets.ModelViewSet):
     queryset = Incidente.objects.all()
     serializer_class = IncidenteSerializer
+    permission_classes = [IsAuthenticated, DjangoModelPermissions]
 
     @action(detail=False, methods=["get"], url_path="contar-alta")
     def contar_alta(self, request):

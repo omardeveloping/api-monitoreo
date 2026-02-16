@@ -110,9 +110,16 @@ class VelocidadVideo(models.Model):
 
 class Incidente(models.Model):
     class TipoIncidente(models.TextChoices):
-        FRENADO_BRUSCO = "frenado_brusco", "Frenado Brusco"
-        EXCESO_VELOCIDAD = "exceso_velocidad", "Exceso Velocidad"
-        COLISION = "colision", "Colisión"
+        FRENADO_BRUSCO = "frenado_brusco", "Frenado o Giro Brusco"
+        EXCESO_VELOCIDAD = "exceso_velocidad", "Exceso de Velocidad"
+        COLISION = "colision", "Impacto o Colisión"
+        SOBRECARGA = "sobrecarga", "Sobrecarga"
+        INGRESO_ZONA_RESTRINGIDA = "ingreso_zona_restringida", "Ingreso a Zona Restringida o Peatonal"
+        FALLA_MECANICA_HIDRAULICA_ELECTRICA = (
+            "falla_mecanica_hidraulica_electrica",
+            "Falla Mecánica, Hidráulica o Eléctrica",
+        )
+        PERDIDA_GPS_COMUNICACION = "perdida_gps_comunicacion", "Pérdida de GPS o Comunicación"
         DISTRACCION = "distraccion", "Distracción"
         FATIGA_SUENO = "fatiga_sueno", "Fatiga / Sueño"
         OTRO = "otro", "Otro"
@@ -188,5 +195,3 @@ class EstadisticaVideoDiaria(models.Model):
 
 #     def __str__(self):
 #         return f"{self.camion} - {self.fecha}"
-
-
