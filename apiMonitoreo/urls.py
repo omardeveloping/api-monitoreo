@@ -24,6 +24,7 @@ from usuarios.views import CustomRegisterAPIView, CustomLoginView, CustomTokenOb
 urlpatterns = [
     path('admin/', admin.site.urls),
     path('api/admin/', admin.site.urls),
+    path('api/dashboard/admin/', admin.site.urls),
     path('api/', include('dashboard.urls')),
     path('api/', include('usuarios.urls')),
     path('api/auth/login/', CustomTokenObtainPairView.as_view(), name='rest_login'),
