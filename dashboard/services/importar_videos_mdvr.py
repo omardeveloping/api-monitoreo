@@ -24,11 +24,11 @@ from dashboard.services.importar_velocidades_xlsx import importar_velocidades_xl
 _DIR_FECHA_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
 _ID_PREFIX_RE = re.compile(r"^(?P<id>\d+)")
 _SEGMENTO_RE = re.compile(
-    r"^(?P<equipo>\d+)-(?P<camara>\d{2})-(?P<inicio>\d{6})-(?P<fin>\d{6})-.*\.(?P<ext>h264|grec)$",
+    r"^(?P<equipo>\d+)-(?P<camara>\d{2})-(?P<inicio>\d{6})-(?P<fin>\d{6})-.*\.(?P<ext>h264|grec|mp4)$",
     re.IGNORECASE,
 )
 _SEGMENTO_GREC_NUEVO_RE = re.compile(
-    r"^(?P<equipo>\d+)-(?P<fecha>\d{6})-(?P<inicio>\d{6})-(?P<fin>\d{6})-(?P<codigo>\d+)\.grec$",
+    r"^(?P<equipo>\d+)-(?P<fecha>\d{6})-(?P<inicio>\d{6})-(?P<fin>\d{6})-(?P<codigo>\d+)\.(?P<ext>grec|mp4)$",
     re.IGNORECASE,
 )
 _XLSX_RE = re.compile(
@@ -58,6 +58,8 @@ try:
 except ValueError:
     MAX_DESFASE_INICIO_ALINEACION_SEGUNDOS = _MAX_DESFASE_INICIO_ALINEACION_DEFAULT
 
+RAW_VIDEO_EXTENSIONS = {".h264", ".grec"}
+
 
 @dataclass(frozen=True)
 class SegmentoVideo:
@@ -65,6 +67,7 @@ class SegmentoVideo:
     camara: int
     inicio_dt: datetime.datetime
     fin_dt: datetime.datetime
+    extension: str
 
 
 @dataclass(frozen=True)
@@ -228,6 +231,7 @@ def _segmento_desde_archivo(ruta: str, fecha: datetime.date) -> SegmentoVideo | 
     camara = None
     inicio_raw = None
     fin_raw = None
+    ext = None
 
     if match:
         camara_raw = match.group("camara")
@@ -237,6 +241,7 @@ def _segmento_desde_archivo(ruta: str, fecha: datetime.date) -> SegmentoVideo | 
             return None
         inicio_raw = match.group("inicio")
         fin_raw = match.group("fin")
+        ext = f".{(match.group('ext') or '').lower()}"
     else:
         match_nuevo = _SEGMENTO_GREC_NUEVO_RE.match(nombre)
         if not match_nuevo:
@@ -249,6 +254,7 @@ def _segmento_desde_archivo(ruta: str, fecha: datetime.date) -> SegmentoVideo | 
             return None
         inicio_raw = match_nuevo.group("inicio")
         fin_raw = match_nuevo.group("fin")
+        ext = f".{(match_nuevo.group('ext') or '').lower()}"
 
     if camara not in {1, 2, 3, 4}:
         return None
@@ -260,7 +266,14 @@ def _segmento_desde_archivo(ruta: str, fecha: datetime.date) -> SegmentoVideo | 
     fin_dt = datetime.datetime.combine(fecha, fin)
     if fin_dt <= inicio_dt:
         fin_dt += datetime.timedelta(days=1)
-    return SegmentoVideo(ruta=ruta, camara=camara, inicio_dt=inicio_dt, fin_dt=fin_dt)
+    extension = ext or os.path.splitext(nombre)[1].lower()
+    return SegmentoVideo(
+        ruta=ruta,
+        camara=camara,
+        inicio_dt=inicio_dt,
+        fin_dt=fin_dt,
+        extension=extension,
+    )
 
 
 def _ffprobe_ok(ruta: str) -> bool:
@@ -341,6 +354,30 @@ def _concat_h264_transcodificando(segmentos: list[str], salida: str) -> tuple[bo
     finally:
         if os.path.exists(lista):
             os.remove(lista)
+
+
+def _concatenar_segmentos(segmentos: list[SegmentoVideo], salida: str) -> tuple[bool, str | None]:
+    rutas = [seg.ruta for seg in segmentos]
+    if not rutas:
+        return False, "sin segmentos para concatenar."
+
+    son_raw = all(seg.extension in RAW_VIDEO_EXTENSIONS for seg in segmentos)
+    if son_raw:
+        ok, error = _concat_h264(rutas, salida)
+        if ok:
+            return True, None
+
+    ok, error = _concat_h264_transcodificando(rutas, salida)
+    if ok:
+        return True, None
+
+    segmentos_validos = [ruta for ruta in rutas if _ffprobe_ok(ruta)]
+    if segmentos_validos and len(segmentos_validos) < len(rutas):
+        ok, error = _concat_h264_transcodificando(segmentos_validos, salida)
+        if ok:
+            return True, None
+
+    return False, error
 
 
 def _subir_archivo_temporal(ruta_local: str, nombre_base: str) -> str:
@@ -648,28 +685,21 @@ def _importar_camion_mdvr(
                 detalles["videos_omitidos"] += 1
                 continue
 
-            segmentos_paths = [seg.ruta for seg in lista]
             tmp_dir = tempfile.mkdtemp(prefix="mdvr_")
             try:
-                ruta_salida = os.path.join(
-                    tmp_dir, f"{nombre_video}.h264"
-                )
-                ok, error = _concat_h264(segmentos_paths, ruta_salida)
+                salida_es_raw = all(seg.extension in RAW_VIDEO_EXTENSIONS for seg in lista)
+                ext_salida = ".h264" if salida_es_raw else ".mp4"
+                ruta_salida = os.path.join(tmp_dir, f"{nombre_video}{ext_salida}")
+                ok, error = _concatenar_segmentos(lista, ruta_salida)
                 if not ok:
-                    ok, error = _concat_h264_transcodificando(segmentos_paths, ruta_salida)
-                if not ok:
-                    segmentos_validos = [p for p in segmentos_paths if _ffprobe_ok(p)]
-                    if segmentos_validos and len(segmentos_validos) < len(segmentos_paths):
-                        ok, error = _concat_h264_transcodificando(segmentos_validos, ruta_salida)
-                    if not ok:
-                        detalles["errores"].append(
-                            f"{nombre_video}: no se pudo concatenar segmentos ({error})."
-                        )
-                        detalles["videos_omitidos"] += 1
-                        continue
+                    detalles["errores"].append(
+                        f"{nombre_video}: no se pudo concatenar segmentos ({error})."
+                    )
+                    detalles["videos_omitidos"] += 1
+                    continue
 
                 destino_rel = _subir_archivo_temporal(
-                    ruta_salida, f"{nombre_video}.h264"
+                    ruta_salida, f"{nombre_video}{ext_salida}"
                 )
 
                 inicio_dt = lista[0].inicio_dt

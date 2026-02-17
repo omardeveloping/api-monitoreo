@@ -6,7 +6,12 @@ from unittest.mock import mock_open, patch
 from django.test import SimpleTestCase, override_settings
 from rest_framework.test import APIRequestFactory
 
-from dashboard.services.importar_videos_mdvr import _alinear_duraciones, _segmento_desde_archivo
+from dashboard.services.importar_videos_mdvr import (
+    SegmentoVideo,
+    _alinear_duraciones,
+    _concatenar_segmentos,
+    _segmento_desde_archivo,
+)
 from dashboard.views import EspacioDiscoViewSet, _listar_montajes_disponibles
 
 
@@ -24,6 +29,26 @@ class SegmentoDesdeArchivoTests(SimpleTestCase):
     def test_soporta_formato_grec_nuevo_con_datos_completos(self):
         segmento = _segmento_desde_archivo(
             "/tmp/4462510196-260202-041706-051706-20010300.grec",
+            datetime.date(2026, 2, 2),
+        )
+        self.assertIsNotNone(segmento)
+        self.assertEqual(segmento.camara, 3)
+        self.assertEqual(segmento.inicio_dt.time(), datetime.time(4, 17, 6))
+        self.assertEqual(segmento.fin_dt.time(), datetime.time(5, 17, 6))
+
+    def test_soporta_formato_mdvr_legacy_en_mp4(self):
+        segmento = _segmento_desde_archivo(
+            "/tmp/201-01-114614-120114-10p000.mp4",
+            datetime.date(2026, 1, 15),
+        )
+        self.assertIsNotNone(segmento)
+        self.assertEqual(segmento.camara, 1)
+        self.assertEqual(segmento.inicio_dt.time(), datetime.time(11, 46, 14))
+        self.assertEqual(segmento.fin_dt.time(), datetime.time(12, 1, 14))
+
+    def test_soporta_formato_grec_nuevo_en_mp4(self):
+        segmento = _segmento_desde_archivo(
+            "/tmp/4462510196-260202-041706-051706-20010300.mp4",
             datetime.date(2026, 2, 2),
         )
         self.assertIsNotNone(segmento)
@@ -170,3 +195,45 @@ class AlineacionVideosMdvrTests(SimpleTestCase):
         self.assertEqual(recortar_mock.call_count, 1)
         self.assertEqual(recortar_mock.call_args.args[1], 590)
         self.assertEqual(recortar_mock.call_args.kwargs, {})
+
+
+class ConcatenacionSegmentosMdvrTests(SimpleTestCase):
+    def _segmento(self, ruta: str, extension: str) -> SegmentoVideo:
+        base = datetime.datetime(2026, 2, 15, 8, 0, 0)
+        return SegmentoVideo(
+            ruta=ruta,
+            camara=1,
+            inicio_dt=base,
+            fin_dt=base + datetime.timedelta(minutes=10),
+            extension=extension,
+        )
+
+    def test_segmentos_mp4_omiten_concat_binaria(self):
+        segmentos = [self._segmento("/tmp/a.mp4", ".mp4")]
+        with patch(
+            "dashboard.services.importar_videos_mdvr._concat_h264",
+            return_value=(True, None),
+        ) as concat_raw, patch(
+            "dashboard.services.importar_videos_mdvr._concat_h264_transcodificando",
+            return_value=(True, None),
+        ) as concat_ffmpeg:
+            ok, _error = _concatenar_segmentos(segmentos, "/tmp/salida.mp4")
+
+        self.assertTrue(ok)
+        concat_raw.assert_not_called()
+        concat_ffmpeg.assert_called_once_with(["/tmp/a.mp4"], "/tmp/salida.mp4")
+
+    def test_segmentos_raw_intentan_concat_binaria_primero(self):
+        segmentos = [self._segmento("/tmp/a.h264", ".h264")]
+        with patch(
+            "dashboard.services.importar_videos_mdvr._concat_h264",
+            return_value=(True, None),
+        ) as concat_raw, patch(
+            "dashboard.services.importar_videos_mdvr._concat_h264_transcodificando",
+            return_value=(True, None),
+        ) as concat_ffmpeg:
+            ok, _error = _concatenar_segmentos(segmentos, "/tmp/salida.h264")
+
+        self.assertTrue(ok)
+        concat_raw.assert_called_once_with(["/tmp/a.h264"], "/tmp/salida.h264")
+        concat_ffmpeg.assert_not_called()
