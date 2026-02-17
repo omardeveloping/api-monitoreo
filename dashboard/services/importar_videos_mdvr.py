@@ -7,13 +7,14 @@ import subprocess
 import tempfile
 from dataclasses import dataclass
 
+from celery.exceptions import SoftTimeLimitExceeded
 from django.conf import settings
 from django.core.files import File
 from django.core.files.storage import default_storage
 from django.utils import timezone
 from rest_framework.exceptions import ValidationError
 
-from dashboard.models import Camion, TipoTurnoChoices, Turno, Video
+from dashboard.models import Camion, EstadoVideo, TipoTurnoChoices, Turno, Video
 from dashboard.services.calcular_duracion_video import (
     calcular_duracion_video,
     procesar_video_subida,
@@ -681,9 +682,20 @@ def _importar_camion_mdvr(
             nombre_video = (
                 f"MDVR_{carpeta_id}_{fecha.isoformat()}_{tipo_turno}_C{camara}"
             )
-            if Video.objects.filter(nombre=nombre_video, id_turno=turno).exists():
+            if Video.objects.filter(
+                nombre=nombre_video,
+                id_turno=turno,
+                estado=EstadoVideo.LISTO,
+            ).exists():
                 detalles["videos_omitidos"] += 1
                 continue
+
+            video_existente = (
+                Video.objects.filter(nombre=nombre_video, id_turno=turno)
+                .exclude(estado=EstadoVideo.LISTO)
+                .order_by("-id")
+                .first()
+            )
 
             tmp_dir = tempfile.mkdtemp(prefix="mdvr_")
             try:
@@ -703,15 +715,46 @@ def _importar_camion_mdvr(
                 )
 
                 inicio_dt = lista[0].inicio_dt
-                video = Video.objects.create(
-                    nombre=nombre_video,
-                    camara=camara,
-                    ruta_archivo=destino_rel,
-                    fecha_inicio=inicio_dt,
-                    fecha_subida=timezone.localdate(),
-                    inicio_timestamp=inicio_dt.time(),
-                    id_turno=turno,
-                )
+                if video_existente:
+                    ruta_previa = (video_existente.ruta_archivo.name or "").strip()
+                    video_existente.camara = camara
+                    video_existente.ruta_archivo = destino_rel
+                    video_existente.fecha_inicio = inicio_dt
+                    video_existente.fecha_subida = timezone.localdate()
+                    video_existente.inicio_timestamp = inicio_dt.time()
+                    video_existente.estado = EstadoVideo.PROCESANDO
+                    video_existente.duracion = None
+                    video_existente.fin_timestamp = None
+                    video_existente.mimetype = ""
+                    video_existente.save(
+                        update_fields=[
+                            "camara",
+                            "ruta_archivo",
+                            "fecha_inicio",
+                            "fecha_subida",
+                            "inicio_timestamp",
+                            "estado",
+                            "duracion",
+                            "fin_timestamp",
+                            "mimetype",
+                        ]
+                    )
+                    video = video_existente
+                    if ruta_previa and ruta_previa != destino_rel:
+                        try:
+                            default_storage.delete(ruta_previa)
+                        except Exception:
+                            pass
+                else:
+                    video = Video.objects.create(
+                        nombre=nombre_video,
+                        camara=camara,
+                        ruta_archivo=destino_rel,
+                        fecha_inicio=inicio_dt,
+                        fecha_subida=timezone.localdate(),
+                        inicio_timestamp=inicio_dt.time(),
+                        id_turno=turno,
+                    )
 
                 procesar_video_subida(video, video.ruta_archivo)
                 detalles["videos_creados"] += 1
@@ -721,6 +764,8 @@ def _importar_camion_mdvr(
                     xlsx_info = _seleccionar_xlsx(xlsx_files, inicio_dt)
                     if xlsx_info:
                         xlsx_por_video[video.id] = xlsx_info.ruta
+            except SoftTimeLimitExceeded:
+                raise
             except Exception as exc:
                 detalles["errores"].append(
                     f"{nombre_video}: error procesando video ({exc})."
@@ -753,6 +798,8 @@ def _importar_camion_mdvr(
                 try:
                     with open(ruta_xlsx, "rb") as archivo:
                         importar_velocidades_xlsx(video, archivo)
+                except SoftTimeLimitExceeded:
+                    raise
                 except Exception as exc:
                     detalles["errores"].append(
                         f"{video.nombre}: error importando velocidades ({exc})."
