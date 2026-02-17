@@ -4,12 +4,18 @@ from types import SimpleNamespace
 from unittest.mock import mock_open, patch
 
 from django.test import SimpleTestCase, override_settings
+from django.utils import timezone
+from rest_framework.exceptions import ValidationError
 from rest_framework.test import APIRequestFactory
 
+from dashboard.models import EstadoVideo
 from dashboard.services.importar_videos_mdvr import (
     SegmentoVideo,
+    _calcular_backoff_reintento,
     _alinear_duraciones,
     _concatenar_segmentos,
+    _es_error_transitorio,
+    _puede_reprocesarse,
     _segmento_desde_archivo,
 )
 from dashboard.views import EspacioDiscoViewSet, _listar_montajes_disponibles
@@ -237,3 +243,46 @@ class ConcatenacionSegmentosMdvrTests(SimpleTestCase):
         self.assertTrue(ok)
         concat_raw.assert_called_once_with(["/tmp/a.h264"], "/tmp/salida.h264")
         concat_ffmpeg.assert_not_called()
+
+
+class ReintentosMdvrTests(SimpleTestCase):
+    def test_detecta_error_transitorio_por_timeout(self):
+        self.assertTrue(_es_error_transitorio(TimeoutError("timeout")))
+
+    def test_detecta_validation_error_como_permanente(self):
+        self.assertFalse(_es_error_transitorio(ValidationError("formato invalido")))
+
+    def test_puede_reprocesarse_error_respeta_backoff(self):
+        ahora = timezone.now()
+        video = SimpleNamespace(
+            estado=EstadoVideo.ERROR,
+            reintentos=1,
+            proximo_reintento_en=ahora + datetime.timedelta(minutes=5),
+            creado_en=ahora - datetime.timedelta(hours=1),
+        )
+        self.assertFalse(_puede_reprocesarse(video, ahora))
+
+    def test_puede_reprocesarse_procesando_stale(self):
+        ahora = timezone.now()
+        video = SimpleNamespace(
+            estado=EstadoVideo.PROCESANDO,
+            reintentos=0,
+            proximo_reintento_en=ahora - datetime.timedelta(minutes=1),
+            creado_en=ahora - datetime.timedelta(hours=3),
+        )
+        self.assertTrue(_puede_reprocesarse(video, ahora))
+
+    def test_no_reprocesa_error_permanente(self):
+        ahora = timezone.now()
+        video = SimpleNamespace(
+            estado=EstadoVideo.ERROR_PERMANENTE,
+            reintentos=3,
+            proximo_reintento_en=None,
+            creado_en=ahora - datetime.timedelta(hours=10),
+        )
+        self.assertFalse(_puede_reprocesarse(video, ahora))
+
+    def test_backoff_reintento_crece(self):
+        primer = _calcular_backoff_reintento(1)
+        segundo = _calcular_backoff_reintento(2)
+        self.assertGreaterEqual(segundo, primer)

@@ -1,4 +1,5 @@
 import datetime
+import errno
 import math
 import os
 import re
@@ -59,7 +60,64 @@ try:
 except ValueError:
     MAX_DESFASE_INICIO_ALINEACION_SEGUNDOS = _MAX_DESFASE_INICIO_ALINEACION_DEFAULT
 
+_MAX_REINTENTOS_DEFAULT = 3
+try:
+    MAX_REINTENTOS_MDVR = int(os.environ.get("MDVR_MAX_REINTENTOS", _MAX_REINTENTOS_DEFAULT))
+except ValueError:
+    MAX_REINTENTOS_MDVR = _MAX_REINTENTOS_DEFAULT
+MAX_REINTENTOS_MDVR = max(0, MAX_REINTENTOS_MDVR)
+
+_BACKOFF_BASE_SEGUNDOS_DEFAULT = 300
+try:
+    BACKOFF_BASE_SEGUNDOS = int(
+        os.environ.get("MDVR_BACKOFF_BASE_SEGUNDOS", _BACKOFF_BASE_SEGUNDOS_DEFAULT)
+    )
+except ValueError:
+    BACKOFF_BASE_SEGUNDOS = _BACKOFF_BASE_SEGUNDOS_DEFAULT
+BACKOFF_BASE_SEGUNDOS = max(1, BACKOFF_BASE_SEGUNDOS)
+
+_BACKOFF_MAX_SEGUNDOS_DEFAULT = 7200
+try:
+    BACKOFF_MAX_SEGUNDOS = int(
+        os.environ.get("MDVR_BACKOFF_MAX_SEGUNDOS", _BACKOFF_MAX_SEGUNDOS_DEFAULT)
+    )
+except ValueError:
+    BACKOFF_MAX_SEGUNDOS = _BACKOFF_MAX_SEGUNDOS_DEFAULT
+BACKOFF_MAX_SEGUNDOS = max(BACKOFF_BASE_SEGUNDOS, BACKOFF_MAX_SEGUNDOS)
+
+_PROCESANDO_STALE_MINUTOS_DEFAULT = 120
+try:
+    PROCESANDO_STALE_MINUTOS = int(
+        os.environ.get(
+            "MDVR_PROCESANDO_STALE_MINUTOS",
+            _PROCESANDO_STALE_MINUTOS_DEFAULT,
+        )
+    )
+except ValueError:
+    PROCESANDO_STALE_MINUTOS = _PROCESANDO_STALE_MINUTOS_DEFAULT
+PROCESANDO_STALE_MINUTOS = max(1, PROCESANDO_STALE_MINUTOS)
+
+_PROCESANDO_LEASE_SEGUNDOS_DEFAULT = 3600
+try:
+    PROCESANDO_LEASE_SEGUNDOS = int(
+        os.environ.get("MDVR_PROCESANDO_LEASE_SEGUNDOS", _PROCESANDO_LEASE_SEGUNDOS_DEFAULT)
+    )
+except ValueError:
+    PROCESANDO_LEASE_SEGUNDOS = _PROCESANDO_LEASE_SEGUNDOS_DEFAULT
+PROCESANDO_LEASE_SEGUNDOS = max(60, PROCESANDO_LEASE_SEGUNDOS)
+
 RAW_VIDEO_EXTENSIONS = {".h264", ".grec"}
+TRANSIENT_ERRNOS = {
+    errno.EAGAIN,
+    errno.EBUSY,
+    errno.EINTR,
+    errno.ETIMEDOUT,
+    errno.ECONNRESET,
+    errno.ENETDOWN,
+    errno.ENETRESET,
+    errno.ENETUNREACH,
+    errno.EHOSTUNREACH,
+}
 
 
 @dataclass(frozen=True)
@@ -224,6 +282,113 @@ def _seleccionar_xlsx(xlsx_files: list[XlsxInfo], fecha_inicio: datetime.datetim
     if not candidatos:
         return None
     return min(candidatos, key=lambda info: info.fin - info.inicio)
+
+
+def _normalizar_error(exc: Exception) -> str:
+    mensaje = (str(exc) or exc.__class__.__name__).strip()
+    if not mensaje:
+        mensaje = exc.__class__.__name__
+    return mensaje[:2000]
+
+
+def _es_error_transitorio(exc: Exception) -> bool:
+    if isinstance(exc, (SoftTimeLimitExceeded, TimeoutError, subprocess.TimeoutExpired)):
+        return True
+    if isinstance(exc, ValidationError):
+        return False
+    if isinstance(exc, subprocess.CalledProcessError):
+        return False
+    if isinstance(exc, OSError):
+        return exc.errno in TRANSIENT_ERRNOS
+    return False
+
+
+def _calcular_backoff_reintento(reintento_num: int) -> datetime.timedelta:
+    exponente = max(0, reintento_num - 1)
+    segundos = BACKOFF_BASE_SEGUNDOS * (2**exponente)
+    segundos = min(segundos, BACKOFF_MAX_SEGUNDOS)
+    return datetime.timedelta(seconds=segundos)
+
+
+def _proximo_reintento_desde(video: Video, ahora: datetime.datetime) -> datetime.datetime | None:
+    proximo = getattr(video, "proximo_reintento_en", None)
+    if proximo is None:
+        return None
+    if timezone.is_naive(proximo):
+        return timezone.make_aware(proximo, timezone.get_current_timezone())
+    return proximo
+
+
+def _es_procesando_stale(video: Video, ahora: datetime.datetime) -> bool:
+    proximo = _proximo_reintento_desde(video, ahora)
+    if proximo is not None:
+        return proximo <= ahora
+    creado_en = getattr(video, "creado_en", None)
+    if creado_en is None:
+        return True
+    if timezone.is_naive(creado_en):
+        creado_en = timezone.make_aware(creado_en, timezone.get_current_timezone())
+    umbral = ahora - datetime.timedelta(minutes=PROCESANDO_STALE_MINUTOS)
+    return creado_en <= umbral
+
+
+def _puede_reprocesarse(video: Video, ahora: datetime.datetime) -> bool:
+    if video.estado in {EstadoVideo.LISTO, EstadoVideo.ERROR_PERMANENTE}:
+        return False
+    if video.estado == EstadoVideo.PROCESANDO:
+        return _es_procesando_stale(video, ahora)
+    if video.estado == EstadoVideo.ERROR:
+        if (video.reintentos or 0) >= MAX_REINTENTOS_MDVR:
+            return False
+        proximo = _proximo_reintento_desde(video, ahora)
+        if proximo and proximo > ahora:
+            return False
+        return True
+    return True
+
+
+def _marcar_video_para_reintento(video: Video, ahora: datetime.datetime, error: Exception) -> str:
+    mensaje = _normalizar_error(error)
+    reintentos_actuales = int(video.reintentos or 0)
+    transitorio = _es_error_transitorio(error)
+
+    if transitorio and reintentos_actuales < MAX_REINTENTOS_MDVR:
+        nuevo_reintento = reintentos_actuales + 1
+        video.estado = EstadoVideo.ERROR
+        video.reintentos = nuevo_reintento
+        video.ultimo_error = mensaje
+        video.proximo_reintento_en = ahora + _calcular_backoff_reintento(nuevo_reintento)
+        video.save(
+            update_fields=["estado", "reintentos", "ultimo_error", "proximo_reintento_en"]
+        )
+        return (
+            f"error transitorio ({mensaje}). "
+            f"Reintento {nuevo_reintento}/{MAX_REINTENTOS_MDVR} programado."
+        )
+
+    sufijo = ""
+    if transitorio and reintentos_actuales >= MAX_REINTENTOS_MDVR:
+        sufijo = f" Reintentos agotados ({MAX_REINTENTOS_MDVR}/{MAX_REINTENTOS_MDVR})."
+    video.estado = EstadoVideo.ERROR_PERMANENTE
+    video.ultimo_error = f"{mensaje}{sufijo}"
+    video.proximo_reintento_en = None
+    video.save(update_fields=["estado", "ultimo_error", "proximo_reintento_en"])
+    return f"error permanente ({video.ultimo_error})"
+
+
+def _normalizar_video_exitoso(video: Video):
+    cambios = []
+    if video.reintentos != 0:
+        video.reintentos = 0
+        cambios.append("reintentos")
+    if video.ultimo_error:
+        video.ultimo_error = ""
+        cambios.append("ultimo_error")
+    if video.proximo_reintento_en is not None:
+        video.proximo_reintento_en = None
+        cambios.append("proximo_reintento_en")
+    if cambios:
+        video.save(update_fields=cambios)
 
 
 def _segmento_desde_archivo(ruta: str, fecha: datetime.date) -> SegmentoVideo | None:
@@ -682,6 +847,7 @@ def _importar_camion_mdvr(
             nombre_video = (
                 f"MDVR_{carpeta_id}_{fecha.isoformat()}_{tipo_turno}_C{camara}"
             )
+            ahora = timezone.now()
             if Video.objects.filter(
                 nombre=nombre_video,
                 id_turno=turno,
@@ -696,7 +862,24 @@ def _importar_camion_mdvr(
                 .order_by("-id")
                 .first()
             )
+            if video_existente and not _puede_reprocesarse(video_existente, ahora):
+                if (
+                    video_existente.estado == EstadoVideo.ERROR
+                    and (video_existente.reintentos or 0) >= MAX_REINTENTOS_MDVR
+                ):
+                    video_existente.estado = EstadoVideo.ERROR_PERMANENTE
+                    if not video_existente.ultimo_error:
+                        video_existente.ultimo_error = (
+                            f"Reintentos agotados ({MAX_REINTENTOS_MDVR}/{MAX_REINTENTOS_MDVR})."
+                        )
+                    video_existente.proximo_reintento_en = None
+                    video_existente.save(
+                        update_fields=["estado", "ultimo_error", "proximo_reintento_en"]
+                    )
+                detalles["videos_omitidos"] += 1
+                continue
 
+            video = video_existente
             tmp_dir = tempfile.mkdtemp(prefix="mdvr_")
             try:
                 salida_es_raw = all(seg.extension in RAW_VIDEO_EXTENSIONS for seg in lista)
@@ -704,17 +887,14 @@ def _importar_camion_mdvr(
                 ruta_salida = os.path.join(tmp_dir, f"{nombre_video}{ext_salida}")
                 ok, error = _concatenar_segmentos(lista, ruta_salida)
                 if not ok:
-                    detalles["errores"].append(
-                        f"{nombre_video}: no se pudo concatenar segmentos ({error})."
-                    )
-                    detalles["videos_omitidos"] += 1
-                    continue
+                    raise ValidationError(f"No se pudo concatenar segmentos ({error}).")
 
                 destino_rel = _subir_archivo_temporal(
                     ruta_salida, f"{nombre_video}{ext_salida}"
                 )
 
                 inicio_dt = lista[0].inicio_dt
+                lease_hasta = timezone.now() + datetime.timedelta(seconds=PROCESANDO_LEASE_SEGUNDOS)
                 if video_existente:
                     ruta_previa = (video_existente.ruta_archivo.name or "").strip()
                     video_existente.camara = camara
@@ -726,6 +906,7 @@ def _importar_camion_mdvr(
                     video_existente.duracion = None
                     video_existente.fin_timestamp = None
                     video_existente.mimetype = ""
+                    video_existente.proximo_reintento_en = lease_hasta
                     video_existente.save(
                         update_fields=[
                             "camara",
@@ -737,6 +918,7 @@ def _importar_camion_mdvr(
                             "duracion",
                             "fin_timestamp",
                             "mimetype",
+                            "proximo_reintento_en",
                         ]
                     )
                     video = video_existente
@@ -753,10 +935,13 @@ def _importar_camion_mdvr(
                         fecha_inicio=inicio_dt,
                         fecha_subida=timezone.localdate(),
                         inicio_timestamp=inicio_dt.time(),
+                        estado=EstadoVideo.PROCESANDO,
+                        proximo_reintento_en=lease_hasta,
                         id_turno=turno,
                     )
 
                 procesar_video_subida(video, video.ruta_archivo)
+                _normalizar_video_exitoso(video)
                 detalles["videos_creados"] += 1
                 videos_turno.setdefault(tipo_turno, []).append(video)
 
@@ -764,12 +949,19 @@ def _importar_camion_mdvr(
                     xlsx_info = _seleccionar_xlsx(xlsx_files, inicio_dt)
                     if xlsx_info:
                         xlsx_por_video[video.id] = xlsx_info.ruta
-            except SoftTimeLimitExceeded:
+            except SoftTimeLimitExceeded as exc:
+                if video is not None:
+                    estado_error = _marcar_video_para_reintento(video, timezone.now(), exc)
+                    detalles["errores"].append(f"{nombre_video}: {estado_error}.")
                 raise
             except Exception as exc:
-                detalles["errores"].append(
-                    f"{nombre_video}: error procesando video ({exc})."
-                )
+                if video is not None:
+                    estado_error = _marcar_video_para_reintento(video, timezone.now(), exc)
+                    detalles["errores"].append(f"{nombre_video}: {estado_error}.")
+                else:
+                    detalles["errores"].append(
+                        f"{nombre_video}: error procesando video ({_normalizar_error(exc)})."
+                    )
                 detalles["videos_omitidos"] += 1
                 continue
             finally:

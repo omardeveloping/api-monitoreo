@@ -66,6 +66,7 @@ class EstadoVideo(models.TextChoices):
     PROCESANDO = "procesando", "Procesando"
     LISTO = "listo", "Listo"
     ERROR = "error", "Error"
+    ERROR_PERMANENTE = "error_permanente", "Error permanente"
 
 
 class Video(models.Model):
@@ -82,6 +83,9 @@ class Video(models.Model):
         choices=EstadoVideo.choices,
         default=EstadoVideo.PROCESANDO,
     )
+    reintentos = models.PositiveSmallIntegerField(default=0)
+    ultimo_error = models.TextField(blank=True, default="")
+    proximo_reintento_en = models.DateTimeField(null=True, blank=True)
     id_turno = models.ForeignKey(Turno, on_delete=models.CASCADE)
     creado_en = models.DateTimeField(auto_now_add=True)
     fecha_subida = models.DateField(default=timezone.localdate)

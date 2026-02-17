@@ -595,6 +595,9 @@ def procesar_video_subida(video_obj, archivo):
 
         video_obj.duracion = math.floor(calcular_duracion_video(video_obj.ruta_archivo.path))
         video_obj.estado = EstadoVideo.LISTO
+        video_obj.reintentos = 0
+        video_obj.ultimo_error = ""
+        video_obj.proximo_reintento_en = None
 
         inicio = video_obj.inicio_timestamp or datetime.time(0, 0)
         if isinstance(inicio, datetime.datetime):
@@ -609,18 +612,32 @@ def procesar_video_subida(video_obj, archivo):
         final_mimetype = mimetypes.guess_type(video_obj.ruta_archivo.path)[0] or content_type or ""
         video_obj.mimetype = final_mimetype
 
-        campos = ["duracion", "estado", "inicio_timestamp", "fin_timestamp", "mimetype"]
+        campos = [
+            "duracion",
+            "estado",
+            "inicio_timestamp",
+            "fin_timestamp",
+            "mimetype",
+            "reintentos",
+            "ultimo_error",
+            "proximo_reintento_en",
+        ]
         if ruta_convertida:
             campos.append("ruta_archivo")
         video_obj.save(update_fields=campos)
 
         if ruta_convertida and ruta_convertida != ruta_original and os.path.exists(ruta_original):
             os.remove(ruta_original)
-    except Exception:
+    except Exception as exc:
         if ruta_convertida and ruta_convertida != ruta_original and os.path.exists(ruta_convertida):
             os.remove(ruta_convertida)
-        video_obj.estado = EstadoVideo.ERROR
-        video_obj.save(update_fields=["estado"])
+        if isinstance(exc, ValidationError):
+            video_obj.estado = EstadoVideo.ERROR_PERMANENTE
+        else:
+            video_obj.estado = EstadoVideo.ERROR
+        mensaje_error = (str(exc) or exc.__class__.__name__).strip()
+        video_obj.ultimo_error = mensaje_error[:2000]
+        video_obj.save(update_fields=["estado", "ultimo_error"])
         raise
 
     return video_obj

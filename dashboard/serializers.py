@@ -88,8 +88,12 @@ class VideoSerializer(serializers.ModelSerializer):
             'fin_timestamp',
             'mimetype',
             'estado',
+            'reintentos',
+            'ultimo_error',
+            'proximo_reintento_en',
             'id_turno',
         ]
+        read_only_fields = ['reintentos', 'ultimo_error', 'proximo_reintento_en']
 
 
 class VideoImportSerializer(serializers.Serializer):
