@@ -144,6 +144,11 @@ class Incidente(models.Model):
     tiempo_en_video = models.IntegerField(help_text="Segundos desde el inicio del video")
     descripcion = models.TextField(blank=True, default="")
     turno = models.ForeignKey(Turno, on_delete=models.CASCADE)
+    velocidad_kmh = models.FloatField(
+        null=True,
+        blank=True,
+        help_text="Velocidad (km/h) capturada automáticamente al momento del reporte.",
+    )
 
     def __str__(self):
         return f"{self.tipo_incidente} ({self.severidad})"

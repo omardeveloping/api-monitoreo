@@ -151,4 +151,6 @@ class IncidenteSerializer(serializers.ModelSerializer):
             'tiempo_en_video',
             'descripcion',
             'turno',
+            'velocidad_kmh',
         ]
+        read_only_fields = ['velocidad_kmh']

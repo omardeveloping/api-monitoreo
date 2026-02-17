@@ -14,7 +14,7 @@ from django.core.files import File
 from django.core.files.storage import default_storage
 from django.utils import timezone
 from django.utils.text import get_valid_filename
-from .models import Camion, Turno, Video, Incidente
+from .models import Camion, Turno, Video, Incidente, VelocidadVideo
 from .serializers import (
     CamionSerializer,
     TurnoSerializer,
@@ -588,6 +588,20 @@ class IncidenteViewSet(viewsets.ModelViewSet):
     queryset = Incidente.objects.all()
     serializer_class = IncidenteSerializer
     permission_classes = [IsAuthenticated, DjangoModelPermissions]
+
+    def perform_create(self, serializer):
+        incidente = serializer.save()
+        velocidad_obj = (
+            VelocidadVideo.objects.filter(
+                video__id_turno=incidente.turno,
+                segundo=incidente.tiempo_en_video,
+            )
+            .order_by("video_id")
+            .first()
+        )
+        if velocidad_obj is not None:
+            incidente.velocidad_kmh = velocidad_obj.velocidad_kmh
+            incidente.save(update_fields=["velocidad_kmh"])
 
     @action(detail=False, methods=["get"], url_path="contar-alta")
     def contar_alta(self, request):
