@@ -235,8 +235,8 @@ CELERY_TASK_ROUTES = {
 }
 CELERY_TASK_ANNOTATIONS = {
     "dashboard.tasks.importar_videos_mdvr_task": {
-        "soft_time_limit": int(os.environ.get("MDVR_IMPORT_SOFT_TIME_LIMIT", "1800")),
-        "time_limit": int(os.environ.get("MDVR_IMPORT_TIME_LIMIT", "2100")),
+        "soft_time_limit": int(os.environ.get("MDVR_IMPORT_SOFT_TIME_LIMIT", "7200")),
+        "time_limit": int(os.environ.get("MDVR_IMPORT_TIME_LIMIT", "7800")),
         "rate_limit": os.environ.get("MDVR_IMPORT_RATE_LIMIT", "1/m"),
     }
 }

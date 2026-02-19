@@ -220,6 +220,9 @@ class ConcatenacionSegmentosMdvrTests(SimpleTestCase):
             "dashboard.services.importar_videos_mdvr._concat_h264",
             return_value=(True, None),
         ) as concat_raw, patch(
+            "dashboard.services.importar_videos_mdvr._concat_mp4_copiando",
+            return_value=(True, None),
+        ) as concat_copy, patch(
             "dashboard.services.importar_videos_mdvr._concat_h264_transcodificando",
             return_value=(True, None),
         ) as concat_ffmpeg:
@@ -227,6 +230,26 @@ class ConcatenacionSegmentosMdvrTests(SimpleTestCase):
 
         self.assertTrue(ok)
         concat_raw.assert_not_called()
+        concat_copy.assert_called_once_with(["/tmp/a.mp4"], "/tmp/salida.mp4")
+        concat_ffmpeg.assert_not_called()
+
+    def test_segmentos_mp4_caen_a_transcode_si_copy_falla(self):
+        segmentos = [self._segmento("/tmp/a.mp4", ".mp4")]
+        with patch(
+            "dashboard.services.importar_videos_mdvr._concat_h264",
+            return_value=(True, None),
+        ) as concat_raw, patch(
+            "dashboard.services.importar_videos_mdvr._concat_mp4_copiando",
+            return_value=(False, "fallo copy"),
+        ) as concat_copy, patch(
+            "dashboard.services.importar_videos_mdvr._concat_h264_transcodificando",
+            return_value=(True, None),
+        ) as concat_ffmpeg:
+            ok, _error = _concatenar_segmentos(segmentos, "/tmp/salida.mp4")
+
+        self.assertTrue(ok)
+        concat_raw.assert_not_called()
+        concat_copy.assert_called_once_with(["/tmp/a.mp4"], "/tmp/salida.mp4")
         concat_ffmpeg.assert_called_once_with(["/tmp/a.mp4"], "/tmp/salida.mp4")
 
     def test_segmentos_raw_intentan_concat_binaria_primero(self):

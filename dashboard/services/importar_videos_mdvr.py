@@ -1,5 +1,6 @@
 import datetime
 import errno
+import logging
 import math
 import os
 import re
@@ -106,6 +107,15 @@ except ValueError:
     PROCESANDO_LEASE_SEGUNDOS = _PROCESANDO_LEASE_SEGUNDOS_DEFAULT
 PROCESANDO_LEASE_SEGUNDOS = max(60, PROCESANDO_LEASE_SEGUNDOS)
 
+_MAX_DETALLES_OMISION_DEFAULT = 300
+try:
+    MAX_DETALLES_OMISION = int(
+        os.environ.get("MDVR_MAX_DETALLES_OMISION", _MAX_DETALLES_OMISION_DEFAULT)
+    )
+except ValueError:
+    MAX_DETALLES_OMISION = _MAX_DETALLES_OMISION_DEFAULT
+MAX_DETALLES_OMISION = max(0, MAX_DETALLES_OMISION)
+
 RAW_VIDEO_EXTENSIONS = {".h264", ".grec"}
 TRANSIENT_ERRNOS = {
     errno.EAGAIN,
@@ -118,6 +128,7 @@ TRANSIENT_ERRNOS = {
     errno.ENETUNREACH,
     errno.EHOSTUNREACH,
 }
+logger = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True)
@@ -391,7 +402,71 @@ def _normalizar_video_exitoso(video: Video):
         video.save(update_fields=cambios)
 
 
-def _segmento_desde_archivo(ruta: str, fecha: datetime.date) -> SegmentoVideo | None:
+def _registrar_omision(
+    detalles: dict,
+    *,
+    motivo: str,
+    ruta_archivo: str | None = None,
+    nombre_video: str | None = None,
+    omision_video: bool = False,
+):
+    motivo_limpio = (motivo or "motivo no especificado").strip()
+    if not motivo_limpio:
+        motivo_limpio = "motivo no especificado"
+
+    resumen = detalles.setdefault("motivos_omision", {})
+    resumen[motivo_limpio] = int(resumen.get(motivo_limpio, 0)) + 1
+
+    if omision_video:
+        detalles["videos_omitidos"] += 1
+
+    registro = {"motivo": motivo_limpio}
+    contexto_log = "desconocido"
+    if ruta_archivo:
+        detalles["archivos_omitidos"] += 1
+        contexto = os.path.join(
+            os.path.basename(os.path.dirname(ruta_archivo)),
+            os.path.basename(ruta_archivo),
+        )
+        registro["archivo"] = contexto
+        contexto_log = ruta_archivo
+    elif nombre_video:
+        registro["video"] = nombre_video
+        contexto_log = nombre_video
+
+    mensaje_error = motivo_limpio
+    if "archivo" in registro:
+        mensaje_error = f"{registro['archivo']}: {motivo_limpio}"
+    elif "video" in registro:
+        mensaje_error = f"{registro['video']}: {motivo_limpio}"
+
+    omisiones = detalles.setdefault("omisiones", [])
+    if len(omisiones) < MAX_DETALLES_OMISION:
+        omisiones.append(registro)
+    elif len(omisiones) == MAX_DETALLES_OMISION:
+        omisiones.append(
+            {
+                "motivo": (
+                    f"Se alcanzó el límite de omisiones detalladas ({MAX_DETALLES_OMISION})."
+                )
+            }
+        )
+
+    errores = detalles.setdefault("errores", [])
+    if len(errores) < MAX_DETALLES_OMISION:
+        errores.append(f"omisión: {mensaje_error}")
+    elif len(errores) == MAX_DETALLES_OMISION:
+        errores.append(
+            f"omisión: se alcanzó el límite de detalles ({MAX_DETALLES_OMISION})."
+        )
+
+    logger.warning("MDVR omitido [%s]: %s", contexto_log, motivo_limpio)
+
+
+def _segmento_desde_archivo_con_motivo(
+    ruta: str,
+    fecha: datetime.date,
+) -> tuple[SegmentoVideo | None, str | None]:
     nombre = os.path.basename(ruta)
     match = _SEGMENTO_RE.match(nombre)
     camara = None
@@ -404,42 +479,63 @@ def _segmento_desde_archivo(ruta: str, fecha: datetime.date) -> SegmentoVideo | 
         try:
             camara = int(camara_raw)
         except ValueError:
-            return None
+            return None, f"cámara inválida en nombre ({camara_raw})."
         inicio_raw = match.group("inicio")
         fin_raw = match.group("fin")
         ext = f".{(match.group('ext') or '').lower()}"
     else:
         match_nuevo = _SEGMENTO_GREC_NUEVO_RE.match(nombre)
         if not match_nuevo:
-            return None
+            return None, "nombre no coincide con formatos MDVR soportados."
         fecha_archivo = _parse_fecha_yymmdd(match_nuevo.group("fecha"))
-        if not fecha_archivo or fecha_archivo != fecha:
-            return None
+        if not fecha_archivo:
+            return None, "fecha YYMMDD inválida en nombre."
+        if fecha_archivo != fecha:
+            return (
+                None,
+                (
+                    "fecha en nombre no coincide con carpeta: "
+                    f"{fecha_archivo.isoformat()} vs {fecha.isoformat()}."
+                ),
+            )
         camara = _extraer_camara_desde_codigo_nuevo(match_nuevo.group("codigo"))
         if camara is None:
-            return None
+            return None, "cámara inválida en código del nombre."
         inicio_raw = match_nuevo.group("inicio")
         fin_raw = match_nuevo.group("fin")
         ext = f".{(match_nuevo.group('ext') or '').lower()}"
 
     if camara not in {1, 2, 3, 4}:
-        return None
+        return None, f"cámara fuera de rango ({camara})."
     inicio = _parse_hora_hhmmss(inicio_raw)
     fin = _parse_hora_hhmmss(fin_raw)
     if not inicio or not fin:
-        return None
+        return None, "hora de inicio o fin inválida en nombre."
     inicio_dt = datetime.datetime.combine(fecha, inicio)
     fin_dt = datetime.datetime.combine(fecha, fin)
     if fin_dt <= inicio_dt:
         fin_dt += datetime.timedelta(days=1)
     extension = ext or os.path.splitext(nombre)[1].lower()
-    return SegmentoVideo(
-        ruta=ruta,
-        camara=camara,
-        inicio_dt=inicio_dt,
-        fin_dt=fin_dt,
-        extension=extension,
+    return (
+        SegmentoVideo(
+            ruta=ruta,
+            camara=camara,
+            inicio_dt=inicio_dt,
+            fin_dt=fin_dt,
+            extension=extension,
+        ),
+        None,
     )
+
+
+def _segmento_desde_archivo(ruta: str, fecha: datetime.date) -> SegmentoVideo | None:
+    segmento, _motivo = _segmento_desde_archivo_con_motivo(ruta, fecha)
+    return segmento
+
+
+def _es_extension_video_soportada(nombre: str) -> bool:
+    ext = os.path.splitext(nombre)[1].lower()
+    return ext in {".mp4", ".h264", ".grec"}
 
 
 def _ffprobe_ok(ruta: str) -> bool:
@@ -485,6 +581,38 @@ def _concat_h264(segmentos: list[str], salida: str) -> tuple[bool, str | None]:
         return True, None
     except OSError as exc:
         return False, str(exc)
+
+
+def _concat_mp4_copiando(segmentos: list[str], salida: str) -> tuple[bool, str | None]:
+    lista = _crear_lista_concat(segmentos)
+    try:
+        comando = [
+            "ffmpeg",
+            "-hide_banner",
+            "-loglevel",
+            "error",
+            "-f",
+            "concat",
+            "-safe",
+            "0",
+            "-i",
+            lista,
+            "-c",
+            "copy",
+            "-movflags",
+            "+faststart",
+            "-y",
+            salida,
+        ]
+        subprocess.run(comando, capture_output=True, text=True, check=True)
+        if os.path.getsize(salida) <= 0:
+            return False, "salida vacía tras concatenación MP4 por copia."
+        return True, None
+    except (subprocess.CalledProcessError, FileNotFoundError, OSError) as exc:
+        return False, str(exc)
+    finally:
+        if os.path.exists(lista):
+            os.remove(lista)
 
 
 def _concat_h264_transcodificando(segmentos: list[str], salida: str) -> tuple[bool, str | None]:
@@ -533,12 +661,22 @@ def _concatenar_segmentos(segmentos: list[SegmentoVideo], salida: str) -> tuple[
         if ok:
             return True, None
 
+    son_mp4 = all(seg.extension == ".mp4" for seg in segmentos)
+    if son_mp4:
+        ok, error = _concat_mp4_copiando(rutas, salida)
+        if ok:
+            return True, None
+
     ok, error = _concat_h264_transcodificando(rutas, salida)
     if ok:
         return True, None
 
     segmentos_validos = [ruta for ruta in rutas if _ffprobe_ok(ruta)]
     if segmentos_validos and len(segmentos_validos) < len(rutas):
+        if son_mp4:
+            ok, error = _concat_mp4_copiando(segmentos_validos, salida)
+            if ok:
+                return True, None
         ok, error = _concat_h264_transcodificando(segmentos_validos, salida)
         if ok:
             return True, None
@@ -791,14 +929,29 @@ def _importar_camion_mdvr(
         "carpeta_id": carpeta_id,
         "videos_creados": 0,
         "videos_omitidos": 0,
+        "archivos_omitidos": 0,
         "turnos_procesados": 0,
         "recortados": 0,
+        "motivos_omision": {},
+        "omisiones": [],
         "errores": [],
     }
 
     for nombre in sorted(os.listdir(carpeta_mdvr)):
         ruta_dia = os.path.join(carpeta_mdvr, nombre)
-        if not os.path.isdir(ruta_dia) or not _DIR_FECHA_RE.match(nombre):
+        if os.path.isfile(ruta_dia) and _es_extension_video_soportada(nombre):
+            _registrar_omision(
+                detalles,
+                motivo=(
+                    "archivo de video fuera de estructura esperada "
+                    "(debe estar dentro de subcarpeta YYYY-MM-DD)."
+                ),
+                ruta_archivo=ruta_dia,
+            )
+            continue
+        if not os.path.isdir(ruta_dia):
+            continue
+        if not _DIR_FECHA_RE.match(nombre):
             continue
 
         try:
@@ -812,14 +965,52 @@ def _importar_camion_mdvr(
         for archivo in os.listdir(ruta_dia):
             ruta_archivo = os.path.join(ruta_dia, archivo)
             if not os.path.isfile(ruta_archivo):
+                if os.path.isdir(ruta_archivo):
+                    _registrar_omision(
+                        detalles,
+                        motivo=(
+                            "subdirectorio detectado dentro de carpeta día; "
+                            "solo se procesan archivos en ese nivel."
+                        ),
+                        ruta_archivo=ruta_archivo,
+                    )
                 continue
-            segmento = _segmento_desde_archivo(ruta_archivo, fecha)
-            if segmento:
-                if os.path.getsize(ruta_archivo) <= 0:
-                    continue
-                segmentos.append(segmento)
+            segmento, motivo_omision = _segmento_desde_archivo_con_motivo(ruta_archivo, fecha)
+            if not segmento:
+                _registrar_omision(
+                    detalles,
+                    motivo=motivo_omision or "archivo no reconocido para importación MDVR.",
+                    ruta_archivo=ruta_archivo,
+                )
+                continue
+
+            try:
+                tamano = os.path.getsize(ruta_archivo)
+            except OSError as exc:
+                _registrar_omision(
+                    detalles,
+                    motivo=f"no se pudo leer tamaño de archivo ({exc}).",
+                    ruta_archivo=ruta_archivo,
+                )
+                continue
+
+            if tamano <= 0:
+                _registrar_omision(
+                    detalles,
+                    motivo="archivo vacío (0 bytes).",
+                    ruta_archivo=ruta_archivo,
+                )
+                continue
+            segmentos.append(segmento)
 
         if not segmentos:
+            _registrar_omision(
+                detalles,
+                motivo=(
+                    f"sin segmentos válidos para la fecha {fecha.isoformat()} "
+                    "en carpeta de día."
+                ),
+            )
             continue
 
         grupos: dict[tuple[str, int], list[SegmentoVideo]] = {}
@@ -853,7 +1044,12 @@ def _importar_camion_mdvr(
                 id_turno=turno,
                 estado=EstadoVideo.LISTO,
             ).exists():
-                detalles["videos_omitidos"] += 1
+                _registrar_omision(
+                    detalles,
+                    motivo="ya existe video LISTO para turno y cámara.",
+                    nombre_video=nombre_video,
+                    omision_video=True,
+                )
                 continue
 
             video_existente = (
@@ -876,7 +1072,17 @@ def _importar_camion_mdvr(
                     video_existente.save(
                         update_fields=["estado", "ultimo_error", "proximo_reintento_en"]
                     )
-                detalles["videos_omitidos"] += 1
+                motivo = (
+                    f"video existente no reprocesable (estado={video_existente.estado}, "
+                    f"reintentos={video_existente.reintentos or 0}, "
+                    f"proximo_reintento_en={video_existente.proximo_reintento_en})."
+                )
+                _registrar_omision(
+                    detalles,
+                    motivo=motivo,
+                    nombre_video=nombre_video,
+                    omision_video=True,
+                )
                 continue
 
             video = video_existente
@@ -884,21 +1090,12 @@ def _importar_camion_mdvr(
             try:
                 salida_es_raw = all(seg.extension in RAW_VIDEO_EXTENSIONS for seg in lista)
                 ext_salida = ".h264" if salida_es_raw else ".mp4"
-                ruta_salida = os.path.join(tmp_dir, f"{nombre_video}{ext_salida}")
-                ok, error = _concatenar_segmentos(lista, ruta_salida)
-                if not ok:
-                    raise ValidationError(f"No se pudo concatenar segmentos ({error}).")
-
-                destino_rel = _subir_archivo_temporal(
-                    ruta_salida, f"{nombre_video}{ext_salida}"
-                )
-
                 inicio_dt = lista[0].inicio_dt
                 lease_hasta = timezone.now() + datetime.timedelta(seconds=PROCESANDO_LEASE_SEGUNDOS)
+                ruta_previa = ""
                 if video_existente:
                     ruta_previa = (video_existente.ruta_archivo.name or "").strip()
                     video_existente.camara = camara
-                    video_existente.ruta_archivo = destino_rel
                     video_existente.fecha_inicio = inicio_dt
                     video_existente.fecha_subida = timezone.localdate()
                     video_existente.inicio_timestamp = inicio_dt.time()
@@ -910,7 +1107,6 @@ def _importar_camion_mdvr(
                     video_existente.save(
                         update_fields=[
                             "camara",
-                            "ruta_archivo",
                             "fecha_inicio",
                             "fecha_subida",
                             "inicio_timestamp",
@@ -922,16 +1118,14 @@ def _importar_camion_mdvr(
                         ]
                     )
                     video = video_existente
-                    if ruta_previa and ruta_previa != destino_rel:
-                        try:
-                            default_storage.delete(ruta_previa)
-                        except Exception:
-                            pass
                 else:
+                    ruta_pendiente = os.path.join(
+                        "videos", "pendientes", f"{nombre_video}{ext_salida}"
+                    )
                     video = Video.objects.create(
                         nombre=nombre_video,
                         camara=camara,
-                        ruta_archivo=destino_rel,
+                        ruta_archivo=ruta_pendiente,
                         fecha_inicio=inicio_dt,
                         fecha_subida=timezone.localdate(),
                         inicio_timestamp=inicio_dt.time(),
@@ -939,6 +1133,22 @@ def _importar_camion_mdvr(
                         proximo_reintento_en=lease_hasta,
                         id_turno=turno,
                     )
+
+                ruta_salida = os.path.join(tmp_dir, f"{nombre_video}{ext_salida}")
+                ok, error = _concatenar_segmentos(lista, ruta_salida)
+                if not ok:
+                    raise ValidationError(f"No se pudo concatenar segmentos ({error}).")
+
+                destino_rel = _subir_archivo_temporal(
+                    ruta_salida, f"{nombre_video}{ext_salida}"
+                )
+                video.ruta_archivo = destino_rel
+                video.save(update_fields=["ruta_archivo"])
+                if video_existente and ruta_previa and ruta_previa != destino_rel:
+                    try:
+                        default_storage.delete(ruta_previa)
+                    except Exception:
+                        pass
 
                 procesar_video_subida(video, video.ruta_archivo)
                 _normalizar_video_exitoso(video)
