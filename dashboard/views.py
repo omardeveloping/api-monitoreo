@@ -2,7 +2,7 @@ import os
 import re
 import shutil
 from celery.result import AsyncResult
-from datetime import datetime
+from datetime import datetime, timedelta
 from rest_framework import viewsets, status
 from rest_framework.exceptions import ValidationError
 from rest_framework.parsers import FormParser, MultiPartParser
@@ -610,6 +610,71 @@ class IncidenteViewSet(viewsets.ModelViewSet):
             severidad=Incidente.Severidad.ALTA
         ).count()
         return Response({"cantidad": cantidad_incidentes})
+
+    @action(detail=False, methods=["get"], url_path="exportar")
+    def exportar(self, request):
+        """
+        Devuelve incidentes en formato plano para exportación (Excel/CSV) desde frontend.
+        """
+        turno_map = {
+            "manana": "Turno 1",
+            "tarde": "Turno 2",
+            "noche": "Turno 3",
+        }
+
+        incidentes = (
+            self.get_queryset()
+            .select_related("turno", "turno__id_camion")
+            .order_by("id")
+        )
+
+        resultados = []
+        for incidente in incidentes:
+            turno = incidente.turno
+            tipo_turno = (turno.tipo_turno or "").strip().lower()
+
+            if tipo_turno in turno_map:
+                turno_nombre = turno_map[tipo_turno]
+            elif turno.hora_inicio is not None:
+                if turno.hora_inicio.hour < 8:
+                    turno_nombre = "Turno 3"
+                elif turno.hora_inicio.hour < 16:
+                    turno_nombre = "Turno 1"
+                else:
+                    turno_nombre = "Turno 2"
+            else:
+                turno_nombre = "Turno 1"
+
+            segundos = int(incidente.tiempo_en_video or 0)
+            if segundos < 0:
+                segundos = 0
+            minutos, rem_segundos = divmod(segundos, 60)
+            fecha_hora = datetime.combine(turno.fecha, datetime.min.time()) + timedelta(
+                seconds=segundos
+            )
+
+            velocidad_kmh = (
+                None
+                if incidente.velocidad_kmh is None
+                else format(float(incidente.velocidad_kmh), "g")
+            )
+
+            resultados.append(
+                {
+                    "id": incidente.id,
+                    "fecha_hora": fecha_hora.strftime("%Y-%m-%d %H:%M"),
+                    "jornada_turno": turno.get_tipo_turno_display() if turno.tipo_turno else "",
+                    "minuto_incidente": f"{minutos:02d}:{rem_segundos:02d}",
+                    "tipo_incidente": incidente.get_tipo_incidente_display(),
+                    "severidad": incidente.severidad,
+                    "velocidad_kmh": velocidad_kmh,
+                    "camionPatente": turno.id_camion.patente if turno.id_camion_id else None,
+                    "turno": turno_nombre,
+                    "descripcion": incidente.descripcion,
+                }
+            )
+
+        return Response(resultados)
 
 
 class EspacioDiscoViewSet(viewsets.ViewSet):

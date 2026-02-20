@@ -3,12 +3,19 @@ from collections import namedtuple
 from types import SimpleNamespace
 from unittest.mock import mock_open, patch
 
-from django.test import SimpleTestCase, override_settings
+from django.contrib.auth import get_user_model
+from django.test import SimpleTestCase, TestCase, override_settings
 from django.utils import timezone
 from rest_framework.exceptions import ValidationError
-from rest_framework.test import APIRequestFactory
+from rest_framework.test import APIRequestFactory, force_authenticate
 
-from dashboard.models import EstadoVideo
+from dashboard.models import (
+    Camion,
+    EstadoVideo,
+    Incidente,
+    TipoTurnoChoices,
+    Turno,
+)
 from dashboard.services.importar_videos_mdvr import (
     SegmentoVideo,
     _calcular_backoff_reintento,
@@ -18,7 +25,7 @@ from dashboard.services.importar_videos_mdvr import (
     _puede_reprocesarse,
     _segmento_desde_archivo,
 )
-from dashboard.views import EspacioDiscoViewSet, _listar_montajes_disponibles
+from dashboard.views import EspacioDiscoViewSet, IncidenteViewSet, _listar_montajes_disponibles
 
 
 class SegmentoDesdeArchivoTests(SimpleTestCase):
@@ -309,3 +316,53 @@ class ReintentosMdvrTests(SimpleTestCase):
         primer = _calcular_backoff_reintento(1)
         segundo = _calcular_backoff_reintento(2)
         self.assertGreaterEqual(segundo, primer)
+
+
+class ExportarIncidentesApiTests(TestCase):
+    def setUp(self):
+        self.factory = APIRequestFactory()
+        self.user = get_user_model().objects.create_superuser(
+            username="admin_export",
+            password="test12345",
+        )
+
+    def test_exportar_incidentes_devuelve_formato_plano_requerido(self):
+        camion = Camion.objects.create(patente="ABCD11")
+        turno = Turno.objects.create(
+            fecha=datetime.date(2026, 2, 17),
+            id_camion=camion,
+            tipo_turno=TipoTurnoChoices.TARDE,
+            hora_inicio=datetime.time(16, 0),
+            hora_fin=datetime.time(0, 0),
+        )
+        incidente = Incidente.objects.create(
+            tipo_incidente=Incidente.TipoIncidente.FRENADO_BRUSCO,
+            severidad=Incidente.Severidad.ALTA,
+            tiempo_en_video=765,
+            descripcion="El conductor frenó de manera agresiva en la curva 4.",
+            turno=turno,
+            velocidad_kmh=65.5,
+        )
+
+        request = self.factory.get("/api/dashboard/incidentes/exportar/")
+        force_authenticate(request, user=self.user)
+        view = IncidenteViewSet.as_view({"get": "exportar"})
+        response = view(request)
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(len(response.data), 1)
+        self.assertEqual(
+            response.data[0],
+            {
+                "id": incidente.id,
+                "fecha_hora": "2026-02-17 00:12",
+                "jornada_turno": "Tarde",
+                "minuto_incidente": "12:45",
+                "tipo_incidente": "Frenado o Giro Brusco",
+                "severidad": "alta",
+                "velocidad_kmh": "65.5",
+                "camionPatente": "ABCD11",
+                "turno": "Turno 2",
+                "descripcion": "El conductor frenó de manera agresiva en la curva 4.",
+            },
+        )
