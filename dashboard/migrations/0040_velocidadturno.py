@@ -8,12 +8,19 @@ def copiar_velocidades_desde_video(apps, schema_editor):
     VelocidadTurno = apps.get_model("dashboard", "VelocidadTurno")
 
     batch = []
-    qs = VelocidadVideo.objects.select_related("video").order_by("id")
+    ultimo_key = None
+    qs = VelocidadVideo.objects.select_related("video").order_by(
+        "video__id_turno_id", "segundo", "id"
+    )
     for velocidad in qs.iterator(chunk_size=2000):
         video = getattr(velocidad, "video", None)
         turno_id = getattr(video, "id_turno_id", None)
         if turno_id is None:
             continue
+        key = (turno_id, velocidad.segundo)
+        if key == ultimo_key:
+            continue
+        ultimo_key = key
         batch.append(
             VelocidadTurno(
                 turno_id=turno_id,
