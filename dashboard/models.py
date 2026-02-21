@@ -108,6 +108,25 @@ class Video(models.Model):
         return self.nombre
 
 
+class VelocidadTurno(models.Model):
+    turno = models.ForeignKey(Turno, on_delete=models.CASCADE, related_name="velocidades_turno")
+    segundo = models.PositiveIntegerField()
+    velocidad_kmh = models.FloatField()
+    timestamp_csv = models.DateTimeField(null=True, blank=True)
+    interpolado = models.BooleanField(default=False)
+    sin_datos = models.BooleanField(default=False)
+    creado_en = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        unique_together = ("turno", "segundo")
+        indexes = [
+            models.Index(fields=["turno", "segundo"], name="velocidad_turno_segundo_idx"),
+        ]
+
+    def __str__(self):
+        return f"{self.turno_id} @ {self.segundo}s: {self.velocidad_kmh} km/h"
+
+
 class VelocidadVideo(models.Model):
     video = models.ForeignKey(Video, on_delete=models.CASCADE, related_name="velocidades")
     segundo = models.PositiveIntegerField()

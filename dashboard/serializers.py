@@ -7,6 +7,7 @@ from .models import (
     Video,
     EstadoVideo,
     Incidente,
+    VelocidadTurno,
     VelocidadVideo,
     NumeroCamara,
 )
@@ -129,6 +130,27 @@ class VelocidadVideoSerializer(serializers.ModelSerializer):
             "sin_datos",
         ]
         read_only_fields = ["id", "video"]
+
+
+class VelocidadTurnoSerializer(serializers.ModelSerializer):
+    video = serializers.SerializerMethodField()
+
+    class Meta:
+        model = VelocidadTurno
+        fields = [
+            "id",
+            "video",
+            "turno",
+            "segundo",
+            "velocidad_kmh",
+            "timestamp_csv",
+            "interpolado",
+            "sin_datos",
+        ]
+        read_only_fields = ["id", "video", "turno"]
+
+    def get_video(self, _obj):
+        return self.context.get("video_id")
 
 
 # class OperadorSerializer(serializers.ModelSerializer):

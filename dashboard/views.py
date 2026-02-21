@@ -20,14 +20,14 @@ from .models import (
     Turno,
     Video,
     Incidente,
-    VelocidadVideo,
+    VelocidadTurno,
 )
 from .serializers import (
     CamionSerializer,
     TurnoSerializer,
     VideoSerializer,
     VideoImportSerializer,
-    VelocidadVideoSerializer,
+    VelocidadTurnoSerializer,
     IncidenteSerializer,
 )
 from dashboard.services.calcular_duracion_video import (
@@ -468,33 +468,23 @@ class VideoViewSet(viewsets.ModelViewSet):
             else:
                 resultado = importar_velocidades_csv(video, archivo)
         except Exception as exc:
-            video.estado_velocidades = EstadoVelocidadesVideo.ERROR
-            video.velocidades_actualizadas_en = None
-            video.velocidades_error = (str(exc) or exc.__class__.__name__).strip()[:2000]
-            video.save(
-                update_fields=[
-                    "estado_velocidades",
-                    "velocidades_actualizadas_en",
-                    "velocidades_error",
-                ]
+            Video.objects.filter(id_turno=video.id_turno).update(
+                estado_velocidades=EstadoVelocidadesVideo.ERROR,
+                velocidades_actualizadas_en=None,
+                velocidades_error=(str(exc) or exc.__class__.__name__).strip()[:2000],
             )
             raise
-        video.estado_velocidades = EstadoVelocidadesVideo.IMPORTADA
-        video.velocidades_actualizadas_en = timezone.now()
-        video.velocidades_error = ""
-        video.save(
-            update_fields=[
-                "estado_velocidades",
-                "velocidades_actualizadas_en",
-                "velocidades_error",
-            ]
+        Video.objects.filter(id_turno=video.id_turno).update(
+            estado_velocidades=EstadoVelocidadesVideo.IMPORTADA,
+            velocidades_actualizadas_en=timezone.now(),
+            velocidades_error="",
         )
         return Response(resultado, status=status.HTTP_201_CREATED)
 
     @action(detail=True, methods=["get"], url_path="velocidades")
     def velocidades(self, request, pk=None):
         video = self.get_object()
-        queryset = video.velocidades.all().order_by("segundo")
+        queryset = VelocidadTurno.objects.filter(turno=video.id_turno).order_by("segundo")
 
         desde = request.query_params.get("desde")
         if desde is not None:
@@ -514,9 +504,13 @@ class VideoViewSet(viewsets.ModelViewSet):
 
         page = self.paginate_queryset(queryset)
         if page is not None:
-            serializer = VelocidadVideoSerializer(page, many=True)
+            serializer = VelocidadTurnoSerializer(
+                page, many=True, context={"video_id": video.id}
+            )
             return self.get_paginated_response(serializer.data)
-        serializer = VelocidadVideoSerializer(queryset, many=True)
+        serializer = VelocidadTurnoSerializer(
+            queryset, many=True, context={"video_id": video.id}
+        )
         return Response(serializer.data)
 
     @action(detail=False, methods=["get"], url_path="conteo-hoy")
@@ -622,11 +616,10 @@ class IncidenteViewSet(viewsets.ModelViewSet):
     def perform_create(self, serializer):
         incidente = serializer.save()
         velocidad_obj = (
-            VelocidadVideo.objects.filter(
-                video__id_turno=incidente.turno,
+            VelocidadTurno.objects.filter(
+                turno=incidente.turno,
                 segundo=incidente.tiempo_en_video,
             )
-            .order_by("video_id")
             .first()
         )
         if velocidad_obj is not None:

@@ -6,7 +6,7 @@ import re
 from django.utils import timezone
 from rest_framework.exceptions import ValidationError
 
-from dashboard.models import VelocidadVideo
+from dashboard.models import VelocidadTurno
 
 _CANDIDATOS_VELOCIDAD = {"velocidadkmh"}
 _CANDIDATOS_HORA = {"hora", "fechahora", "datetime", "timestamp", "recibirtiempo"}
@@ -66,6 +66,10 @@ def _detectar_dialecto(texto):
 
 
 def importar_velocidades_tabulares(video, fieldnames, filas_iterable):
+    turno = getattr(video, "id_turno", None)
+    if turno is None:
+        raise ValidationError("El video no tiene turno asociado.")
+
     duracion = video.duracion
     if duracion is None or duracion <= 0:
         raise ValidationError("El video no tiene una duracion valida.")
@@ -142,8 +146,8 @@ def importar_velocidades_tabulares(video, fieldnames, filas_iterable):
     for segundo in range(0, ultimo_segundo + 1):
         if segundo < primer_segundo:
             timestamp = base_ts + datetime.timedelta(seconds=segundo)
-            registros[segundo] = VelocidadVideo(
-                video=video,
+            registros[segundo] = VelocidadTurno(
+                turno=turno,
                 segundo=segundo,
                 velocidad_kmh=0,
                 timestamp_csv=timestamp,
@@ -154,8 +158,8 @@ def importar_velocidades_tabulares(video, fieldnames, filas_iterable):
             continue
         if segundo in muestras:
             ultimo_valor = muestras[segundo]
-            registros[segundo] = VelocidadVideo(
-                video=video,
+            registros[segundo] = VelocidadTurno(
+                turno=turno,
                 segundo=segundo,
                 velocidad_kmh=ultimo_valor,
                 timestamp_csv=muestras_timestamp.get(segundo),
@@ -166,8 +170,8 @@ def importar_velocidades_tabulares(video, fieldnames, filas_iterable):
         if ultimo_valor is None:
             continue
         timestamp = base_ts + datetime.timedelta(seconds=segundo)
-        registros[segundo] = VelocidadVideo(
-            video=video,
+        registros[segundo] = VelocidadTurno(
+            turno=turno,
             segundo=segundo,
             velocidad_kmh=ultimo_valor,
             timestamp_csv=timestamp,
@@ -176,8 +180,8 @@ def importar_velocidades_tabulares(video, fieldnames, filas_iterable):
         )
         interpoladas += 1
 
-    VelocidadVideo.objects.filter(video=video).delete()
-    VelocidadVideo.objects.bulk_create(list(registros.values()), batch_size=1000)
+    VelocidadTurno.objects.filter(turno=turno).delete()
+    VelocidadTurno.objects.bulk_create(list(registros.values()), batch_size=1000)
 
     return {
         "filas": filas,
@@ -185,6 +189,7 @@ def importar_velocidades_tabulares(video, fieldnames, filas_iterable):
         "descartadas": descartadas,
         "interpoladas": interpoladas,
         "reemplazadas": True,
+        "turno_id": turno.id,
     }
 
 
