@@ -20,6 +20,7 @@ from dashboard.models import (
 )
 from dashboard.services.importar_videos_mdvr import (
     SegmentoVideo,
+    _archivo_listo_para_importar,
     _actualizar_estado_velocidades,
     _calcular_backoff_reintento,
     _alinear_duraciones,
@@ -86,6 +87,49 @@ class SegmentoDesdeArchivoTests(SimpleTestCase):
             datetime.date(2026, 2, 2),
         )
         self.assertIsNone(segmento)
+
+
+class ArchivoListoMdvrTests(SimpleTestCase):
+    def test_archivo_reciente_se_omite(self):
+        stat_fake = SimpleNamespace(st_size=1024, st_mtime=1000.0)
+        with patch(
+            "dashboard.services.importar_videos_mdvr.MIN_ANTIGUEDAD_ARCHIVO_SEGUNDOS",
+            180,
+        ), patch(
+            "dashboard.services.importar_videos_mdvr.os.stat",
+            return_value=stat_fake,
+        ), patch(
+            "dashboard.services.importar_videos_mdvr.time.time",
+            return_value=1010.0,
+        ):
+            ok, motivo = _archivo_listo_para_importar("/tmp/video.mp4")
+        self.assertFalse(ok)
+        self.assertIn("archivo en subida o reciente", motivo or "")
+
+    def test_archivo_antiguo_se_procesa(self):
+        stat_fake = SimpleNamespace(st_size=2048, st_mtime=1000.0)
+        with patch(
+            "dashboard.services.importar_videos_mdvr.MIN_ANTIGUEDAD_ARCHIVO_SEGUNDOS",
+            60,
+        ), patch(
+            "dashboard.services.importar_videos_mdvr.os.stat",
+            return_value=stat_fake,
+        ), patch(
+            "dashboard.services.importar_videos_mdvr.time.time",
+            return_value=1200.0,
+        ):
+            ok, motivo = _archivo_listo_para_importar("/tmp/video.mp4")
+        self.assertTrue(ok)
+        self.assertIsNone(motivo)
+
+    def test_archivo_inaccesible_se_omite(self):
+        with patch(
+            "dashboard.services.importar_videos_mdvr.os.stat",
+            side_effect=OSError("permiso denegado"),
+        ):
+            ok, motivo = _archivo_listo_para_importar("/tmp/video.mp4")
+        self.assertFalse(ok)
+        self.assertIn("no se pudo leer metadatos de archivo", motivo or "")
 
 
 class EspacioDiscoMontajesTests(SimpleTestCase):

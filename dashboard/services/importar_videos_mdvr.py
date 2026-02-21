@@ -7,6 +7,7 @@ import re
 import shutil
 import subprocess
 import tempfile
+import time
 from dataclasses import dataclass
 
 from celery.exceptions import SoftTimeLimitExceeded
@@ -131,6 +132,15 @@ try:
 except ValueError:
     MAX_DETALLES_OMISION = _MAX_DETALLES_OMISION_DEFAULT
 MAX_DETALLES_OMISION = max(0, MAX_DETALLES_OMISION)
+
+_MIN_ANTIGUEDAD_ARCHIVO_DEFAULT = 180
+try:
+    MIN_ANTIGUEDAD_ARCHIVO_SEGUNDOS = int(
+        os.environ.get("MDVR_MIN_FILE_AGE_SECONDS", _MIN_ANTIGUEDAD_ARCHIVO_DEFAULT)
+    )
+except ValueError:
+    MIN_ANTIGUEDAD_ARCHIVO_SEGUNDOS = _MIN_ANTIGUEDAD_ARCHIVO_DEFAULT
+MIN_ANTIGUEDAD_ARCHIVO_SEGUNDOS = max(0, MIN_ANTIGUEDAD_ARCHIVO_SEGUNDOS)
 
 RAW_VIDEO_EXTENSIONS = {".h264", ".grec"}
 TRANSIENT_ERRNOS = {
@@ -593,6 +603,32 @@ def _segmento_desde_archivo(ruta: str, fecha: datetime.date) -> SegmentoVideo | 
     return segmento
 
 
+def _archivo_listo_para_importar(ruta_archivo: str) -> tuple[bool, str | None]:
+    try:
+        st = os.stat(ruta_archivo)
+    except OSError as exc:
+        return False, f"no se pudo leer metadatos de archivo ({exc})."
+
+    if st.st_size <= 0:
+        return False, "archivo vacío (0 bytes)."
+
+    if MIN_ANTIGUEDAD_ARCHIVO_SEGUNDOS <= 0:
+        return True, None
+
+    edad_segundos = float(time.time()) - float(st.st_mtime)
+    if edad_segundos < MIN_ANTIGUEDAD_ARCHIVO_SEGUNDOS:
+        faltan = max(1, math.ceil(MIN_ANTIGUEDAD_ARCHIVO_SEGUNDOS - edad_segundos))
+        return (
+            False,
+            (
+                "archivo en subida o reciente; "
+                f"esperar ~{faltan}s para procesarlo."
+            ),
+        )
+
+    return True, None
+
+
 def _es_extension_video_soportada(nombre: str) -> bool:
     ext = os.path.splitext(nombre)[1].lower()
     return ext in {".mp4", ".h264", ".grec"}
@@ -1048,20 +1084,11 @@ def _importar_camion_mdvr(
                 )
                 continue
 
-            try:
-                tamano = os.path.getsize(ruta_archivo)
-            except OSError as exc:
+            listo, motivo_listo = _archivo_listo_para_importar(ruta_archivo)
+            if not listo:
                 _registrar_omision(
                     detalles,
-                    motivo=f"no se pudo leer tamaño de archivo ({exc}).",
-                    ruta_archivo=ruta_archivo,
-                )
-                continue
-
-            if tamano <= 0:
-                _registrar_omision(
-                    detalles,
-                    motivo="archivo vacío (0 bytes).",
+                    motivo=motivo_listo or "archivo no está listo para importación.",
                     ruta_archivo=ruta_archivo,
                 )
                 continue
