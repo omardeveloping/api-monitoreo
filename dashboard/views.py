@@ -201,6 +201,35 @@ class TurnoViewSet(viewsets.ModelViewSet):
         serializer = VideoSerializer(videos, many=True, context=serializer_context)
         return Response(serializer.data)
 
+    @action(detail=True, methods=["get"], url_path="velocidades")
+    def velocidades(self, request, pk=None):
+        """Devuelve velocidades del turno."""
+        turno = self.get_object()
+        queryset = VelocidadTurno.objects.filter(turno=turno).order_by("segundo")
+
+        desde = request.query_params.get("desde")
+        if desde is not None:
+            try:
+                desde = int(desde)
+            except ValueError as exc:
+                raise ValidationError("Parametro 'desde' invalido.") from exc
+            queryset = queryset.filter(segundo__gte=desde)
+
+        hasta = request.query_params.get("hasta")
+        if hasta is not None:
+            try:
+                hasta = int(hasta)
+            except ValueError as exc:
+                raise ValidationError("Parametro 'hasta' invalido.") from exc
+            queryset = queryset.filter(segundo__lte=hasta)
+
+        page = self.paginate_queryset(queryset)
+        if page is not None:
+            serializer = VelocidadTurnoSerializer(page, many=True)
+            return self.get_paginated_response(serializer.data)
+        serializer = VelocidadTurnoSerializer(queryset, many=True)
+        return Response(serializer.data)
+
     @action(detail=False, methods=["get"], url_path="por-dia")
     def por_dia(self, request):
         """
