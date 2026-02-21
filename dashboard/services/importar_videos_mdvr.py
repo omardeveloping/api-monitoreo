@@ -1112,6 +1112,7 @@ def _importar_camion_mdvr(
 
         turnos_creados = {}
         videos_turno: dict[str, list[Video]] = {}
+        videos_para_velocidades: dict[int, Video] = {}
         xlsx_por_video: dict[int, str] = {}
 
         for (tipo_turno, camara), lista in grupos.items():
@@ -1130,11 +1131,41 @@ def _importar_camion_mdvr(
                 f"MDVR_{carpeta_id}_{fecha.isoformat()}_{tipo_turno}_C{camara}"
             )
             ahora = timezone.now()
-            if Video.objects.filter(
-                nombre=nombre_video,
-                id_turno=turno,
-                estado=EstadoVideo.LISTO,
-            ).exists():
+            video_listo = (
+                Video.objects.filter(
+                    nombre=nombre_video,
+                    id_turno=turno,
+                    estado=EstadoVideo.LISTO,
+                )
+                .order_by("-id")
+                .first()
+            )
+            if video_listo:
+                if (
+                    importar_velocidades
+                    and video_listo.estado_velocidades == EstadoVelocidadesVideo.PENDIENTE
+                ):
+                    inicio_para_xlsx = lista[0].inicio_dt
+                    if video_listo.fecha_inicio is not None:
+                        inicio_para_xlsx = video_listo.fecha_inicio
+                        if timezone.is_aware(inicio_para_xlsx):
+                            inicio_para_xlsx = timezone.localtime(inicio_para_xlsx).replace(
+                                tzinfo=None
+                            )
+                    xlsx_info = _seleccionar_xlsx(xlsx_files, inicio_para_xlsx)
+                    if xlsx_info:
+                        xlsx_por_video[video_listo.id] = xlsx_info.ruta
+                        videos_para_velocidades[video_listo.id] = video_listo
+                        _actualizar_estado_velocidades(
+                            video_listo, EstadoVelocidadesVideo.PENDIENTE
+                        )
+                    else:
+                        _actualizar_estado_velocidades(
+                            video_listo,
+                            EstadoVelocidadesVideo.SIN_XLSX,
+                            error="No se encontró XLSX que cubra la fecha/hora de inicio del video.",
+                        )
+                    continue
                 _registrar_omision(
                     detalles,
                     motivo="ya existe video LISTO para turno y cámara.",
@@ -1257,6 +1288,7 @@ def _importar_camion_mdvr(
                     xlsx_info = _seleccionar_xlsx(xlsx_files, inicio_dt)
                     if xlsx_info:
                         xlsx_por_video[video.id] = xlsx_info.ruta
+                        videos_para_velocidades[video.id] = video
                         _actualizar_estado_velocidades(video, EstadoVelocidadesVideo.PENDIENTE)
                     else:
                         _actualizar_estado_velocidades(
@@ -1296,36 +1328,37 @@ def _importar_camion_mdvr(
             detalles["turnos_procesados"] += 1
             detalles["recortados"] += _alinear_duraciones(videos)
 
-            if not importar_velocidades:
+        if not importar_velocidades:
+            continue
+
+        for video in videos_para_velocidades.values():
+            ruta_xlsx = xlsx_por_video.get(video.id)
+            if not ruta_xlsx:
+                if video.estado_velocidades != EstadoVelocidadesVideo.SIN_XLSX:
+                    _actualizar_estado_velocidades(
+                        video,
+                        EstadoVelocidadesVideo.SIN_XLSX,
+                        error="No se encontró XLSX asociado para este video.",
+                    )
                 continue
-            for video in videos:
-                ruta_xlsx = xlsx_por_video.get(video.id)
-                if not ruta_xlsx:
-                    if video.estado_velocidades != EstadoVelocidadesVideo.SIN_XLSX:
-                        _actualizar_estado_velocidades(
-                            video,
-                            EstadoVelocidadesVideo.SIN_XLSX,
-                            error="No se encontró XLSX asociado para este video.",
-                        )
-                    continue
-                try:
-                    with open(ruta_xlsx, "rb") as archivo:
-                        importar_velocidades_xlsx(video, archivo)
-                    _actualizar_estado_velocidades(
-                        video,
-                        EstadoVelocidadesVideo.IMPORTADA,
-                        actualizado_en=timezone.now(),
-                    )
-                except SoftTimeLimitExceeded:
-                    raise
-                except Exception as exc:
-                    _actualizar_estado_velocidades(
-                        video,
-                        EstadoVelocidadesVideo.ERROR,
-                        error=_normalizar_error(exc),
-                    )
-                    detalles["errores"].append(
-                        f"{video.nombre}: error importando velocidades ({exc})."
-                    )
+            try:
+                with open(ruta_xlsx, "rb") as archivo:
+                    importar_velocidades_xlsx(video, archivo)
+                _actualizar_estado_velocidades(
+                    video,
+                    EstadoVelocidadesVideo.IMPORTADA,
+                    actualizado_en=timezone.now(),
+                )
+            except SoftTimeLimitExceeded:
+                raise
+            except Exception as exc:
+                _actualizar_estado_velocidades(
+                    video,
+                    EstadoVelocidadesVideo.ERROR,
+                    error=_normalizar_error(exc),
+                )
+                detalles["errores"].append(
+                    f"{video.nombre}: error importando velocidades ({exc})."
+                )
 
     return detalles

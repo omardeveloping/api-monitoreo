@@ -1,5 +1,7 @@
 import datetime
+import os
 import subprocess
+import tempfile
 from collections import namedtuple
 from types import SimpleNamespace
 from unittest.mock import mock_open, patch
@@ -17,11 +19,13 @@ from dashboard.models import (
     Incidente,
     TipoTurnoChoices,
     Turno,
+    Video,
 )
 from dashboard.services.importar_videos_mdvr import (
     SegmentoVideo,
     _archivo_listo_para_importar,
     _actualizar_estado_velocidades,
+    _importar_camion_mdvr,
     _calcular_backoff_reintento,
     _alinear_duraciones,
     _concat_h264_transcodificando,
@@ -130,6 +134,133 @@ class ArchivoListoMdvrTests(SimpleTestCase):
             ok, motivo = _archivo_listo_para_importar("/tmp/video.mp4")
         self.assertFalse(ok)
         self.assertIn("no se pudo leer metadatos de archivo", motivo or "")
+
+
+class ImportarMdvrBackfillVelocidadesTests(TestCase):
+    def test_video_listo_pendiente_reintenta_carga_xlsx(self):
+        camion = Camion.objects.create(
+            patente="BKCD11",
+            carpeta_id="4462510196",
+        )
+        turno = Turno.objects.create(
+            fecha=datetime.date(2026, 2, 18),
+            id_camion=camion,
+            tipo_turno=TipoTurnoChoices.MANANA,
+            hora_inicio=datetime.time(8, 0),
+            hora_fin=datetime.time(16, 0),
+        )
+        video = Video.objects.create(
+            nombre="MDVR_4462510196_2026-02-18_manana_C3",
+            camara=3,
+            ruta_archivo="videos/existente.mp4",
+            fecha_inicio=timezone.make_aware(datetime.datetime(2026, 2, 18, 8, 0, 47)),
+            fecha_subida=datetime.date(2026, 2, 19),
+            inicio_timestamp=datetime.time(8, 0, 47),
+            estado=EstadoVideo.LISTO,
+            estado_velocidades=EstadoVelocidadesVideo.PENDIENTE,
+            id_turno=turno,
+        )
+
+        with tempfile.TemporaryDirectory() as base_dir:
+            carpeta_mdvr = os.path.join(base_dir, "4462510196(4462510196)")
+            carpeta_dia = os.path.join(carpeta_mdvr, "2026-02-18")
+            os.makedirs(carpeta_dia, exist_ok=True)
+
+            segmento = os.path.join(
+                carpeta_dia,
+                "4462510196-260218-080047-080047-20010300.mp4",
+            )
+            with open(segmento, "wb") as fh:
+                fh.write(b"dummy-segment")
+
+            ruta_xlsx = os.path.join(
+                base_dir,
+                "4462510196 2026-02-18 00-00-00~2026-02-18 23-59-59.xlsx",
+            )
+            with open(ruta_xlsx, "wb") as fh:
+                fh.write(b"dummy-xlsx")
+
+            with patch(
+                "dashboard.services.importar_videos_mdvr.MIN_ANTIGUEDAD_ARCHIVO_SEGUNDOS",
+                0,
+            ), patch(
+                "dashboard.services.importar_videos_mdvr.importar_velocidades_xlsx",
+                return_value={"guardadas": 1},
+            ) as importar_mock, patch(
+                "dashboard.services.importar_videos_mdvr.procesar_video_subida"
+            ) as procesar_video_mock:
+                detalle = _importar_camion_mdvr(
+                    camion=camion,
+                    base_dir=base_dir,
+                    importar_velocidades=True,
+                    fecha_objetivo=datetime.date(2026, 2, 18),
+                )
+
+        self.assertEqual(detalle["videos_creados"], 0)
+        self.assertEqual(importar_mock.call_count, 1)
+        self.assertEqual(importar_mock.call_args.args[0].id, video.id)
+        procesar_video_mock.assert_not_called()
+
+        video.refresh_from_db()
+        self.assertEqual(video.estado_velocidades, EstadoVelocidadesVideo.IMPORTADA)
+        self.assertEqual(video.velocidades_error, "")
+        self.assertIsNotNone(video.velocidades_actualizadas_en)
+
+    def test_video_listo_sin_xlsx_no_reintenta(self):
+        camion = Camion.objects.create(
+            patente="BKCD12",
+            carpeta_id="4462510197",
+        )
+        turno = Turno.objects.create(
+            fecha=datetime.date(2026, 2, 18),
+            id_camion=camion,
+            tipo_turno=TipoTurnoChoices.MANANA,
+            hora_inicio=datetime.time(8, 0),
+            hora_fin=datetime.time(16, 0),
+        )
+        video = Video.objects.create(
+            nombre="MDVR_4462510197_2026-02-18_manana_C3",
+            camara=3,
+            ruta_archivo="videos/existente.mp4",
+            fecha_inicio=timezone.make_aware(datetime.datetime(2026, 2, 18, 8, 0, 47)),
+            fecha_subida=datetime.date(2026, 2, 19),
+            inicio_timestamp=datetime.time(8, 0, 47),
+            estado=EstadoVideo.LISTO,
+            estado_velocidades=EstadoVelocidadesVideo.SIN_XLSX,
+            velocidades_error="No se encontró XLSX asociado para este video.",
+            id_turno=turno,
+        )
+
+        with tempfile.TemporaryDirectory() as base_dir:
+            carpeta_mdvr = os.path.join(base_dir, "4462510197(4462510197)")
+            carpeta_dia = os.path.join(carpeta_mdvr, "2026-02-18")
+            os.makedirs(carpeta_dia, exist_ok=True)
+
+            segmento = os.path.join(
+                carpeta_dia,
+                "4462510197-260218-080047-080047-20010300.mp4",
+            )
+            with open(segmento, "wb") as fh:
+                fh.write(b"dummy-segment")
+
+            with patch(
+                "dashboard.services.importar_videos_mdvr.MIN_ANTIGUEDAD_ARCHIVO_SEGUNDOS",
+                0,
+            ), patch(
+                "dashboard.services.importar_videos_mdvr.importar_velocidades_xlsx",
+                return_value={"guardadas": 1},
+            ) as importar_mock:
+                detalle = _importar_camion_mdvr(
+                    camion=camion,
+                    base_dir=base_dir,
+                    importar_velocidades=True,
+                    fecha_objetivo=datetime.date(2026, 2, 18),
+                )
+
+        self.assertEqual(detalle["videos_creados"], 0)
+        self.assertEqual(importar_mock.call_count, 0)
+        video.refresh_from_db()
+        self.assertEqual(video.estado_velocidades, EstadoVelocidadesVideo.SIN_XLSX)
 
 
 class EspacioDiscoMontajesTests(SimpleTestCase):
