@@ -1,4 +1,5 @@
 import datetime
+import subprocess
 from collections import namedtuple
 from types import SimpleNamespace
 from unittest.mock import mock_open, patch
@@ -20,6 +21,7 @@ from dashboard.services.importar_videos_mdvr import (
     SegmentoVideo,
     _calcular_backoff_reintento,
     _alinear_duraciones,
+    _concat_h264_transcodificando,
     _concatenar_segmentos,
     _es_error_transitorio,
     _puede_reprocesarse,
@@ -273,6 +275,28 @@ class ConcatenacionSegmentosMdvrTests(SimpleTestCase):
         self.assertTrue(ok)
         concat_raw.assert_called_once_with(["/tmp/a.h264"], "/tmp/salida.h264")
         concat_ffmpeg.assert_not_called()
+
+    def test_concat_transcodificando_propagates_ffmpeg_stderr(self):
+        exc = subprocess.CalledProcessError(
+            returncode=183,
+            cmd=["ffmpeg", "-f", "concat"],
+            stderr="Impossible to open '/tmp/broken_segment.mp4'",
+        )
+        with patch(
+            "dashboard.services.importar_videos_mdvr._crear_lista_concat",
+            return_value="/tmp/concat_lista.txt",
+        ), patch(
+            "dashboard.services.importar_videos_mdvr.subprocess.run",
+            side_effect=exc,
+        ), patch(
+            "dashboard.services.importar_videos_mdvr.os.path.exists",
+            return_value=False,
+        ):
+            ok, error = _concat_h264_transcodificando(["/tmp/a.mp4"], "/tmp/salida.mp4")
+
+        self.assertFalse(ok)
+        self.assertIn("código 183", error)
+        self.assertIn("Impossible to open", error)
 
 
 class ReintentosMdvrTests(SimpleTestCase):

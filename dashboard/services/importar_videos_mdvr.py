@@ -311,6 +311,28 @@ def _normalizar_error(exc: Exception) -> str:
     return mensaje[:2000]
 
 
+def _resumir_texto_error_subprocess(valor: str | None, limite: int = 800) -> str:
+    texto = (valor or "").strip()
+    if not texto:
+        return ""
+    texto = re.sub(r"\s+", " ", texto)
+    if len(texto) > limite:
+        return f"{texto[:limite]}..."
+    return texto
+
+
+def _mensaje_error_subprocess(exc: Exception) -> str:
+    if isinstance(exc, subprocess.CalledProcessError):
+        detalle = _resumir_texto_error_subprocess(exc.stderr) or _resumir_texto_error_subprocess(
+            exc.stdout
+        )
+        mensaje = f"ffmpeg devolvió código {exc.returncode}"
+        if detalle:
+            mensaje = f"{mensaje}. detalle: {detalle}"
+        return mensaje
+    return _normalizar_error(exc)
+
+
 def _es_error_transitorio(exc: Exception) -> bool:
     if isinstance(exc, (SoftTimeLimitExceeded, TimeoutError, subprocess.TimeoutExpired)):
         return True
@@ -617,8 +639,10 @@ def _concat_mp4_copiando(segmentos: list[str], salida: str) -> tuple[bool, str |
         if os.path.getsize(salida) <= 0:
             return False, "salida vacía tras concatenación MP4 por copia."
         return True, None
-    except (subprocess.CalledProcessError, FileNotFoundError, OSError) as exc:
-        return False, str(exc)
+    except subprocess.CalledProcessError as exc:
+        return False, _mensaje_error_subprocess(exc)
+    except (FileNotFoundError, OSError) as exc:
+        return False, _normalizar_error(exc)
     finally:
         if os.path.exists(lista):
             os.remove(lista)
@@ -652,8 +676,10 @@ def _concat_h264_transcodificando(segmentos: list[str], salida: str) -> tuple[bo
         ]
         subprocess.run(comando, capture_output=True, text=True, check=True)
         return True, None
-    except (subprocess.CalledProcessError, FileNotFoundError) as exc:
-        return False, str(exc)
+    except subprocess.CalledProcessError as exc:
+        return False, _mensaje_error_subprocess(exc)
+    except (FileNotFoundError, OSError) as exc:
+        return False, _normalizar_error(exc)
     finally:
         if os.path.exists(lista):
             os.remove(lista)
