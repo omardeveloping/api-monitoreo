@@ -69,6 +69,13 @@ class EstadoVideo(models.TextChoices):
     ERROR_PERMANENTE = "error_permanente", "Error permanente"
 
 
+class EstadoVelocidadesVideo(models.TextChoices):
+    PENDIENTE = "pendiente", "Pendiente"
+    IMPORTADA = "importada", "Importada"
+    SIN_XLSX = "sin_xlsx", "Sin XLSX"
+    ERROR = "error", "Error"
+
+
 class Video(models.Model):
     nombre = models.CharField(max_length=100)
     camara = models.IntegerField(choices=NumeroCamara.choices)
@@ -86,6 +93,13 @@ class Video(models.Model):
     reintentos = models.PositiveSmallIntegerField(default=0)
     ultimo_error = models.TextField(blank=True, default="")
     proximo_reintento_en = models.DateTimeField(null=True, blank=True)
+    estado_velocidades = models.CharField(
+        max_length=20,
+        choices=EstadoVelocidadesVideo.choices,
+        default=EstadoVelocidadesVideo.PENDIENTE,
+    )
+    velocidades_actualizadas_en = models.DateTimeField(null=True, blank=True)
+    velocidades_error = models.TextField(blank=True, default="")
     id_turno = models.ForeignKey(Turno, on_delete=models.CASCADE)
     creado_en = models.DateTimeField(auto_now_add=True)
     fecha_subida = models.DateField(default=timezone.localdate)

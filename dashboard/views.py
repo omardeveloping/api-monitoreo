@@ -14,7 +14,14 @@ from django.core.files import File
 from django.core.files.storage import default_storage
 from django.utils import timezone
 from django.utils.text import get_valid_filename
-from .models import Camion, Turno, Video, Incidente, VelocidadVideo
+from .models import (
+    Camion,
+    EstadoVelocidadesVideo,
+    Turno,
+    Video,
+    Incidente,
+    VelocidadVideo,
+)
 from .serializers import (
     CamionSerializer,
     TurnoSerializer,
@@ -454,11 +461,34 @@ class VideoViewSet(viewsets.ModelViewSet):
         archivo = request.FILES.get("archivo") or request.FILES.get("csv")
         if not archivo:
             raise ValidationError("Debe adjuntar un archivo CSV o XLSX en 'archivo'.")
-        ext = os.path.splitext(getattr(archivo, "name", "") or "")[1].lower()
-        if ext in {".xlsx", ".xls"}:
-            resultado = importar_velocidades_xlsx(video, archivo)
-        else:
-            resultado = importar_velocidades_csv(video, archivo)
+        try:
+            ext = os.path.splitext(getattr(archivo, "name", "") or "")[1].lower()
+            if ext in {".xlsx", ".xls"}:
+                resultado = importar_velocidades_xlsx(video, archivo)
+            else:
+                resultado = importar_velocidades_csv(video, archivo)
+        except Exception as exc:
+            video.estado_velocidades = EstadoVelocidadesVideo.ERROR
+            video.velocidades_actualizadas_en = None
+            video.velocidades_error = (str(exc) or exc.__class__.__name__).strip()[:2000]
+            video.save(
+                update_fields=[
+                    "estado_velocidades",
+                    "velocidades_actualizadas_en",
+                    "velocidades_error",
+                ]
+            )
+            raise
+        video.estado_velocidades = EstadoVelocidadesVideo.IMPORTADA
+        video.velocidades_actualizadas_en = timezone.now()
+        video.velocidades_error = ""
+        video.save(
+            update_fields=[
+                "estado_velocidades",
+                "velocidades_actualizadas_en",
+                "velocidades_error",
+            ]
+        )
         return Response(resultado, status=status.HTTP_201_CREATED)
 
     @action(detail=True, methods=["get"], url_path="velocidades")

@@ -12,6 +12,7 @@ from rest_framework.test import APIRequestFactory, force_authenticate
 
 from dashboard.models import (
     Camion,
+    EstadoVelocidadesVideo,
     EstadoVideo,
     Incidente,
     TipoTurnoChoices,
@@ -19,6 +20,7 @@ from dashboard.models import (
 )
 from dashboard.services.importar_videos_mdvr import (
     SegmentoVideo,
+    _actualizar_estado_velocidades,
     _calcular_backoff_reintento,
     _alinear_duraciones,
     _concat_h264_transcodificando,
@@ -340,6 +342,55 @@ class ReintentosMdvrTests(SimpleTestCase):
         primer = _calcular_backoff_reintento(1)
         segundo = _calcular_backoff_reintento(2)
         self.assertGreaterEqual(segundo, primer)
+
+
+class EstadoVelocidadesMdvrTests(SimpleTestCase):
+    def test_actualiza_estado_de_velocidades(self):
+        class VideoMock:
+            def __init__(self):
+                self.estado_velocidades = EstadoVelocidadesVideo.PENDIENTE
+                self.velocidades_error = ""
+                self.velocidades_actualizadas_en = None
+                self.guardados = []
+
+            def save(self, update_fields):
+                self.guardados.append(update_fields)
+
+        video = VideoMock()
+        ahora = timezone.now()
+        _actualizar_estado_velocidades(
+            video,
+            EstadoVelocidadesVideo.IMPORTADA,
+            actualizado_en=ahora,
+        )
+
+        self.assertEqual(video.estado_velocidades, EstadoVelocidadesVideo.IMPORTADA)
+        self.assertEqual(video.velocidades_error, "")
+        self.assertEqual(video.velocidades_actualizadas_en, ahora)
+        self.assertEqual(
+            video.guardados,
+            [["estado_velocidades", "velocidades_actualizadas_en"]],
+        )
+
+    def test_no_guarda_si_no_hay_cambios(self):
+        class VideoMock:
+            def __init__(self):
+                self.estado_velocidades = EstadoVelocidadesVideo.SIN_XLSX
+                self.velocidades_error = "sin archivo"
+                self.velocidades_actualizadas_en = None
+                self.guardados = []
+
+            def save(self, update_fields):
+                self.guardados.append(update_fields)
+
+        video = VideoMock()
+        _actualizar_estado_velocidades(
+            video,
+            EstadoVelocidadesVideo.SIN_XLSX,
+            error="sin archivo",
+            actualizado_en=None,
+        )
+        self.assertEqual(video.guardados, [])
 
 
 class ExportarIncidentesApiTests(TestCase):

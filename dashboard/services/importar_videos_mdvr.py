@@ -16,7 +16,14 @@ from django.core.files.storage import default_storage
 from django.utils import timezone
 from rest_framework.exceptions import ValidationError
 
-from dashboard.models import Camion, EstadoVideo, TipoTurnoChoices, Turno, Video
+from dashboard.models import (
+    Camion,
+    EstadoVelocidadesVideo,
+    EstadoVideo,
+    TipoTurnoChoices,
+    Turno,
+    Video,
+)
 from dashboard.services.calcular_duracion_video import (
     calcular_duracion_video,
     procesar_video_subida,
@@ -331,6 +338,28 @@ def _mensaje_error_subprocess(exc: Exception) -> str:
             mensaje = f"{mensaje}. detalle: {detalle}"
         return mensaje
     return _normalizar_error(exc)
+
+
+def _actualizar_estado_velocidades(
+    video: Video,
+    estado: str,
+    *,
+    error: str = "",
+    actualizado_en: datetime.datetime | None = None,
+):
+    error_limpio = (error or "").strip()[:2000]
+    cambios = []
+    if video.estado_velocidades != estado:
+        video.estado_velocidades = estado
+        cambios.append("estado_velocidades")
+    if video.velocidades_error != error_limpio:
+        video.velocidades_error = error_limpio
+        cambios.append("velocidades_error")
+    if video.velocidades_actualizadas_en != actualizado_en:
+        video.velocidades_actualizadas_en = actualizado_en
+        cambios.append("velocidades_actualizadas_en")
+    if cambios:
+        video.save(update_fields=cambios)
 
 
 def _es_error_transitorio(exc: Exception) -> bool:
@@ -1139,6 +1168,9 @@ def _importar_camion_mdvr(
                     video_existente.fin_timestamp = None
                     video_existente.mimetype = ""
                     video_existente.proximo_reintento_en = lease_hasta
+                    video_existente.estado_velocidades = EstadoVelocidadesVideo.PENDIENTE
+                    video_existente.velocidades_actualizadas_en = None
+                    video_existente.velocidades_error = ""
                     video_existente.save(
                         update_fields=[
                             "camara",
@@ -1150,6 +1182,9 @@ def _importar_camion_mdvr(
                             "fin_timestamp",
                             "mimetype",
                             "proximo_reintento_en",
+                            "estado_velocidades",
+                            "velocidades_actualizadas_en",
+                            "velocidades_error",
                         ]
                     )
                     video = video_existente
@@ -1166,6 +1201,7 @@ def _importar_camion_mdvr(
                         inicio_timestamp=inicio_dt.time(),
                         estado=EstadoVideo.PROCESANDO,
                         proximo_reintento_en=lease_hasta,
+                        estado_velocidades=EstadoVelocidadesVideo.PENDIENTE,
                         id_turno=turno,
                     )
 
@@ -1194,6 +1230,13 @@ def _importar_camion_mdvr(
                     xlsx_info = _seleccionar_xlsx(xlsx_files, inicio_dt)
                     if xlsx_info:
                         xlsx_por_video[video.id] = xlsx_info.ruta
+                        _actualizar_estado_velocidades(video, EstadoVelocidadesVideo.PENDIENTE)
+                    else:
+                        _actualizar_estado_velocidades(
+                            video,
+                            EstadoVelocidadesVideo.SIN_XLSX,
+                            error="No se encontró XLSX que cubra la fecha/hora de inicio del video.",
+                        )
             except SoftTimeLimitExceeded as exc:
                 if video is not None:
                     estado_error = _marcar_video_para_reintento(video, timezone.now(), exc)
@@ -1231,13 +1274,29 @@ def _importar_camion_mdvr(
             for video in videos:
                 ruta_xlsx = xlsx_por_video.get(video.id)
                 if not ruta_xlsx:
+                    if video.estado_velocidades != EstadoVelocidadesVideo.SIN_XLSX:
+                        _actualizar_estado_velocidades(
+                            video,
+                            EstadoVelocidadesVideo.SIN_XLSX,
+                            error="No se encontró XLSX asociado para este video.",
+                        )
                     continue
                 try:
                     with open(ruta_xlsx, "rb") as archivo:
                         importar_velocidades_xlsx(video, archivo)
+                    _actualizar_estado_velocidades(
+                        video,
+                        EstadoVelocidadesVideo.IMPORTADA,
+                        actualizado_en=timezone.now(),
+                    )
                 except SoftTimeLimitExceeded:
                     raise
                 except Exception as exc:
+                    _actualizar_estado_velocidades(
+                        video,
+                        EstadoVelocidadesVideo.ERROR,
+                        error=_normalizar_error(exc),
+                    )
                     detalles["errores"].append(
                         f"{video.nombre}: error importando velocidades ({exc})."
                     )
