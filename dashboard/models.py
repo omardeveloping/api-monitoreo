@@ -81,6 +81,7 @@ class Video(models.Model):
     camara = models.IntegerField(choices=NumeroCamara.choices)
     ruta_archivo = models.FileField(upload_to='videos/')
     mimetype = models.CharField(max_length=100, blank=True, default="")
+    mapa_segmentos = models.JSONField(default=list, blank=True)
     fecha_inicio = models.DateTimeField(null=True, blank=True)
     duracion = models.IntegerField(null=True, blank=True)
     inicio_timestamp = models.TimeField(default=time(0, 0), null=True, blank=True)

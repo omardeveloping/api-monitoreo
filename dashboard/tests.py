@@ -736,6 +736,62 @@ class ImportarVelocidadesTabularesTests(TestCase):
         self.assertFalse(velocidad_21.sin_datos)
         self.assertFalse(velocidad_21.interpolado)
 
+    def test_mapa_segmentos_alinea_velocidades_en_video_concatenado(self):
+        camion = Camion.objects.create(patente="BKCD17")
+        turno = Turno.objects.create(
+            fecha=datetime.date(2026, 2, 18),
+            id_camion=camion,
+            tipo_turno=TipoTurnoChoices.MANANA,
+            hora_inicio=datetime.time(8, 0),
+            hora_fin=datetime.time(16, 0),
+        )
+        video = Video.objects.create(
+            nombre="MDVR_4462510196_2026-02-18_manana_C3",
+            camara=3,
+            ruta_archivo="videos/mdvr_mapa.mp4",
+            fecha_inicio=timezone.make_aware(datetime.datetime(2026, 2, 18, 8, 0, 0)),
+            fecha_subida=datetime.date(2026, 2, 18),
+            inicio_timestamp=datetime.time(8, 0, 0),
+            estado=EstadoVideo.LISTO,
+            duracion=240,
+            mapa_segmentos=[
+                {
+                    "orden": 1,
+                    "video_inicio_segundo": 0,
+                    "video_fin_segundo": 119,
+                    "real_inicio": "2026-02-18T08:00:00-03:00",
+                    "real_fin": "2026-02-18T08:02:00-03:00",
+                },
+                {
+                    "orden": 2,
+                    "video_inicio_segundo": 120,
+                    "video_fin_segundo": 239,
+                    "real_inicio": "2026-02-18T08:10:00-03:00",
+                    "real_fin": "2026-02-18T08:12:00-03:00",
+                },
+            ],
+            id_turno=turno,
+        )
+
+        fieldnames = ["Hora", "Velocidad(km / h)"]
+        filas = [
+            {"Hora": "2026-02-18 08:01:50", "Velocidad(km / h)": "20"},
+            {"Hora": "2026-02-18 08:05:00", "Velocidad(km / h)": "99"},
+            {"Hora": "2026-02-18 08:10:00", "Velocidad(km / h)": "60"},
+        ]
+
+        resultado = importar_velocidades_tabulares(video, fieldnames, filas)
+        self.assertEqual(resultado["guardadas"], 240)
+        self.assertGreaterEqual(resultado["descartadas"], 1)
+
+        velocidad_110 = VelocidadTurno.objects.get(turno=turno, segundo=110)
+        self.assertEqual(velocidad_110.velocidad_kmh, 20)
+
+        velocidad_120 = VelocidadTurno.objects.get(turno=turno, segundo=120)
+        self.assertEqual(velocidad_120.velocidad_kmh, 60)
+        self.assertFalse(velocidad_120.sin_datos)
+        self.assertFalse(velocidad_120.interpolado)
+
 
 class ExportarIncidentesApiTests(TestCase):
     def setUp(self):

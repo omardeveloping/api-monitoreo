@@ -162,6 +162,81 @@ def _debe_compactar_saltos_mdvr(muestras_ordenadas, base_ts, ultimo_segundo):
     return cobertura < UMBRAL_COBERTURA_SIN_COMPACTAR
 
 
+def _parsear_iso_datetime(valor):
+    if valor is None:
+        return None
+    texto = str(valor).strip()
+    if not texto:
+        return None
+    try:
+        dt = datetime.datetime.fromisoformat(texto)
+    except ValueError:
+        return None
+    if timezone.is_naive(dt):
+        return timezone.make_aware(dt, timezone.get_current_timezone())
+    return dt
+
+
+def _obtener_mapa_segmentos(video):
+    mapa_raw = getattr(video, "mapa_segmentos", None)
+    if not isinstance(mapa_raw, list):
+        return []
+
+    segmentos = []
+    for item in mapa_raw:
+        if not isinstance(item, dict):
+            continue
+        try:
+            video_inicio = int(item.get("video_inicio_segundo"))
+            video_fin = int(item.get("video_fin_segundo"))
+        except (TypeError, ValueError):
+            continue
+        if video_fin < video_inicio:
+            continue
+        real_inicio = _parsear_iso_datetime(item.get("real_inicio"))
+        real_fin = _parsear_iso_datetime(item.get("real_fin"))
+        if real_inicio is None or real_fin is None:
+            continue
+        if real_fin <= real_inicio:
+            continue
+        segmentos.append((real_inicio, real_fin, video_inicio, video_fin))
+
+    segmentos.sort(key=lambda seg: seg[2])
+    return segmentos
+
+
+def _mapear_segundo_con_segmentos(timestamp, segmentos, indice_inicio=0):
+    if not segmentos:
+        return None, indice_inicio
+
+    idx = max(0, min(indice_inicio, len(segmentos) - 1))
+    while idx < len(segmentos):
+        real_inicio, real_fin, video_inicio, video_fin = segmentos[idx]
+        if timestamp < real_inicio:
+            return None, idx
+        if timestamp > real_fin:
+            idx += 1
+            continue
+        delta = int((timestamp - real_inicio).total_seconds())
+        if delta < 0:
+            return None, idx
+        segundo = video_inicio + delta
+        if segundo > video_fin:
+            segundo = video_fin
+        if segundo < video_inicio:
+            segundo = video_inicio
+        return segundo, idx
+
+    return None, len(segmentos) - 1
+
+
+def _timestamp_para_segundo_mapeado(segundo, segmentos):
+    for real_inicio, _real_fin, video_inicio, video_fin in segmentos:
+        if video_inicio <= segundo <= video_fin:
+            return real_inicio + datetime.timedelta(seconds=segundo - video_inicio)
+    return None
+
+
 def importar_velocidades_tabulares(video, fieldnames, filas_iterable):
     turno = getattr(video, "id_turno", None)
     if turno is None:
@@ -219,8 +294,11 @@ def importar_velocidades_tabulares(video, fieldnames, filas_iterable):
         base_ts = timezone.make_aware(base_ts, timezone.get_current_timezone())
 
     muestras_raw_ordenadas = sorted(muestras_raw, key=lambda x: (x[0], x[2]))
+    mapa_segmentos = _obtener_mapa_segmentos(video)
+    usar_mapa_segmentos = bool(mapa_segmentos)
     compactar_saltos = (
-        COMPACTAR_SALTOS_RELOJ_MDVR
+        (not usar_mapa_segmentos)
+        and COMPACTAR_SALTOS_RELOJ_MDVR
         and _es_video_mdvr(video)
         and _debe_compactar_saltos_mdvr(muestras_raw_ordenadas, base_ts, ultimo_segundo)
     )
@@ -234,9 +312,20 @@ def importar_velocidades_tabulares(video, fieldnames, filas_iterable):
     muestras_timestamp = {}
     timestamp_previo = None
     segundo_compactado = None
+    indice_segmento = 0
 
     for timestamp, velocidad, _ in muestras_raw_ordenadas:
-        segundo = int((timestamp - base_ts).total_seconds())
+        if usar_mapa_segmentos:
+            segundo, indice_segmento = _mapear_segundo_con_segmentos(
+                timestamp,
+                mapa_segmentos,
+                indice_inicio=indice_segmento,
+            )
+            if segundo is None:
+                descartadas += 1
+                continue
+        else:
+            segundo = int((timestamp - base_ts).total_seconds())
         if compactar_saltos:
             if segundo_compactado is None:
                 segundo_compactado = segundo
@@ -271,8 +360,16 @@ def importar_velocidades_tabulares(video, fieldnames, filas_iterable):
     primer_segundo = min(muestras.keys())
 
     for segundo in range(0, ultimo_segundo + 1):
+        timestamp_mapeado = (
+            _timestamp_para_segundo_mapeado(segundo, mapa_segmentos)
+            if usar_mapa_segmentos
+            else None
+        )
         if segundo < primer_segundo:
-            timestamp = base_ts + datetime.timedelta(seconds=segundo)
+            if usar_mapa_segmentos:
+                timestamp = timestamp_mapeado
+            else:
+                timestamp = base_ts + datetime.timedelta(seconds=segundo)
             registros[segundo] = VelocidadTurno(
                 turno=turno,
                 segundo=segundo,
@@ -297,7 +394,10 @@ def importar_velocidades_tabulares(video, fieldnames, filas_iterable):
             continue
         if ultimo_valor is None:
             continue
-        timestamp = base_ts + datetime.timedelta(seconds=segundo)
+        if usar_mapa_segmentos:
+            timestamp = timestamp_mapeado
+        else:
+            timestamp = base_ts + datetime.timedelta(seconds=segundo)
         gap_desde_muestra = (
             segundo - ultimo_segundo_con_muestra
             if ultimo_segundo_con_muestra is not None

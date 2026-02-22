@@ -806,6 +806,172 @@ def _subir_archivo_temporal(ruta_local: str, nombre_base: str) -> str:
     return destino
 
 
+def _parsear_iso_datetime(valor: str | None) -> datetime.datetime | None:
+    if valor is None:
+        return None
+    texto = str(valor).strip()
+    if not texto:
+        return None
+    try:
+        dt = datetime.datetime.fromisoformat(texto)
+    except ValueError:
+        return None
+    if timezone.is_naive(dt):
+        return timezone.make_aware(dt, timezone.get_current_timezone())
+    return dt
+
+
+def _duracion_segmento_real(seg: SegmentoVideo) -> float:
+    try:
+        duracion = float(calcular_duracion_video(seg.ruta))
+    except Exception:
+        duracion = 0.0
+    if duracion > 0:
+        return duracion
+
+    duracion_nombre = float((seg.fin_dt - seg.inicio_dt).total_seconds())
+    if 0 < duracion_nombre <= 6 * 3600:
+        return duracion_nombre
+    return 1.0
+
+
+def _construir_mapa_segmentos(
+    segmentos: list[SegmentoVideo],
+    duracion_video: int | None,
+) -> list[dict]:
+    total_video = int(duracion_video or 0)
+    if not segmentos or total_video <= 0:
+        return []
+
+    duraciones = [_duracion_segmento_real(seg) for seg in segmentos]
+    for idx in range(0, len(duraciones) - 1):
+        if duraciones[idx] > 1.0:
+            continue
+        delta_inicio = float(
+            (segmentos[idx + 1].inicio_dt - segmentos[idx].inicio_dt).total_seconds()
+        )
+        if 1.0 < delta_inicio <= 6 * 3600:
+            duraciones[idx] = delta_inicio
+    if duraciones and duraciones[-1] <= 1.0:
+        candidatas = sorted(d for d in duraciones[:-1] if d > 1.0)
+        if candidatas:
+            duraciones[-1] = candidatas[len(candidatas) // 2]
+
+    total_real = float(sum(duraciones))
+    if total_real <= 0:
+        return []
+
+    tz_actual = timezone.get_current_timezone()
+    mapa: list[dict] = []
+    inicio_video = 0
+    acumulada_real = 0.0
+    cantidad = len(segmentos)
+
+    for idx, (seg, duracion_seg) in enumerate(zip(segmentos, duraciones), start=1):
+        if inicio_video >= total_video:
+            break
+        if idx == cantidad:
+            fin_video_exclusivo = total_video
+        else:
+            acumulada_real += duracion_seg
+            ideal = int(round((acumulada_real / total_real) * total_video))
+            restantes = cantidad - idx
+            minimo = inicio_video + 1
+            maximo = max(minimo, total_video - restantes)
+            fin_video_exclusivo = min(maximo, max(minimo, ideal))
+        if fin_video_exclusivo <= inicio_video:
+            fin_video_exclusivo = min(total_video, inicio_video + 1)
+        if fin_video_exclusivo <= inicio_video:
+            continue
+
+        inicio_real = seg.inicio_dt
+        if timezone.is_naive(inicio_real):
+            inicio_real = timezone.make_aware(inicio_real, tz_actual)
+        fin_real = inicio_real + datetime.timedelta(seconds=duracion_seg)
+
+        mapa.append(
+            {
+                "orden": idx,
+                "archivo": os.path.basename(seg.ruta),
+                "video_inicio_segundo": int(inicio_video),
+                "video_fin_segundo": int(fin_video_exclusivo - 1),
+                "real_inicio": inicio_real.isoformat(),
+                "real_fin": fin_real.isoformat(),
+            }
+        )
+        inicio_video = fin_video_exclusivo
+
+    return mapa
+
+
+def _recortar_mapa_segmentos(
+    mapa_segmentos: list[dict] | None,
+    *,
+    inicio_offset: int,
+    nueva_duracion: int,
+) -> list[dict]:
+    if not isinstance(mapa_segmentos, list):
+        return []
+    if nueva_duracion <= 0:
+        return []
+
+    inicio_offset = max(0, int(inicio_offset))
+    limite = nueva_duracion - 1
+    recortado: list[dict] = []
+
+    for item in mapa_segmentos:
+        if not isinstance(item, dict):
+            continue
+        try:
+            viejo_inicio = int(item.get("video_inicio_segundo"))
+            viejo_fin = int(item.get("video_fin_segundo"))
+        except (TypeError, ValueError):
+            continue
+        if viejo_fin < viejo_inicio:
+            continue
+
+        nuevo_inicio = viejo_inicio - inicio_offset
+        nuevo_fin = viejo_fin - inicio_offset
+        if nuevo_fin < 0 or nuevo_inicio > limite:
+            continue
+
+        recorte_inicio_seg = max(0, -nuevo_inicio)
+        nuevo_inicio = max(0, nuevo_inicio)
+        nuevo_fin = min(limite, nuevo_fin)
+        if nuevo_fin < nuevo_inicio:
+            continue
+
+        inicio_real = _parsear_iso_datetime(item.get("real_inicio"))
+        fin_real = _parsear_iso_datetime(item.get("real_fin"))
+        if inicio_real is not None:
+            inicio_real = inicio_real + datetime.timedelta(seconds=recorte_inicio_seg)
+            duracion_recortada = nuevo_fin - nuevo_inicio + 1
+            fin_real = inicio_real + datetime.timedelta(seconds=duracion_recortada)
+
+        nuevo = dict(item)
+        nuevo["video_inicio_segundo"] = int(nuevo_inicio)
+        nuevo["video_fin_segundo"] = int(nuevo_fin)
+        if inicio_real is not None:
+            nuevo["real_inicio"] = inicio_real.isoformat()
+        if fin_real is not None:
+            nuevo["real_fin"] = fin_real.isoformat()
+        recortado.append(nuevo)
+
+    def _safe_int(valor, default=0):
+        try:
+            return int(valor)
+        except (TypeError, ValueError):
+            return default
+
+    recortado.sort(
+        key=lambda item: (
+            _safe_int(item.get("video_inicio_segundo"), 0),
+            _safe_int(item.get("video_fin_segundo"), 0),
+        )
+    )
+    return recortado
+
+
 def _recortar_video(video: Video, segundos: int, inicio_offset: int = 0) -> bool:
     if segundos <= 0 or inicio_offset < 0:
         return False
@@ -892,6 +1058,13 @@ def _recortar_video(video: Video, segundos: int, inicio_offset: int = 0) -> bool
     if video.fecha_inicio is not None:
         video.fecha_inicio = video.fecha_inicio + datetime.timedelta(seconds=inicio_offset)
         campos.append("fecha_inicio")
+    if getattr(video, "mapa_segmentos", None):
+        video.mapa_segmentos = _recortar_mapa_segmentos(
+            video.mapa_segmentos,
+            inicio_offset=inicio_offset,
+            nueva_duracion=nueva_duracion,
+        )
+        campos.append("mapa_segmentos")
     video.save(update_fields=campos)
     return True
 
@@ -1156,6 +1329,11 @@ def _importar_camion_mdvr(
                 .first()
             )
             if video_listo:
+                if not getattr(video_listo, "mapa_segmentos", None):
+                    mapa_segmentos = _construir_mapa_segmentos(lista, video_listo.duracion)
+                    if mapa_segmentos:
+                        video_listo.mapa_segmentos = mapa_segmentos
+                        video_listo.save(update_fields=["mapa_segmentos"])
                 if (
                     importar_velocidades
                     and video_listo.estado_velocidades == EstadoVelocidadesVideo.PENDIENTE
@@ -1244,6 +1422,7 @@ def _importar_camion_mdvr(
                     video_existente.estado_velocidades = EstadoVelocidadesVideo.PENDIENTE
                     video_existente.velocidades_actualizadas_en = None
                     video_existente.velocidades_error = ""
+                    video_existente.mapa_segmentos = []
                     video_existente.save(
                         update_fields=[
                             "camara",
@@ -1258,6 +1437,7 @@ def _importar_camion_mdvr(
                             "estado_velocidades",
                             "velocidades_actualizadas_en",
                             "velocidades_error",
+                            "mapa_segmentos",
                         ]
                     )
                     video = video_existente
@@ -1295,6 +1475,10 @@ def _importar_camion_mdvr(
                         pass
 
                 procesar_video_subida(video, video.ruta_archivo)
+                mapa_segmentos = _construir_mapa_segmentos(lista, video.duracion)
+                if mapa_segmentos:
+                    video.mapa_segmentos = mapa_segmentos
+                    video.save(update_fields=["mapa_segmentos"])
                 _normalizar_video_exitoso(video)
                 detalles["videos_creados"] += 1
                 videos_turno.setdefault(tipo_turno, []).append(video)
