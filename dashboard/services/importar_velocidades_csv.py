@@ -45,6 +45,30 @@ COMPACTAR_SALTOS_RELOJ_MDVR = (
     .lower()
     in {"1", "true", "yes"}
 )
+_UMBRAL_COBERTURA_SIN_COMPACTAR_DEFAULT = 0.8
+try:
+    UMBRAL_COBERTURA_SIN_COMPACTAR = float(
+        os.environ.get(
+            "VELOCIDADES_UMBRAL_COBERTURA_SIN_COMPACTAR",
+            _UMBRAL_COBERTURA_SIN_COMPACTAR_DEFAULT,
+        )
+    )
+except ValueError:
+    UMBRAL_COBERTURA_SIN_COMPACTAR = _UMBRAL_COBERTURA_SIN_COMPACTAR_DEFAULT
+UMBRAL_COBERTURA_SIN_COMPACTAR = min(
+    1.0, max(0.0, UMBRAL_COBERTURA_SIN_COMPACTAR)
+)
+_PASO_SALTO_RELOJ_FIJO_DEFAULT = 0
+try:
+    PASO_SALTO_RELOJ_FIJO_SEGUNDOS = int(
+        os.environ.get(
+            "VELOCIDADES_PASO_SALTO_RELOJ_FIJO_SEGUNDOS",
+            _PASO_SALTO_RELOJ_FIJO_DEFAULT,
+        )
+    )
+except ValueError:
+    PASO_SALTO_RELOJ_FIJO_SEGUNDOS = _PASO_SALTO_RELOJ_FIJO_DEFAULT
+PASO_SALTO_RELOJ_FIJO_SEGUNDOS = max(0, PASO_SALTO_RELOJ_FIJO_SEGUNDOS)
 
 
 def _normalizar_encabezado(valor):
@@ -100,6 +124,9 @@ def _es_video_mdvr(video):
 
 
 def _calcular_paso_referencia(muestras_ordenadas):
+    if PASO_SALTO_RELOJ_FIJO_SEGUNDOS > 0:
+        return PASO_SALTO_RELOJ_FIJO_SEGUNDOS
+
     deltas = []
     previo = None
     for timestamp, _velocidad, _idx in muestras_ordenadas:
@@ -114,6 +141,25 @@ def _calcular_paso_referencia(muestras_ordenadas):
         return 1
     deltas.sort()
     return max(1, deltas[len(deltas) // 2])
+
+
+def _debe_compactar_saltos_mdvr(muestras_ordenadas, base_ts, ultimo_segundo):
+    if not muestras_ordenadas:
+        return False
+    if ultimo_segundo <= 0:
+        return False
+
+    segundos_en_rango = []
+    for timestamp, _velocidad, _idx in muestras_ordenadas:
+        segundo = int((timestamp - base_ts).total_seconds())
+        if 0 <= segundo <= ultimo_segundo:
+            segundos_en_rango.append(segundo)
+
+    if not segundos_en_rango:
+        return True
+
+    cobertura = max(segundos_en_rango) / float(ultimo_segundo)
+    return cobertura < UMBRAL_COBERTURA_SIN_COMPACTAR
 
 
 def importar_velocidades_tabulares(video, fieldnames, filas_iterable):
@@ -173,7 +219,11 @@ def importar_velocidades_tabulares(video, fieldnames, filas_iterable):
         base_ts = timezone.make_aware(base_ts, timezone.get_current_timezone())
 
     muestras_raw_ordenadas = sorted(muestras_raw, key=lambda x: (x[0], x[2]))
-    compactar_saltos = COMPACTAR_SALTOS_RELOJ_MDVR and _es_video_mdvr(video)
+    compactar_saltos = (
+        COMPACTAR_SALTOS_RELOJ_MDVR
+        and _es_video_mdvr(video)
+        and _debe_compactar_saltos_mdvr(muestras_raw_ordenadas, base_ts, ultimo_segundo)
+    )
     paso_referencia = (
         _calcular_paso_referencia(muestras_raw_ordenadas)
         if compactar_saltos
