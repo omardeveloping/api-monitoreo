@@ -1,6 +1,7 @@
 import csv
 import datetime
 import io
+import os
 import re
 
 from django.utils import timezone
@@ -16,6 +17,17 @@ _FORMATOS_FECHA = (
     "%d-%m-%Y %H:%M:%S",
     "%d/%m/%Y %H:%M:%S",
 )
+_MAX_GAP_INTERPOLACION_DEFAULT = 90
+try:
+    MAX_GAP_INTERPOLACION_SEGUNDOS = int(
+        os.environ.get(
+            "VELOCIDADES_MAX_GAP_INTERPOLACION_SEGUNDOS",
+            _MAX_GAP_INTERPOLACION_DEFAULT,
+        )
+    )
+except ValueError:
+    MAX_GAP_INTERPOLACION_SEGUNDOS = _MAX_GAP_INTERPOLACION_DEFAULT
+MAX_GAP_INTERPOLACION_SEGUNDOS = max(0, MAX_GAP_INTERPOLACION_SEGUNDOS)
 
 
 def _normalizar_encabezado(valor):
@@ -141,6 +153,7 @@ def importar_velocidades_tabulares(video, fieldnames, filas_iterable):
     registros = {}
     interpoladas = 0
     ultimo_valor = None
+    ultimo_segundo_con_muestra = None
     primer_segundo = min(muestras.keys())
 
     for segundo in range(0, ultimo_segundo + 1):
@@ -158,6 +171,7 @@ def importar_velocidades_tabulares(video, fieldnames, filas_iterable):
             continue
         if segundo in muestras:
             ultimo_valor = muestras[segundo]
+            ultimo_segundo_con_muestra = segundo
             registros[segundo] = VelocidadTurno(
                 turno=turno,
                 segundo=segundo,
@@ -170,13 +184,22 @@ def importar_velocidades_tabulares(video, fieldnames, filas_iterable):
         if ultimo_valor is None:
             continue
         timestamp = base_ts + datetime.timedelta(seconds=segundo)
+        gap_desde_muestra = (
+            segundo - ultimo_segundo_con_muestra
+            if ultimo_segundo_con_muestra is not None
+            else None
+        )
+        sin_datos = (
+            gap_desde_muestra is None
+            or gap_desde_muestra > MAX_GAP_INTERPOLACION_SEGUNDOS
+        )
         registros[segundo] = VelocidadTurno(
             turno=turno,
             segundo=segundo,
-            velocidad_kmh=ultimo_valor,
+            velocidad_kmh=0 if sin_datos else ultimo_valor,
             timestamp_csv=timestamp,
             interpolado=True,
-            sin_datos=False,
+            sin_datos=sin_datos,
         )
         interpoladas += 1
 

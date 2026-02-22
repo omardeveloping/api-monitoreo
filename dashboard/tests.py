@@ -19,8 +19,10 @@ from dashboard.models import (
     Incidente,
     TipoTurnoChoices,
     Turno,
+    VelocidadTurno,
     Video,
 )
+from dashboard.services.importar_velocidades_csv import importar_velocidades_tabulares
 from dashboard.services.importar_videos_mdvr import (
     SegmentoVideo,
     _archivo_listo_para_importar,
@@ -566,6 +568,55 @@ class EstadoVelocidadesMdvrTests(SimpleTestCase):
             actualizado_en=None,
         )
         self.assertEqual(video.guardados, [])
+
+
+class ImportarVelocidadesTabularesTests(TestCase):
+    def test_hueco_largo_no_arrastra_ultimo_valor(self):
+        camion = Camion.objects.create(patente="BKCD13")
+        turno = Turno.objects.create(
+            fecha=datetime.date(2026, 2, 18),
+            id_camion=camion,
+            tipo_turno=TipoTurnoChoices.MANANA,
+            hora_inicio=datetime.time(8, 0),
+            hora_fin=datetime.time(16, 0),
+        )
+        video = Video.objects.create(
+            nombre="video_hueco_largo",
+            camara=3,
+            ruta_archivo="videos/video_hueco_largo.mp4",
+            fecha_inicio=timezone.make_aware(datetime.datetime(2026, 2, 18, 8, 0, 0)),
+            fecha_subida=datetime.date(2026, 2, 18),
+            inicio_timestamp=datetime.time(8, 0, 0),
+            estado=EstadoVideo.LISTO,
+            duracion=240,
+            id_turno=turno,
+        )
+
+        fieldnames = ["Hora", "Velocidad(km / h)"]
+        filas = [
+            {"Hora": "2026-02-18 08:00:00", "Velocidad(km / h)": "10"},
+            {"Hora": "2026-02-18 08:00:10", "Velocidad(km / h)": "20"},
+            {"Hora": "2026-02-18 08:00:20", "Velocidad(km / h)": "4"},
+            {"Hora": "2026-02-18 08:03:00", "Velocidad(km / h)": "30"},
+        ]
+
+        resultado = importar_velocidades_tabulares(video, fieldnames, filas)
+        self.assertEqual(resultado["guardadas"], 240)
+
+        velocidad_110 = VelocidadTurno.objects.get(turno=turno, segundo=110)
+        self.assertEqual(velocidad_110.velocidad_kmh, 4)
+        self.assertFalse(velocidad_110.sin_datos)
+        self.assertTrue(velocidad_110.interpolado)
+
+        velocidad_111 = VelocidadTurno.objects.get(turno=turno, segundo=111)
+        self.assertEqual(velocidad_111.velocidad_kmh, 0)
+        self.assertTrue(velocidad_111.sin_datos)
+        self.assertTrue(velocidad_111.interpolado)
+
+        velocidad_180 = VelocidadTurno.objects.get(turno=turno, segundo=180)
+        self.assertEqual(velocidad_180.velocidad_kmh, 30)
+        self.assertFalse(velocidad_180.sin_datos)
+        self.assertFalse(velocidad_180.interpolado)
 
 
 class ExportarIncidentesApiTests(TestCase):
