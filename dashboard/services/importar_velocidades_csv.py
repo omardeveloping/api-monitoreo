@@ -28,6 +28,23 @@ try:
 except ValueError:
     MAX_GAP_INTERPOLACION_SEGUNDOS = _MAX_GAP_INTERPOLACION_DEFAULT
 MAX_GAP_INTERPOLACION_SEGUNDOS = max(0, MAX_GAP_INTERPOLACION_SEGUNDOS)
+_UMBRAL_SALTO_RELOJ_DEFAULT = 120
+try:
+    UMBRAL_SALTO_RELOJ_SEGUNDOS = int(
+        os.environ.get(
+            "VELOCIDADES_UMBRAL_SALTO_RELOJ_SEGUNDOS",
+            _UMBRAL_SALTO_RELOJ_DEFAULT,
+        )
+    )
+except ValueError:
+    UMBRAL_SALTO_RELOJ_SEGUNDOS = _UMBRAL_SALTO_RELOJ_DEFAULT
+UMBRAL_SALTO_RELOJ_SEGUNDOS = max(1, UMBRAL_SALTO_RELOJ_SEGUNDOS)
+COMPACTAR_SALTOS_RELOJ_MDVR = (
+    str(os.environ.get("VELOCIDADES_COMPACTAR_SALTOS_RELOJ_MDVR", "1"))
+    .strip()
+    .lower()
+    in {"1", "true", "yes"}
+)
 
 
 def _normalizar_encabezado(valor):
@@ -75,6 +92,28 @@ def _detectar_dialecto(texto):
         return csv.Sniffer().sniff(texto, delimiters="\t,;")
     except csv.Error:
         return csv.excel_tab
+
+
+def _es_video_mdvr(video):
+    nombre = (getattr(video, "nombre", "") or "").strip()
+    return nombre.startswith("MDVR_")
+
+
+def _calcular_paso_referencia(muestras_ordenadas):
+    deltas = []
+    previo = None
+    for timestamp, _velocidad, _idx in muestras_ordenadas:
+        if previo is None:
+            previo = timestamp
+            continue
+        delta = int((timestamp - previo).total_seconds())
+        previo = timestamp
+        if 0 < delta <= UMBRAL_SALTO_RELOJ_SEGUNDOS:
+            deltas.append(delta)
+    if not deltas:
+        return 1
+    deltas.sort()
+    return max(1, deltas[len(deltas) // 2])
 
 
 def importar_velocidades_tabulares(video, fieldnames, filas_iterable):
@@ -132,11 +171,36 @@ def importar_velocidades_tabulares(video, fieldnames, filas_iterable):
     base_ts = video.fecha_inicio or min(timestamp for timestamp, _, _ in muestras_raw)
     if timezone.is_naive(base_ts):
         base_ts = timezone.make_aware(base_ts, timezone.get_current_timezone())
+
+    muestras_raw_ordenadas = sorted(muestras_raw, key=lambda x: (x[0], x[2]))
+    compactar_saltos = COMPACTAR_SALTOS_RELOJ_MDVR and _es_video_mdvr(video)
+    paso_referencia = (
+        _calcular_paso_referencia(muestras_raw_ordenadas)
+        if compactar_saltos
+        else 0
+    )
+
     muestras = {}
     muestras_timestamp = {}
+    timestamp_previo = None
+    segundo_compactado = None
 
-    for timestamp, velocidad, _ in muestras_raw:
+    for timestamp, velocidad, _ in muestras_raw_ordenadas:
         segundo = int((timestamp - base_ts).total_seconds())
+        if compactar_saltos:
+            if segundo_compactado is None:
+                segundo_compactado = segundo
+            else:
+                delta = int((timestamp - timestamp_previo).total_seconds())
+                if delta < 0:
+                    timestamp_previo = timestamp
+                    continue
+                if delta > UMBRAL_SALTO_RELOJ_SEGUNDOS:
+                    delta = paso_referencia
+                segundo_compactado += delta
+            timestamp_previo = timestamp
+            segundo = segundo_compactado
+
         if segundo < 0 or segundo > ultimo_segundo:
             descartadas += 1
             continue

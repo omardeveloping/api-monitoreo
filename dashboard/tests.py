@@ -618,6 +618,44 @@ class ImportarVelocidadesTabularesTests(TestCase):
         self.assertFalse(velocidad_180.sin_datos)
         self.assertFalse(velocidad_180.interpolado)
 
+    def test_mdvr_compacta_salto_grande_de_reloj(self):
+        camion = Camion.objects.create(patente="BKCD14")
+        turno = Turno.objects.create(
+            fecha=datetime.date(2026, 2, 18),
+            id_camion=camion,
+            tipo_turno=TipoTurnoChoices.MANANA,
+            hora_inicio=datetime.time(8, 0),
+            hora_fin=datetime.time(16, 0),
+        )
+        video = Video.objects.create(
+            nombre="MDVR_4462510196_2026-02-18_manana_C3",
+            camara=3,
+            ruta_archivo="videos/mdvr_hueco.mp4",
+            fecha_inicio=timezone.make_aware(datetime.datetime(2026, 2, 18, 8, 0, 0)),
+            fecha_subida=datetime.date(2026, 2, 18),
+            inicio_timestamp=datetime.time(8, 0, 0),
+            estado=EstadoVideo.LISTO,
+            duracion=240,
+            id_turno=turno,
+        )
+
+        fieldnames = ["Hora", "Velocidad(km / h)"]
+        filas = [
+            {"Hora": "2026-02-18 08:00:00", "Velocidad(km / h)": "10"},
+            {"Hora": "2026-02-18 08:00:10", "Velocidad(km / h)": "20"},
+            {"Hora": "2026-02-18 08:00:20", "Velocidad(km / h)": "4"},
+            {"Hora": "2026-02-18 08:03:00", "Velocidad(km / h)": "60"},
+        ]
+
+        resultado = importar_velocidades_tabulares(video, fieldnames, filas)
+        self.assertEqual(resultado["guardadas"], 240)
+
+        # El salto de 08:00:20 -> 08:03:00 se compacta para timeline MDVR.
+        velocidad_30 = VelocidadTurno.objects.get(turno=turno, segundo=30)
+        self.assertEqual(velocidad_30.velocidad_kmh, 60)
+        self.assertFalse(velocidad_30.sin_datos)
+        self.assertFalse(velocidad_30.interpolado)
+
 
 class ExportarIncidentesApiTests(TestCase):
     def setUp(self):
