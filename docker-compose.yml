@@ -26,6 +26,7 @@ services:
       MP4_TARGET_FPS: "${MP4_TARGET_FPS:-25}"
     volumes:
       - .:/app
+      - "${MEDIA_HOST_PATH:-./media}:/app/media"
       - sqlite_data:/data
       - "${ESPACIO_DISCO_DATA_HOST:-/data}:/host-data:ro"
       - "${ESPACIO_DISCO_BACKUP_HOST:-/backup}:/host-backup:ro"
@@ -58,6 +59,7 @@ services:
       MP4_TARGET_FPS: "${MP4_TARGET_FPS:-25}"
     volumes:
       - .:/app
+      - "${MEDIA_HOST_PATH:-./media}:/app/media"
       - sqlite_data:/data
       - "${VIDEOS_IMPORT_DIR_HOST:-/data/windows_share/videos_MDVR}:/data/windows_share/videos_MDVR:ro"
     depends_on:
@@ -88,6 +90,7 @@ services:
       MP4_TARGET_FPS: "${MP4_TARGET_FPS:-25}"
     volumes:
       - .:/app
+      - "${MEDIA_HOST_PATH:-./media}:/app/media"
       - sqlite_data:/data
       - "${VIDEOS_IMPORT_DIR_HOST:-/data/windows_share/videos_MDVR}:/data/windows_share/videos_MDVR:ro"
     depends_on:
@@ -118,6 +121,7 @@ services:
       MP4_TARGET_FPS: "${MP4_TARGET_FPS:-25}"
     volumes:
       - .:/app
+      - "${MEDIA_HOST_PATH:-./media}:/app/media"
       - sqlite_data:/data
       - "${VIDEOS_IMPORT_DIR_HOST:-/data/windows_share/videos_MDVR}:/data/windows_share/videos_MDVR:ro"
     depends_on:
