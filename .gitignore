@@ -215,3 +215,6 @@ __marimo__/
 # Django collected static files
 staticfiles/
 /test/
+output/
+scripts/
+tmp/
