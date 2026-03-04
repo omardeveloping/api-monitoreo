@@ -1216,6 +1216,7 @@ def _importar_camion_mdvr(
         "camion_id": camion.id,
         "carpeta_id": carpeta_id,
         "videos_creados": 0,
+        "videos_procesados": [],
         "videos_omitidos": 0,
         "archivos_omitidos": 0,
         "turnos_procesados": 0,
@@ -1418,6 +1419,9 @@ def _importar_camion_mdvr(
                     video_existente.duracion = None
                     video_existente.fin_timestamp = None
                     video_existente.mimetype = ""
+                    video_existente.procesamiento_iniciado_en = timezone.now()
+                    video_existente.procesamiento_finalizado_en = None
+                    video_existente.tiempo_procesamiento_segundos = None
                     video_existente.proximo_reintento_en = lease_hasta
                     video_existente.estado_velocidades = EstadoVelocidadesVideo.PENDIENTE
                     video_existente.velocidades_actualizadas_en = None
@@ -1433,6 +1437,9 @@ def _importar_camion_mdvr(
                             "duracion",
                             "fin_timestamp",
                             "mimetype",
+                            "procesamiento_iniciado_en",
+                            "procesamiento_finalizado_en",
+                            "tiempo_procesamiento_segundos",
                             "proximo_reintento_en",
                             "estado_velocidades",
                             "velocidades_actualizadas_en",
@@ -1453,6 +1460,7 @@ def _importar_camion_mdvr(
                         fecha_subida=timezone.localdate(),
                         inicio_timestamp=inicio_dt.time(),
                         estado=EstadoVideo.PROCESANDO,
+                        procesamiento_iniciado_en=timezone.now(),
                         proximo_reintento_en=lease_hasta,
                         estado_velocidades=EstadoVelocidadesVideo.PENDIENTE,
                         id_turno=turno,
@@ -1481,6 +1489,25 @@ def _importar_camion_mdvr(
                     video.save(update_fields=["mapa_segmentos"])
                 _normalizar_video_exitoso(video)
                 detalles["videos_creados"] += 1
+                detalles["videos_procesados"].append(
+                    {
+                        "video_id": video.id,
+                        "nombre": video.nombre,
+                        "camara": video.camara,
+                        "turno_id": turno.id,
+                        "procesamiento_iniciado_en": (
+                            video.procesamiento_iniciado_en.isoformat()
+                            if video.procesamiento_iniciado_en
+                            else None
+                        ),
+                        "procesamiento_finalizado_en": (
+                            video.procesamiento_finalizado_en.isoformat()
+                            if video.procesamiento_finalizado_en
+                            else None
+                        ),
+                        "tiempo_procesamiento_segundos": video.tiempo_procesamiento_segundos,
+                    }
+                )
                 videos_turno.setdefault(tipo_turno, []).append(video)
 
                 if importar_velocidades:

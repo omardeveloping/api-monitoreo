@@ -7,6 +7,7 @@ import subprocess
 import tempfile
 
 from django.conf import settings
+from django.utils import timezone
 from rest_framework.exceptions import ValidationError
 
 ### Tengo que acordarme de poner constantes en mayusculas
@@ -575,6 +576,9 @@ def procesar_video_subida(video_obj, archivo):
 
     validar_formato(archivo)
     content_type = (getattr(archivo, "content_type", "") or "").lower()
+    inicio_procesamiento = video_obj.procesamiento_iniciado_en or timezone.now()
+    if video_obj.procesamiento_iniciado_en is None:
+        video_obj.procesamiento_iniciado_en = inicio_procesamiento
 
     ruta_original = video_obj.ruta_archivo.path
     ruta_convertida = None
@@ -611,6 +615,16 @@ def procesar_video_subida(video_obj, archivo):
 
         final_mimetype = mimetypes.guess_type(video_obj.ruta_archivo.path)[0] or content_type or ""
         video_obj.mimetype = final_mimetype
+        video_obj.procesamiento_finalizado_en = timezone.now()
+        video_obj.tiempo_procesamiento_segundos = round(
+            max(
+                (
+                    video_obj.procesamiento_finalizado_en - inicio_procesamiento
+                ).total_seconds(),
+                0,
+            ),
+            3,
+        )
 
         campos = [
             "duracion",
@@ -618,6 +632,9 @@ def procesar_video_subida(video_obj, archivo):
             "inicio_timestamp",
             "fin_timestamp",
             "mimetype",
+            "procesamiento_iniciado_en",
+            "procesamiento_finalizado_en",
+            "tiempo_procesamiento_segundos",
             "reintentos",
             "ultimo_error",
             "proximo_reintento_en",
@@ -637,7 +654,25 @@ def procesar_video_subida(video_obj, archivo):
             video_obj.estado = EstadoVideo.ERROR
         mensaje_error = (str(exc) or exc.__class__.__name__).strip()
         video_obj.ultimo_error = mensaje_error[:2000]
-        video_obj.save(update_fields=["estado", "ultimo_error"])
+        video_obj.procesamiento_finalizado_en = timezone.now()
+        video_obj.tiempo_procesamiento_segundos = round(
+            max(
+                (
+                    video_obj.procesamiento_finalizado_en - inicio_procesamiento
+                ).total_seconds(),
+                0,
+            ),
+            3,
+        )
+        video_obj.save(
+            update_fields=[
+                "estado",
+                "ultimo_error",
+                "procesamiento_iniciado_en",
+                "procesamiento_finalizado_en",
+                "tiempo_procesamiento_segundos",
+            ]
+        )
         raise
 
     return video_obj

@@ -22,6 +22,7 @@ from dashboard.models import (
     VelocidadTurno,
     Video,
 )
+from dashboard.serializers import VideoSerializer
 from dashboard.services.importar_velocidades_csv import importar_velocidades_tabulares
 from dashboard.services.importar_videos_mdvr import (
     SegmentoVideo,
@@ -37,6 +38,82 @@ from dashboard.services.importar_videos_mdvr import (
     _segmento_desde_archivo,
 )
 from dashboard.views import EspacioDiscoViewSet, IncidenteViewSet, _listar_montajes_disponibles
+
+
+class ProcesamientoVideoTimerTests(TestCase):
+    def test_procesar_video_subida_guarda_tiempo_total(self):
+        camion = Camion.objects.create(patente="BKCD99", carpeta_id="4462510999")
+        turno = Turno.objects.create(
+            fecha=datetime.date(2026, 3, 4),
+            id_camion=camion,
+            tipo_turno=TipoTurnoChoices.MANANA,
+            hora_inicio=datetime.time(8, 0),
+            hora_fin=datetime.time(16, 0),
+        )
+        inicio = timezone.make_aware(datetime.datetime(2026, 3, 4, 10, 0, 0))
+        fin = timezone.make_aware(datetime.datetime(2026, 3, 4, 10, 0, 12, 345000))
+        video = Video.objects.create(
+            nombre="video_tiempo",
+            camara=1,
+            ruta_archivo="videos/video_tiempo.mp4",
+            id_turno=turno,
+            estado=EstadoVideo.PROCESANDO,
+            procesamiento_iniciado_en=inicio,
+        )
+
+        with patch(
+            "dashboard.services.calcular_duracion_video.validar_formato"
+        ), patch(
+            "dashboard.services.calcular_duracion_video.asegurar_mp4_compatible"
+        ), patch(
+            "dashboard.services.calcular_duracion_video.calcular_duracion_video",
+            return_value=9.8,
+        ), patch(
+            "dashboard.services.calcular_duracion_video.timezone.now",
+            return_value=fin,
+        ), patch(
+            "dashboard.services.calcular_duracion_video.os.path.exists",
+            return_value=False,
+        ):
+            from dashboard.services.calcular_duracion_video import procesar_video_subida
+
+            procesar_video_subida(video, video.ruta_archivo)
+
+        video.refresh_from_db()
+        self.assertEqual(video.estado, EstadoVideo.LISTO)
+        self.assertEqual(video.procesamiento_iniciado_en, inicio)
+        self.assertEqual(video.procesamiento_finalizado_en, fin)
+        self.assertEqual(video.tiempo_procesamiento_segundos, 12.345)
+
+    def test_serializer_expone_tiempo_actual_mientras_procesa(self):
+        camion = Camion.objects.create(patente="BKCE00", carpeta_id="4462511000")
+        turno = Turno.objects.create(
+            fecha=datetime.date(2026, 3, 4),
+            id_camion=camion,
+            tipo_turno=TipoTurnoChoices.MANANA,
+            hora_inicio=datetime.time(8, 0),
+            hora_fin=datetime.time(16, 0),
+        )
+        inicio = timezone.make_aware(datetime.datetime(2026, 3, 4, 11, 0, 0))
+        ahora = timezone.make_aware(datetime.datetime(2026, 3, 4, 11, 0, 7, 500000))
+        video = Video.objects.create(
+            nombre="video_en_proceso",
+            camara=2,
+            ruta_archivo="videos/video_en_proceso.mp4",
+            id_turno=turno,
+            estado=EstadoVideo.PROCESANDO,
+            procesamiento_iniciado_en=inicio,
+        )
+
+        with patch("dashboard.serializers.timezone.now", return_value=ahora):
+            data = VideoSerializer(video).data
+
+        self.assertEqual(data["tiempo_procesamiento_segundos"], 7.5)
+        inicio_serializado = datetime.datetime.fromisoformat(
+            data["procesamiento_iniciado_en"].replace("Z", "+00:00")
+        )
+        self.assertEqual(inicio_serializado, inicio)
+        self.assertIsNone(data["procesamiento_finalizado_en"])
 
 
 class SegmentoDesdeArchivoTests(SimpleTestCase):

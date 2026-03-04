@@ -91,6 +91,9 @@ class Video(models.Model):
         choices=EstadoVideo.choices,
         default=EstadoVideo.PROCESANDO,
     )
+    procesamiento_iniciado_en = models.DateTimeField(null=True, blank=True)
+    procesamiento_finalizado_en = models.DateTimeField(null=True, blank=True)
+    tiempo_procesamiento_segundos = models.FloatField(null=True, blank=True)
     reintentos = models.PositiveSmallIntegerField(default=0)
     ultimo_error = models.TextField(blank=True, default="")
     proximo_reintento_en = models.DateTimeField(null=True, blank=True)

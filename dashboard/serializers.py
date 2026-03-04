@@ -1,6 +1,7 @@
 from urllib.parse import parse_qsl, urlencode, urlparse, urlunparse
 
 from rest_framework import serializers
+from django.utils import timezone
 from .models import (
     Camion,
     Turno,
@@ -60,6 +61,8 @@ class TurnoSerializer(serializers.ModelSerializer):
         read_only_fields = ['completado']
 
 class VideoSerializer(serializers.ModelSerializer):
+    tiempo_procesamiento_segundos = serializers.SerializerMethodField()
+
     def to_representation(self, instance):
         data = super().to_representation(instance)
         if instance.estado != EstadoVideo.LISTO:
@@ -75,6 +78,22 @@ class VideoSerializer(serializers.ModelSerializer):
                 data["ruta_archivo"] = _with_query_param(ruta, "v", token)
         return data
 
+    def get_tiempo_procesamiento_segundos(self, instance):
+        inicio = instance.procesamiento_iniciado_en
+        if inicio is None:
+            return None
+
+        fin = instance.procesamiento_finalizado_en
+        if fin is None and instance.estado == EstadoVideo.PROCESANDO:
+            fin = timezone.now()
+
+        if fin is not None:
+            return round(max((fin - inicio).total_seconds(), 0), 3)
+
+        if instance.tiempo_procesamiento_segundos is None:
+            return None
+        return round(float(instance.tiempo_procesamiento_segundos), 3)
+
     class Meta:
         model = Video
         fields = [
@@ -89,6 +108,9 @@ class VideoSerializer(serializers.ModelSerializer):
             'fin_timestamp',
             'mimetype',
             'estado',
+            'procesamiento_iniciado_en',
+            'procesamiento_finalizado_en',
+            'tiempo_procesamiento_segundos',
             'estado_velocidades',
             'velocidades_actualizadas_en',
             'velocidades_error',
@@ -98,6 +120,9 @@ class VideoSerializer(serializers.ModelSerializer):
             'id_turno',
         ]
         read_only_fields = [
+            'procesamiento_iniciado_en',
+            'procesamiento_finalizado_en',
+            'tiempo_procesamiento_segundos',
             'estado_velocidades',
             'velocidades_actualizadas_en',
             'velocidades_error',

@@ -310,7 +310,7 @@ class VideoViewSet(viewsets.ModelViewSet):
     permission_classes = [IsAuthenticated, DjangoModelPermissions]
 
     def perform_create(self, serializer):
-        video = serializer.save()
+        video = serializer.save(procesamiento_iniciado_en=timezone.now())
         archivo = serializer.validated_data.get("ruta_archivo")
         procesar_video_subida(video, archivo)
 
@@ -362,6 +362,7 @@ class VideoViewSet(viewsets.ModelViewSet):
             fecha_inicio=serializer.validated_data.get("fecha_inicio"),
             fecha_subida=serializer.validated_data.get("fecha_subida") or timezone.localdate(),
             inicio_timestamp=serializer.validated_data.get("inicio_timestamp"),
+            procesamiento_iniciado_en=timezone.now(),
             id_turno=serializer.validated_data["id_turno"],
         )
 
