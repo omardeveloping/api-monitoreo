@@ -13,15 +13,18 @@ def _semana_iso(fecha):
     return fecha.isocalendar().week
 
 
-def _asignacion_para_semana_y_tipo(semana, tipo_turno):
-    return (
-        AsignacionTurno.objects.filter(
-            semana=semana,
-            turno__tipo_turno=tipo_turno,
-        )
-        .select_related("operador")
-        .first()
+def _asignaciones_semana_por_tipo(semana):
+    asignaciones_por_tipo = {}
+    asignaciones = (
+        AsignacionTurno.objects.filter(semana=semana)
+        .select_related("operador", "turno")
+        .order_by("id")
     )
+    for asignacion in asignaciones:
+        tipo_turno = asignacion.turno.tipo_turno
+        if tipo_turno and asignacion.operador_id and tipo_turno not in asignaciones_por_tipo:
+            asignaciones_por_tipo[tipo_turno] = asignacion.operador
+    return asignaciones_por_tipo
 
 
 def crear_turnos_diarios(fecha=None):
@@ -41,6 +44,7 @@ def crear_turnos_diarios(fecha=None):
         return 0
 
     semana_actual = _semana_iso(fecha)
+    asignaciones_por_tipo = _asignaciones_semana_por_tipo(semana_actual)
     turnos_creados = 0
 
     for tipo_turno in (
@@ -55,9 +59,9 @@ def crear_turnos_diarios(fecha=None):
             defaults={"activo": False},
         )
         if creado:
-            asignacion = _asignacion_para_semana_y_tipo(semana_actual, tipo_turno)
-            if asignacion and asignacion.operador_id:
-                turno.operador = asignacion.operador
+            operador = asignaciones_por_tipo.get(tipo_turno)
+            if operador:
+                turno.operador = operador
                 turno.save(update_fields=["operador"])
             turnos_creados += 1
 

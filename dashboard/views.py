@@ -2,16 +2,15 @@ import os
 import re
 import shutil
 from datetime import datetime, timedelta
-from rest_framework import viewsets, status
+
+from django.conf import settings
+from django.utils import timezone
+from rest_framework import status, viewsets
+from rest_framework.decorators import action
 from rest_framework.exceptions import ValidationError
 from rest_framework.parsers import FormParser, MultiPartParser
 from rest_framework.response import Response
-from rest_framework.decorators import action
-from django.conf import settings
-from django.core.files import File
-from django.core.files.storage import default_storage
-from django.utils import timezone
-from django.utils.text import get_valid_filename
+
 from .models import Camion, Turno, Video, Operador, Incidente, AsignacionTurno, Mantenimiento
 from .serializers import (
     CamionSerializer,
@@ -24,11 +23,14 @@ from .serializers import (
     AsignacionTurnoSerializer,
     MantenimientoSerializer,
 )
-from dashboard.services.calcular_duracion_video import (
-    procesar_video_subida,
-)
 from dashboard.services.importar_velocidades_csv import importar_velocidades_csv
 from dashboard.services.preview_video import obtener_preview_video
+from dashboard.services.video_importacion import (
+    crear_video_desde_ruta_servidor,
+    crear_video_desde_serializer,
+    obtener_base_importacion,
+    resolver_ruta_importacion,
+)
 
 _PATRON_NOMBRE_VIDEO = re.compile(
     r"^(?P<equipo>\d+)-(?P<fecha>\d{6})-(?P<inicio>\d{6})-(?P<fin>\d{6})-(?P<codigo>\d+)$"
@@ -120,9 +122,7 @@ class VideoViewSet(viewsets.ModelViewSet):
     serializer_class = VideoSerializer
 
     def perform_create(self, serializer):
-        video = serializer.save()
-        archivo = serializer.validated_data.get("ruta_archivo")
-        procesar_video_subida(video, archivo)
+        return crear_video_desde_serializer(serializer)
 
     def create(self, request, *args, **kwargs):
         serializer = self.get_serializer(data=request.data)
@@ -136,59 +136,19 @@ class VideoViewSet(viewsets.ModelViewSet):
         serializer = VideoImportSerializer(data=request.data)
         serializer.is_valid(raise_exception=True)
 
-        base_dir = getattr(settings, "VIDEOS_IMPORT_DIR", "")
-        if not base_dir:
-            raise ValidationError("VIDEOS_IMPORT_DIR no está configurado en el servidor.")
-
-        base_dir_real = os.path.realpath(base_dir)
-        if not os.path.isdir(base_dir_real):
-            raise ValidationError("VIDEOS_IMPORT_DIR no apunta a un directorio válido.")
-
-        ruta_origen = serializer.validated_data["ruta_origen"].strip()
-        if not ruta_origen:
-            raise ValidationError("Debe indicar 'ruta_origen'.")
-        if os.path.isabs(ruta_origen):
-            raise ValidationError("La ruta debe ser relativa al directorio configurado.")
-
-        origen_real = os.path.realpath(os.path.join(base_dir_real, ruta_origen))
-        if not (origen_real == base_dir_real or origen_real.startswith(base_dir_real + os.sep)):
-            raise ValidationError("La ruta indicada sale del directorio permitido.")
-        if not os.path.isfile(origen_real):
-            raise ValidationError("El archivo indicado no existe.")
-
-        nombre_archivo = get_valid_filename(os.path.basename(origen_real))
-        if not nombre_archivo:
-            raise ValidationError("Nombre de archivo inválido.")
-
-        destino_rel = default_storage.get_available_name(os.path.join("videos", nombre_archivo))
-        with open(origen_real, "rb") as archivo_origen:
-            destino_rel = default_storage.save(destino_rel, File(archivo_origen))
-
-        nombre = serializer.validated_data.get("nombre") or os.path.splitext(nombre_archivo)[0]
-        video = Video.objects.create(
-            nombre=nombre,
-            camara=serializer.validated_data["camara"],
-            ruta_archivo=destino_rel,
-            fecha_inicio=serializer.validated_data.get("fecha_inicio"),
-            fecha_subida=serializer.validated_data.get("fecha_subida") or timezone.localdate(),
-            inicio_timestamp=serializer.validated_data.get("inicio_timestamp"),
-            id_turno=serializer.validated_data["id_turno"],
+        base_dir_real = obtener_base_importacion()
+        _ruta_origen, origen_real = resolver_ruta_importacion(
+            base_dir_real,
+            serializer.validated_data["ruta_origen"],
         )
-
-        procesar_video_subida(video, video.ruta_archivo)
+        video = crear_video_desde_ruta_servidor(serializer.validated_data, origen_real)
 
         response_serializer = VideoSerializer(video, context={"request": request})
         return Response(response_serializer.data, status=status.HTTP_201_CREATED)
 
     @action(detail=False, methods=["get"], url_path="archivos-servidor")
     def archivos_servidor(self, request):
-        base_dir = getattr(settings, "VIDEOS_IMPORT_DIR", "")
-        if not base_dir:
-            raise ValidationError("VIDEOS_IMPORT_DIR no está configurado en el servidor.")
-
-        base_dir_real = os.path.realpath(base_dir)
-        if not os.path.isdir(base_dir_real):
-            raise ValidationError("VIDEOS_IMPORT_DIR no apunta a un directorio válido.")
+        base_dir_real = obtener_base_importacion()
 
         include_all = request.query_params.get("todo", "").lower() in {"1", "true", "yes"}
         exts_param = (request.query_params.get("extensiones") or "").strip()
@@ -252,25 +212,11 @@ class VideoViewSet(viewsets.ModelViewSet):
 
     @action(detail=False, methods=["get"], url_path="preview-servidor")
     def preview_servidor(self, request):
-        base_dir = getattr(settings, "VIDEOS_IMPORT_DIR", "")
-        if not base_dir:
-            raise ValidationError("VIDEOS_IMPORT_DIR no está configurado en el servidor.")
-
-        base_dir_real = os.path.realpath(base_dir)
-        if not os.path.isdir(base_dir_real):
-            raise ValidationError("VIDEOS_IMPORT_DIR no apunta a un directorio válido.")
-
-        ruta_origen = (request.query_params.get("ruta_origen") or "").strip()
-        if not ruta_origen:
-            raise ValidationError("Debe indicar 'ruta_origen'.")
-        if os.path.isabs(ruta_origen):
-            raise ValidationError("La ruta debe ser relativa al directorio configurado.")
-
-        origen_real = os.path.realpath(os.path.join(base_dir_real, ruta_origen))
-        if not (origen_real == base_dir_real or origen_real.startswith(base_dir_real + os.sep)):
-            raise ValidationError("La ruta indicada sale del directorio permitido.")
-        if not os.path.isfile(origen_real):
-            raise ValidationError("El archivo indicado no existe.")
+        base_dir_real = obtener_base_importacion()
+        ruta_origen, origen_real = resolver_ruta_importacion(
+            base_dir_real,
+            request.query_params.get("ruta_origen"),
+        )
 
         preview_rel, cached = obtener_preview_video(origen_real, ruta_origen)
 

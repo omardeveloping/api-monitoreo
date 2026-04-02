@@ -1,10 +1,16 @@
 import hashlib
 import os
-import subprocess
 import tempfile
 
 from django.conf import settings
 from rest_framework.exceptions import ValidationError
+from dashboard.services.video_commands import (
+    FFMPEG_LARGE_PROBE_ARGS,
+    build_ffmpeg_command,
+    remove_if_exists,
+    run_command,
+    validation_error_message,
+)
 
 PREVIEW_SECONDS = 5
 PREVIEW_WIDTH = 320
@@ -20,13 +26,7 @@ def _hash_preview_key(ruta_relativa: str, stat: os.stat_result) -> str:
 
 def _build_preview_commands(ruta_entrada: str, ruta_salida: str, es_raw: bool) -> list[list[str]]:
     filtro_video = f"scale={PREVIEW_WIDTH}:-2"
-    base = [
-        "ffmpeg",
-        "-y",
-        "-t",
-        str(PREVIEW_SECONDS),
-        "-i",
-        ruta_entrada,
+    output_args = [
         "-an",
         "-sn",
         "-vf",
@@ -39,69 +39,30 @@ def _build_preview_commands(ruta_entrada: str, ruta_salida: str, es_raw: bool) -
         str(PREVIEW_CRF),
         "-movflags",
         "+faststart",
-        ruta_salida,
     ]
+    base = build_ffmpeg_command(
+        ruta_entrada,
+        ruta_salida,
+        input_args=["-t", str(PREVIEW_SECONDS)],
+        output_args=output_args,
+    )
 
-    with_probe = [
-        "ffmpeg",
-        "-y",
-        "-probesize",
-        "50M",
-        "-analyzeduration",
-        "50M",
-        "-fflags",
-        "+genpts",
-        "-t",
-        str(PREVIEW_SECONDS),
-        "-i",
+    with_probe = build_ffmpeg_command(
         ruta_entrada,
-        "-an",
-        "-sn",
-        "-vf",
-        filtro_video,
-        "-c:v",
-        "libx264",
-        "-preset",
-        PREVIEW_PRESET,
-        "-crf",
-        str(PREVIEW_CRF),
-        "-movflags",
-        "+faststart",
         ruta_salida,
-    ]
+        input_args=[*FFMPEG_LARGE_PROBE_ARGS, "-t", str(PREVIEW_SECONDS)],
+        output_args=output_args,
+    )
 
     if not es_raw:
         return [base, with_probe]
 
-    raw = [
-        "ffmpeg",
-        "-y",
-        "-f",
-        "h264",
-        "-probesize",
-        "50M",
-        "-analyzeduration",
-        "50M",
-        "-fflags",
-        "+genpts",
-        "-t",
-        str(PREVIEW_SECONDS),
-        "-i",
+    raw = build_ffmpeg_command(
         ruta_entrada,
-        "-an",
-        "-sn",
-        "-vf",
-        filtro_video,
-        "-c:v",
-        "libx264",
-        "-preset",
-        PREVIEW_PRESET,
-        "-crf",
-        str(PREVIEW_CRF),
-        "-movflags",
-        "+faststart",
         ruta_salida,
-    ]
+        input_args=["-f", "h264", *FFMPEG_LARGE_PROBE_ARGS, "-t", str(PREVIEW_SECONDS)],
+        output_args=output_args,
+    )
     return [with_probe, raw]
 
 
@@ -109,13 +70,10 @@ def _generar_preview(ruta_entrada: str, ruta_salida: str, es_raw: bool) -> None:
     errores: list[str] = []
     for idx, cmd in enumerate(_build_preview_commands(ruta_entrada, ruta_salida, es_raw), start=1):
         try:
-            subprocess.run(cmd, check=True, capture_output=True, text=True)
+            run_command(cmd)
             return
-        except subprocess.CalledProcessError as exc:
-            stderr = (exc.stderr or exc.stdout or str(exc)).strip()
-            errores.append(f"Intento {idx}: {stderr}")
-        except OSError as exc:
-            raise ValidationError(f"No se pudo ejecutar ffmpeg: {exc}") from exc
+        except ValidationError as exc:
+            errores.append(f"Intento {idx}: {validation_error_message(exc)}")
 
     detalles = "\n\n".join(errores) if errores else "Sin detalles del error."
     raise ValidationError(f"No se pudo generar el preview del video:\n{detalles}")
@@ -152,10 +110,9 @@ def obtener_preview_video(ruta_entrada: str, ruta_relativa: str) -> tuple[str, b
         if not os.path.exists(preview_abs):
             os.replace(tmp_path, preview_abs)
         else:
-            os.remove(tmp_path)
+            remove_if_exists(tmp_path)
     except Exception:
-        if os.path.exists(tmp_path):
-            os.remove(tmp_path)
+        remove_if_exists(tmp_path)
         raise
 
     return preview_rel, False

@@ -35,22 +35,24 @@ def _esta_completado(turno: Turno, ahora: datetime) -> bool:
 def actualizar_turnos_activos():
     """Marca turnos como activos/inactivos según horario y fecha."""
     ahora = timezone.localtime()
-    turnos = Turno.objects.all()
-    for turno in turnos:
+    turnos_actualizados = []
+    activos = 0
+
+    for turno in Turno.objects.all():
         activo_calculado = _esta_activo(turno, ahora)
         completado_calculado = _esta_completado(turno, ahora)
+        if activo_calculado:
+            activos += 1
+        if turno.activo == activo_calculado and turno.completado == completado_calculado:
+            continue
 
-        cambios = []
-        if turno.activo != activo_calculado:
-            turno.activo = activo_calculado
-            cambios.append("activo")
-        if turno.completado != completado_calculado:
-            turno.completado = completado_calculado
-            cambios.append("completado")
+        turno.activo = activo_calculado
+        turno.completado = completado_calculado
+        turnos_actualizados.append(turno)
 
-        if cambios:
-            turno.save(update_fields=cambios)
-    return Turno.objects.filter(activo=True).count()
+    if turnos_actualizados:
+        Turno.objects.bulk_update(turnos_actualizados, ["activo", "completado"])
+    return activos
 
 
 @shared_task

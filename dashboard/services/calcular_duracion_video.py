@@ -1,15 +1,21 @@
 import datetime
-import json
 import math
 import mimetypes
 import os
-import subprocess
 import tempfile
 
 from django.conf import settings
 from rest_framework.exceptions import ValidationError
 
 from dashboard.models import EstadoVideo
+from dashboard.services.video_commands import (
+    FFMPEG_LARGE_PROBE_ARGS,
+    build_ffmpeg_command,
+    remove_if_exists,
+    run_command,
+    run_ffprobe_json,
+    validation_error_message,
+)
 
 ### Tengo que acordarme de poner constantes en mayusculas
 FORMATO_VIDEO_VALIDO = {"video/mp4", "video/h264", "video/x-h264"}
@@ -163,22 +169,14 @@ def _buscar_offset_longitudes(ruta_h264, longitud_nal, max_scan=MAX_BYTES_SCAN_L
 
 
 def _obtener_streams(ruta_video):
-    probe = subprocess.run(
-        [
-            "ffprobe",
-            "-v",
-            "error",
-            "-show_entries",
-            "stream=index,codec_type,codec_name,codec_tag_string,pix_fmt,profile,level,disposition,r_frame_rate,avg_frame_rate,sample_rate",
-            "-of",
-            "json",
-            ruta_video,
-        ],
-        capture_output=True,
-        text=True,
-        check=True,
+    data = run_ffprobe_json(
+        ruta_video,
+        show_entries=(
+            "stream=index,codec_type,codec_name,codec_tag_string,pix_fmt,profile,level,"
+            "disposition,r_frame_rate,avg_frame_rate,sample_rate"
+        ),
+        error_prefix="No se pudo inspeccionar los streams del video",
     )
-    data = json.loads(probe.stdout)
     return data.get("streams", [])
 
 
@@ -304,13 +302,11 @@ def _transcodificar_mp4(ruta_mp4, stream_info):
     if fps_expr:
         filtro_video = f"fps={fps_expr},{filtro_video}"
 
-    cmd = [
-        "ffmpeg",
-        "-y",
-        "-fflags",
-        "+genpts",
-        "-i",
+    cmd = build_ffmpeg_command(
         ruta_mp4,
+        ruta_salida,
+        input_args=["-fflags", "+genpts"],
+        output_args=[
         "-map",
         map_video,
         "-map",
@@ -333,28 +329,24 @@ def _transcodificar_mp4(ruta_mp4, stream_info):
         str(AUDIO_SAMPLE_RATE_MP4),
         "-movflags",
         "+faststart",
-        ruta_salida,
-    ]
+        ],
+    )
     if MP4_VIDEO_PROFILE:
         cmd.extend(["-profile:v", MP4_VIDEO_PROFILE])
     if MP4_VIDEO_LEVEL:
         cmd.extend(["-level", MP4_VIDEO_LEVEL])
     try:
-        subprocess.run(cmd, check=True, capture_output=True, text=True)
-    except subprocess.CalledProcessError as exc:
-        stderr = (exc.stderr or exc.stdout or str(exc)).strip()
-        if os.path.exists(ruta_salida):
-            os.remove(ruta_salida)
-        raise ValidationError(f"No se pudo convertir el MP4 a un formato compatible: {stderr}")
+        run_command(cmd, error_prefix="No se pudo convertir el MP4 a un formato compatible")
+    except ValidationError:
+        remove_if_exists(ruta_salida)
+        raise
 
     salida_stream = _seleccionar_stream_video(_obtener_streams(ruta_salida))
     if not salida_stream:
-        if os.path.exists(ruta_salida):
-            os.remove(ruta_salida)
+        remove_if_exists(ruta_salida)
         raise ValidationError("El MP4 convertido no contiene pista de video.")
     if not _mp4_es_compatible(salida_stream):
-        if os.path.exists(ruta_salida):
-            os.remove(ruta_salida)
+        remove_if_exists(ruta_salida)
         raise ValidationError("El MP4 convertido no es compatible con navegadores.")
 
     os.replace(ruta_salida, ruta_mp4)
@@ -391,53 +383,29 @@ def validar_formato(video):
         )
 
 
-def envolver_h264_en_mp4(ruta_h264):
-    if not ruta_h264:
-        raise ValidationError("No se encontró la ruta del archivo H264.")
+def _crear_temporal(suffix: str, *, dir: str | None = None) -> str:
+    with tempfile.NamedTemporaryFile(delete=False, suffix=suffix, dir=dir) as tmp:
+        return tmp.name
 
-    ruta_salida = os.path.splitext(ruta_h264)[0] + ".mp4"
 
-    def construir_comandos_ffmpeg(ruta_entrada):
-        return [
-            [
-                "ffmpeg",
-                "-y",
-                "-i",
-                ruta_entrada,
-                "-c",
-                "copy",
-                "-movflags",
-                "+faststart",
-                ruta_salida,
-            ],
-            [
-                "ffmpeg",
-                "-y",
-                "-probesize",
-                "50M",
-                "-analyzeduration",
-                "50M",
-                "-fflags",
-                "+genpts",
-                "-i",
-                ruta_entrada,
-                "-c",
-                "copy",
-                "-movflags",
-                "+faststart",
-                ruta_salida,
-            ],
-            [
-                "ffmpeg",
-                "-y",
-                "-probesize",
-                "50M",
-                "-analyzeduration",
-                "50M",
-                "-fflags",
-                "+genpts",
-                "-i",
-                ruta_entrada,
+def _comandos_envolver_h264(ruta_entrada: str, ruta_salida: str) -> list[list[str]]:
+    return [
+        build_ffmpeg_command(
+            ruta_entrada,
+            ruta_salida,
+            output_args=["-c", "copy", "-movflags", "+faststart"],
+        ),
+        build_ffmpeg_command(
+            ruta_entrada,
+            ruta_salida,
+            input_args=FFMPEG_LARGE_PROBE_ARGS,
+            output_args=["-c", "copy", "-movflags", "+faststart"],
+        ),
+        build_ffmpeg_command(
+            ruta_entrada,
+            ruta_salida,
+            input_args=FFMPEG_LARGE_PROBE_ARGS,
+            output_args=[
                 "-c:v",
                 "libx264",
                 "-preset",
@@ -448,93 +416,115 @@ def envolver_h264_en_mp4(ruta_h264):
                 "yuv420p",
                 "-movflags",
                 "+faststart",
-                ruta_salida,
             ],
-        ]
+        ),
+    ]
 
-    def intentar_conversion(ruta_entrada, etiqueta):
-        for idx, cmd in enumerate(construir_comandos_ffmpeg(ruta_entrada), start=1):
-            try:
-                subprocess.run(
-                    cmd,
-                    check=True,
-                    capture_output=True,
-                    text=True,
-                )
-                return True
-            except subprocess.CalledProcessError as exc:
-                stderr = (exc.stderr or exc.stdout or str(exc)).strip()
-                errores.append(f"{etiqueta} {idx}: {stderr}")
-        return False
 
-    errores = []
-    if intentar_conversion(ruta_h264, "Intento"):
-        return ruta_salida
+def _intentar_conversion_h264(
+    ruta_entrada: str,
+    ruta_salida: str,
+    etiqueta: str,
+    errores: list[str],
+) -> bool:
+    for idx, cmd in enumerate(_comandos_envolver_h264(ruta_entrada, ruta_salida), start=1):
+        try:
+            run_command(cmd)
+            return True
+        except ValidationError as exc:
+            errores.append(f"{etiqueta} {idx}: {validation_error_message(exc)}")
+    return False
 
-    ruta_annexb = None
-    if not _tiene_start_codes(ruta_h264):
-        for longitud in LONGITUDES_NAL_H264:
-            with tempfile.NamedTemporaryFile(delete=False, suffix=".annexb.h264") as tmp:
-                ruta_annexb = tmp.name
+
+def _intentar_annexb_directo(ruta_h264: str, ruta_salida: str, errores: list[str]) -> bool:
+    for longitud in LONGITUDES_NAL_H264:
+        ruta_annexb = _crear_temporal(".annexb.h264")
+        try:
             if _convertir_longitudes_a_annexb(ruta_h264, ruta_annexb, longitud, offset=0):
-                if intentar_conversion(ruta_annexb, f"Intento annexb-{longitud}"):
-                    os.remove(ruta_annexb)
-                    return ruta_salida
+                if _intentar_conversion_h264(
+                    ruta_annexb,
+                    ruta_salida,
+                    f"Intento annexb-{longitud}",
+                    errores,
+                ):
+                    return True
             else:
                 errores.append(
                     f"Intento annexb-{longitud}: no se pudo convertir longitudes a start codes"
                 )
-            if ruta_annexb and os.path.exists(ruta_annexb):
-                os.remove(ruta_annexb)
-            ruta_annexb = None
+        finally:
+            remove_if_exists(ruta_annexb)
+    return False
 
-        offset_start = _buscar_offset_start_code(ruta_h264)
-        ruta_recortada = None
-        if offset_start is not None and offset_start > 0:
-            with tempfile.NamedTemporaryFile(delete=False, suffix=".h264") as tmp:
-                ruta_recortada = tmp.name
-            if _copiar_desde_offset(ruta_h264, ruta_recortada, offset_start):
-                if intentar_conversion(
-                    ruta_recortada, f"Intento recorte-startcode@{offset_start}"
-                ):
-                    os.remove(ruta_recortada)
-                    return ruta_salida
-            else:
-                errores.append(
-                    "Intento recorte-startcode: no se pudo copiar el stream desde el offset"
-                )
-            if ruta_recortada and os.path.exists(ruta_recortada):
-                os.remove(ruta_recortada)
-        else:
-            errores.append("Intento recorte-startcode: no se encontró start code en el archivo")
 
-        for longitud in LONGITUDES_NAL_H264:
-            offset = _buscar_offset_longitudes(ruta_h264, longitud)
-            if offset is None:
-                errores.append(
-                    f"Intento annexb-{longitud}-offset: no se encontró un offset válido"
-                )
-                continue
-            if offset == 0:
-                continue
-            with tempfile.NamedTemporaryFile(delete=False, suffix=".annexb.h264") as tmp:
-                ruta_annexb = tmp.name
+def _intentar_recorte_start_code(ruta_h264: str, ruta_salida: str, errores: list[str]) -> bool:
+    offset_start = _buscar_offset_start_code(ruta_h264)
+    if offset_start is None or offset_start <= 0:
+        errores.append("Intento recorte-startcode: no se encontró start code en el archivo")
+        return False
+
+    ruta_recortada = _crear_temporal(".h264")
+    try:
+        if _copiar_desde_offset(ruta_h264, ruta_recortada, offset_start):
+            return _intentar_conversion_h264(
+                ruta_recortada,
+                ruta_salida,
+                f"Intento recorte-startcode@{offset_start}",
+                errores,
+            )
+        errores.append("Intento recorte-startcode: no se pudo copiar el stream desde el offset")
+        return False
+    finally:
+        remove_if_exists(ruta_recortada)
+
+
+def _intentar_annexb_desde_offset(ruta_h264: str, ruta_salida: str, errores: list[str]) -> bool:
+    for longitud in LONGITUDES_NAL_H264:
+        offset = _buscar_offset_longitudes(ruta_h264, longitud)
+        if offset is None:
+            errores.append(f"Intento annexb-{longitud}-offset: no se encontró un offset válido")
+            continue
+        if offset == 0:
+            continue
+
+        ruta_annexb = _crear_temporal(".annexb.h264")
+        try:
             if _convertir_longitudes_a_annexb(ruta_h264, ruta_annexb, longitud, offset=offset):
-                if intentar_conversion(
-                    ruta_annexb, f"Intento annexb-{longitud}-offset@{offset}"
+                if _intentar_conversion_h264(
+                    ruta_annexb,
+                    ruta_salida,
+                    f"Intento annexb-{longitud}-offset@{offset}",
+                    errores,
                 ):
-                    os.remove(ruta_annexb)
-                    return ruta_salida
+                    return True
             else:
                 errores.append(
                     f"Intento annexb-{longitud}-offset@{offset}: no se pudo convertir longitudes a start codes"
                 )
-            if ruta_annexb and os.path.exists(ruta_annexb):
-                os.remove(ruta_annexb)
-            ruta_annexb = None
+        finally:
+            remove_if_exists(ruta_annexb)
+    return False
 
-    if os.path.exists(ruta_salida):
-        os.remove(ruta_salida)
+
+def envolver_h264_en_mp4(ruta_h264):
+    if not ruta_h264:
+        raise ValidationError("No se encontró la ruta del archivo H264.")
+
+    ruta_salida = os.path.splitext(ruta_h264)[0] + ".mp4"
+
+    errores = []
+    if _intentar_conversion_h264(ruta_h264, ruta_salida, "Intento", errores):
+        return ruta_salida
+
+    if not _tiene_start_codes(ruta_h264):
+        if _intentar_annexb_directo(ruta_h264, ruta_salida, errores):
+            return ruta_salida
+        if _intentar_recorte_start_code(ruta_h264, ruta_salida, errores):
+            return ruta_salida
+        if _intentar_annexb_desde_offset(ruta_h264, ruta_salida, errores):
+            return ruta_salida
+
+    remove_if_exists(ruta_salida)
 
     detalles = "\n\n".join(errores) if errores else "Sin detalles del error."
     raise ValidationError(
@@ -543,13 +533,15 @@ def envolver_h264_en_mp4(ruta_h264):
 
 
 def calcular_duracion_video(video):
-    probe = subprocess.run(
-        ["ffprobe", "-v", "error", "-show_entries", "format=duration", "-of", "json", video],
-        capture_output=True,
-        text=True,
-        check=True,
+    data = run_ffprobe_json(
+        video,
+        show_entries="format=duration",
+        error_prefix="No se pudo calcular la duracion del video",
     )
-    seconds = float(json.loads(probe.stdout)["format"]["duration"])
+    try:
+        seconds = float(data["format"]["duration"])
+    except (KeyError, TypeError, ValueError) as exc:
+        raise ValidationError("ffprobe no devolvió una duración válida.") from exc
     return datetime.timedelta(seconds=seconds).total_seconds()
 
 
@@ -595,11 +587,11 @@ def procesar_video_subida(video_obj, archivo):
             campos.append("ruta_archivo")
         video_obj.save(update_fields=campos)
 
-        if ruta_convertida and ruta_convertida != ruta_original and os.path.exists(ruta_original):
-            os.remove(ruta_original)
+        if ruta_convertida and ruta_convertida != ruta_original:
+            remove_if_exists(ruta_original)
     except Exception:
-        if ruta_convertida and ruta_convertida != ruta_original and os.path.exists(ruta_convertida):
-            os.remove(ruta_convertida)
+        if ruta_convertida and ruta_convertida != ruta_original:
+            remove_if_exists(ruta_convertida)
         video_obj.estado = EstadoVideo.ERROR
         video_obj.save(update_fields=["estado"])
         raise
