@@ -674,8 +674,15 @@ class AlineacionVideosMdvrTests(SimpleTestCase):
 
 
 class ConcatenacionSegmentosMdvrTests(SimpleTestCase):
-    def _segmento(self, ruta: str, extension: str) -> SegmentoVideo:
-        base = datetime.datetime(2026, 2, 15, 8, 0, 0)
+    def _segmento(
+        self,
+        ruta: str,
+        extension: str,
+        *,
+        base: datetime.datetime | None = None,
+    ) -> SegmentoVideo:
+        if base is None:
+            base = datetime.datetime(2026, 2, 15, 8, 0, 0)
         return SegmentoVideo(
             ruta=ruta,
             camara=1,
@@ -721,6 +728,77 @@ class ConcatenacionSegmentosMdvrTests(SimpleTestCase):
         concat_raw.assert_not_called()
         concat_copy.assert_called_once_with(["/tmp/a.mp4"], "/tmp/salida.mp4")
         concat_ffmpeg.assert_called_once_with(["/tmp/a.mp4"], "/tmp/salida.mp4")
+
+    def test_segmentos_con_hueco_fuerzan_padding_y_transcode(self):
+        base = datetime.datetime(2026, 3, 30, 16, 0, 0)
+        segmentos = [
+            self._segmento("/tmp/a.mp4", ".mp4", base=base),
+            self._segmento("/tmp/b.mp4", ".mp4", base=base + datetime.timedelta(hours=1)),
+        ]
+        with patch(
+            "dashboard.services.importar_videos_mdvr._preparar_segmentos_para_concat",
+            return_value=(["/tmp/a.mp4", "/tmp/pad.mp4", "/tmp/b.mp4"], ["/tmp/pad.mp4"], True),
+        ) as preparar, patch(
+            "dashboard.services.importar_videos_mdvr._concat_mp4_copiando",
+            return_value=(True, None),
+        ) as concat_copy, patch(
+            "dashboard.services.importar_videos_mdvr._concat_h264_transcodificando",
+            return_value=(True, None),
+        ) as concat_ffmpeg, patch(
+            "dashboard.services.importar_videos_mdvr.remove_if_exists"
+        ) as remove_mock:
+            ok, _error = _concatenar_segmentos(segmentos, "/tmp/salida.mp4")
+
+        self.assertTrue(ok)
+        preparar.assert_called_once()
+        concat_copy.assert_not_called()
+        concat_ffmpeg.assert_called_once_with(
+            ["/tmp/a.mp4", "/tmp/pad.mp4", "/tmp/b.mp4"],
+            "/tmp/salida.mp4",
+        )
+        remove_mock.assert_called_once_with("/tmp/pad.mp4")
+
+    def test_construir_mapa_segmentos_preserva_huecos_reales(self):
+        from dashboard.services import importar_videos_mdvr as mdvr
+
+        base = datetime.datetime(2026, 3, 30, 16, 0, 0)
+        segmentos = [
+            SegmentoVideo(
+                ruta="/tmp/c2_a.mp4",
+                camara=2,
+                inicio_dt=base,
+                fin_dt=base + datetime.timedelta(minutes=23),
+                extension=".mp4",
+            ),
+            SegmentoVideo(
+                ruta="/tmp/c2_b.mp4",
+                camara=2,
+                inicio_dt=base + datetime.timedelta(hours=1, minutes=29),
+                fin_dt=base + datetime.timedelta(hours=1, minutes=59),
+                extension=".mp4",
+            ),
+            SegmentoVideo(
+                ruta="/tmp/c2_c.mp4",
+                camara=2,
+                inicio_dt=base + datetime.timedelta(hours=2, minutes=21),
+                fin_dt=base + datetime.timedelta(hours=3),
+                extension=".mp4",
+            ),
+        ]
+
+        with patch(
+            "dashboard.services.importar_videos_mdvr._duracion_segmento_real",
+            side_effect=[23 * 60, 30 * 60, 39 * 60],
+        ):
+            mapa = mdvr._construir_mapa_segmentos(segmentos, 3 * 3600)
+
+        self.assertEqual(len(mapa), 3)
+        self.assertEqual(mapa[0]["video_inicio_segundo"], 0)
+        self.assertEqual(mapa[0]["video_fin_segundo"], 1379)
+        self.assertEqual(mapa[1]["video_inicio_segundo"], 5340)
+        self.assertEqual(mapa[1]["video_fin_segundo"], 7139)
+        self.assertEqual(mapa[2]["video_inicio_segundo"], 8460)
+        self.assertEqual(mapa[2]["video_fin_segundo"], 10799)
 
     def test_segmentos_raw_intentan_concat_binaria_primero(self):
         segmentos = [self._segmento("/tmp/a.h264", ".h264")]

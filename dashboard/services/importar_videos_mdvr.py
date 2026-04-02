@@ -37,6 +37,7 @@ from dashboard.services.video_commands import (
     build_ffmpeg_command,
     remove_if_exists,
     run_command,
+    run_ffprobe_json,
     validation_error_message,
 )
 from dashboard.services.video_importacion import inspeccionar_origen_importacion
@@ -151,6 +152,15 @@ try:
 except ValueError:
     MIN_ANTIGUEDAD_ARCHIVO_SEGUNDOS = _MIN_ANTIGUEDAD_ARCHIVO_DEFAULT
 MIN_ANTIGUEDAD_ARCHIVO_SEGUNDOS = max(0, MIN_ANTIGUEDAD_ARCHIVO_SEGUNDOS)
+
+_GAP_PADDING_MIN_SEGUNDOS_DEFAULT = 3.0
+try:
+    GAP_PADDING_MIN_SEGUNDOS = float(
+        os.environ.get("MDVR_GAP_PADDING_MIN_SECONDS", _GAP_PADDING_MIN_SEGUNDOS_DEFAULT)
+    )
+except ValueError:
+    GAP_PADDING_MIN_SEGUNDOS = _GAP_PADDING_MIN_SEGUNDOS_DEFAULT
+GAP_PADDING_MIN_SEGUNDOS = max(0.0, GAP_PADDING_MIN_SEGUNDOS)
 
 RAW_VIDEO_EXTENSIONS = {".h264", ".grec"}
 TRANSIENT_ERRNOS = {
@@ -856,6 +866,163 @@ def _ffprobe_ok(ruta: str) -> bool:
     return True
 
 
+def _parsear_fraccion_ffprobe(valor: str | None) -> float | None:
+    if not valor:
+        return None
+    if "/" not in valor:
+        try:
+            return float(valor)
+        except ValueError:
+            return None
+    num, den = valor.split("/", 1)
+    try:
+        num_f = float(num)
+        den_f = float(den)
+    except ValueError:
+        return None
+    if den_f == 0:
+        return None
+    return num_f / den_f
+
+
+def _obtener_parametros_padding_video(ruta: str) -> tuple[int, int, str]:
+    ancho = 1280
+    alto = 720
+    fps_expr = "25"
+    try:
+        data = run_ffprobe_json(
+            ruta,
+            show_entries="stream=width,height,avg_frame_rate,r_frame_rate",
+            error_prefix="No se pudo inspeccionar video MDVR",
+        )
+    except ValidationError:
+        return ancho, alto, fps_expr
+
+    for stream in data.get("streams", []):
+        try:
+            ancho_stream = int(stream.get("width") or 0)
+            alto_stream = int(stream.get("height") or 0)
+        except (TypeError, ValueError):
+            continue
+        if ancho_stream <= 0 or alto_stream <= 0:
+            continue
+        ancho = ancho_stream
+        alto = alto_stream
+        candidato = stream.get("avg_frame_rate") or stream.get("r_frame_rate")
+        fps_val = _parsear_fraccion_ffprobe(candidato)
+        if fps_val and fps_val > 0:
+            fps_expr = candidato
+        break
+    return ancho, alto, fps_expr
+
+
+def _duracion_hueco_entre_segmentos(
+    segmento_actual: SegmentoVideo,
+    duracion_actual: float,
+    siguiente_segmento: SegmentoVideo,
+) -> float:
+    duracion_base = max(0.0, float(duracion_actual or 0.0))
+    fin_real_actual = segmento_actual.inicio_dt + datetime.timedelta(seconds=duracion_base)
+    hueco = float((siguiente_segmento.inicio_dt - fin_real_actual).total_seconds())
+    if hueco < GAP_PADDING_MIN_SEGUNDOS:
+        return 0.0
+    return hueco
+
+
+def _planificar_timeline_segmentos(segmentos: list[SegmentoVideo]) -> tuple[list[dict], float]:
+    if not segmentos:
+        return [], 0.0
+
+    duraciones = [max(1.0, _duracion_segmento_real(seg)) for seg in segmentos]
+    plan: list[dict] = []
+    cursor = 0.0
+    total = len(segmentos)
+    for idx, (segmento, duracion_seg) in enumerate(zip(segmentos, duraciones), start=1):
+        inicio_timeline = cursor
+        fin_timeline = inicio_timeline + duracion_seg
+        hueco_despues = 0.0
+        if idx < total:
+            hueco_despues = _duracion_hueco_entre_segmentos(
+                segmento,
+                duracion_seg,
+                segmentos[idx],
+            )
+        plan.append(
+            {
+                "segmento": segmento,
+                "duracion_segundos": duracion_seg,
+                "timeline_inicio": inicio_timeline,
+                "timeline_fin": fin_timeline,
+                "hueco_despues": hueco_despues,
+            }
+        )
+        cursor = fin_timeline + hueco_despues
+    return plan, cursor
+
+
+def _crear_padding_negro_mp4(segundos: float, referencia_ruta: str) -> str:
+    ancho, alto, fps_expr = _obtener_parametros_padding_video(referencia_ruta)
+    ruta_padding = tempfile.NamedTemporaryFile(delete=False, suffix=".mp4").name
+    run_command(
+        [
+            "ffmpeg",
+            "-y",
+            "-hide_banner",
+            "-loglevel",
+            "error",
+            "-f",
+            "lavfi",
+            "-i",
+            f"color=c=black:s={ancho}x{alto}:r={fps_expr}:d={segundos:.3f}",
+            "-an",
+            "-c:v",
+            "libx264",
+            "-preset",
+            "veryfast",
+            "-crf",
+            "23",
+            "-pix_fmt",
+            "yuv420p",
+            "-movflags",
+            "+faststart",
+            ruta_padding,
+        ],
+        error_prefix="No se pudo generar padding negro MDVR",
+    )
+    if os.path.getsize(ruta_padding) <= 0:
+        remove_if_exists(ruta_padding)
+        raise ValidationError("No se pudo generar padding negro MDVR.")
+    return ruta_padding
+
+
+def _preparar_segmentos_para_concat(
+    segmentos: list[SegmentoVideo],
+) -> tuple[list[str], list[str], bool]:
+    son_mp4 = all(seg.extension == ".mp4" for seg in segmentos)
+    temporales: list[str] = []
+    if son_mp4:
+        rutas_mp4 = [seg.ruta for seg in segmentos]
+    else:
+        rutas_mp4, temporales = _normalizar_segmentos_raw_a_mp4(segmentos)
+
+    plan, _total_timeline = _planificar_timeline_segmentos(segmentos)
+    if not plan:
+        return rutas_mp4, temporales, False
+
+    rutas_finales: list[str] = []
+    hubo_padding = False
+    for idx, item in enumerate(plan):
+        rutas_finales.append(rutas_mp4[idx])
+        hueco = float(item.get("hueco_despues") or 0.0)
+        if hueco >= GAP_PADDING_MIN_SEGUNDOS:
+            ruta_padding = _crear_padding_negro_mp4(hueco, rutas_mp4[idx])
+            temporales.append(ruta_padding)
+            rutas_finales.append(ruta_padding)
+            hubo_padding = True
+
+    return rutas_finales, temporales, hubo_padding
+
+
 def _crear_lista_concat(segmentos: list[str]) -> str:
     with tempfile.NamedTemporaryFile(mode="w", delete=False, suffix=".txt") as archivo:
         for ruta in segmentos:
@@ -927,6 +1094,9 @@ def _concat_mp4_transcodificando(segmentos: list[str], salida: str) -> tuple[boo
             os.remove(lista)
 
 
+_concat_h264_transcodificando = _concat_mp4_transcodificando
+
+
 def _normalizar_segmentos_raw_a_mp4(segmentos: list[SegmentoVideo]) -> tuple[list[str], list[str]]:
     rutas_mp4 = []
     temporales = []
@@ -948,27 +1118,29 @@ def _concatenar_segmentos(segmentos: list[SegmentoVideo], salida: str) -> tuple[
         return False, "sin segmentos para concatenar."
 
     son_mp4 = all(seg.extension == ".mp4" for seg in segmentos)
-    if son_mp4:
-        ok, error = _concat_mp4_copiando(rutas, salida)
+    try:
+        rutas_preparadas, temporales, hubo_padding = _preparar_segmentos_para_concat(segmentos)
+    except Exception as exc:
+        return False, _normalizar_error(exc)
+
+    if son_mp4 and not hubo_padding:
+        ok, error = _concat_mp4_copiando(rutas_preparadas, salida)
         if ok:
             return True, None
-        ok, error = _concat_mp4_transcodificando(rutas, salida)
+        ok, error = _concat_h264_transcodificando(rutas_preparadas, salida)
         if ok:
             return True, None
         return False, error
 
-    temporales = []
     try:
-        rutas_mp4, temporales = _normalizar_segmentos_raw_a_mp4(segmentos)
-        ok, error = _concat_mp4_copiando(rutas_mp4, salida)
-        if ok:
-            return True, None
-        ok, error = _concat_mp4_transcodificando(rutas_mp4, salida)
+        if not hubo_padding:
+            ok, error = _concat_mp4_copiando(rutas_preparadas, salida)
+            if ok:
+                return True, None
+        ok, error = _concat_h264_transcodificando(rutas_preparadas, salida)
         if ok:
             return True, None
         return False, error
-    except Exception as exc:
-        return False, _normalizar_error(exc)
     finally:
         for ruta in temporales:
             remove_if_exists(ruta)
@@ -1018,38 +1190,26 @@ def _construir_mapa_segmentos(
     if not segmentos or total_video <= 0:
         return []
 
-    duraciones = [_duracion_segmento_real(seg) for seg in segmentos]
-    for idx in range(0, len(duraciones) - 1):
-        if duraciones[idx] > 1.0:
-            continue
-        delta_inicio = float(
-            (segmentos[idx + 1].inicio_dt - segmentos[idx].inicio_dt).total_seconds()
-        )
-        if 1.0 < delta_inicio <= 6 * 3600:
-            duraciones[idx] = delta_inicio
-    if duraciones and duraciones[-1] <= 1.0:
-        candidatas = sorted(d for d in duraciones[:-1] if d > 1.0)
-        if candidatas:
-            duraciones[-1] = candidatas[len(candidatas) // 2]
-
-    total_real = float(sum(duraciones))
-    if total_real <= 0:
+    plan, total_real = _planificar_timeline_segmentos(segmentos)
+    if not plan or total_real <= 0:
         return []
 
     tz_actual = timezone.get_current_timezone()
     mapa: list[dict] = []
-    inicio_video = 0
-    acumulada_real = 0.0
-    cantidad = len(segmentos)
+    cantidad = len(plan)
+    ultimo_fin_exclusivo = 0
 
-    for idx, (seg, duracion_seg) in enumerate(zip(segmentos, duraciones), start=1):
+    for idx, item in enumerate(plan, start=1):
+        seg = item["segmento"]
+        duracion_seg = float(item["duracion_segundos"])
+        inicio_video = int(round((float(item["timeline_inicio"]) / total_real) * total_video))
+        inicio_video = max(ultimo_fin_exclusivo, inicio_video)
         if inicio_video >= total_video:
             break
         if idx == cantidad:
             fin_video_exclusivo = total_video
         else:
-            acumulada_real += duracion_seg
-            ideal = int(round((acumulada_real / total_real) * total_video))
+            ideal = int(round((float(item["timeline_fin"]) / total_real) * total_video))
             restantes = cantidad - idx
             minimo = inicio_video + 1
             maximo = max(minimo, total_video - restantes)
@@ -1074,7 +1234,7 @@ def _construir_mapa_segmentos(
                 "real_fin": fin_real.isoformat(),
             }
         )
-        inicio_video = fin_video_exclusivo
+        ultimo_fin_exclusivo = fin_video_exclusivo
 
     return mapa
 
