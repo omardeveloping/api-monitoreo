@@ -1,5 +1,6 @@
 import datetime
 import errno
+import hashlib
 import logging
 import math
 import os
@@ -27,9 +28,17 @@ from dashboard.models import (
 )
 from dashboard.services.calcular_duracion_video import (
     calcular_duracion_video,
+    envolver_h264_en_mp4,
     procesar_video_subida,
 )
 from dashboard.services.importar_velocidades_xlsx import importar_velocidades_xlsx
+from dashboard.services.video_commands import (
+    build_ffmpeg_command,
+    remove_if_exists,
+    run_command,
+    validation_error_message,
+)
+from dashboard.services.video_importacion import inspeccionar_origen_importacion
 
 
 _DIR_FECHA_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
@@ -447,6 +456,10 @@ def _marcar_video_para_reintento(video: Video, ahora: datetime.datetime, error: 
     mensaje = _normalizar_error(error)
     reintentos_actuales = int(video.reintentos or 0)
     transitorio = _es_error_transitorio(error)
+    if hasattr(video, "detalle_error"):
+        video.detalle_error = mensaje
+    if hasattr(video, "error_tipo"):
+        video.error_tipo = "transitorio" if transitorio else "procesamiento"
 
     if transitorio and reintentos_actuales < MAX_REINTENTOS_MDVR:
         nuevo_reintento = reintentos_actuales + 1
@@ -455,7 +468,14 @@ def _marcar_video_para_reintento(video: Video, ahora: datetime.datetime, error: 
         video.ultimo_error = mensaje
         video.proximo_reintento_en = ahora + _calcular_backoff_reintento(nuevo_reintento)
         video.save(
-            update_fields=["estado", "reintentos", "ultimo_error", "proximo_reintento_en"]
+            update_fields=[
+                "estado",
+                "reintentos",
+                "ultimo_error",
+                "proximo_reintento_en",
+                "detalle_error",
+                "error_tipo",
+            ]
         )
         return (
             f"error transitorio ({mensaje}). "
@@ -468,7 +488,15 @@ def _marcar_video_para_reintento(video: Video, ahora: datetime.datetime, error: 
     video.estado = EstadoVideo.ERROR_PERMANENTE
     video.ultimo_error = f"{mensaje}{sufijo}"
     video.proximo_reintento_en = None
-    video.save(update_fields=["estado", "ultimo_error", "proximo_reintento_en"])
+    video.save(
+        update_fields=[
+            "estado",
+            "ultimo_error",
+            "proximo_reintento_en",
+            "detalle_error",
+            "error_tipo",
+        ]
+    )
     return f"error permanente ({video.ultimo_error})"
 
 
@@ -483,8 +511,64 @@ def _normalizar_video_exitoso(video: Video):
     if video.proximo_reintento_en is not None:
         video.proximo_reintento_en = None
         cambios.append("proximo_reintento_en")
+    if getattr(video, "detalle_error", ""):
+        video.detalle_error = ""
+        cambios.append("detalle_error")
+    if getattr(video, "error_tipo", ""):
+        video.error_tipo = ""
+        cambios.append("error_tipo")
     if cambios:
         video.save(update_fields=cambios)
+
+
+def _grupo_origen_mdvr(carpeta_id: str, fecha: datetime.date, tipo_turno: str, camara: int) -> str:
+    return f"mdvr:{carpeta_id}:{fecha.isoformat()}:{tipo_turno}:camara:{camara}"
+
+
+def _inspeccionar_segmentos_mdvr(
+    segmentos: list[SegmentoVideo],
+    *,
+    carpeta_id: str,
+    fecha: datetime.date,
+    tipo_turno: str,
+    camara: int,
+):
+    detalles = []
+    hash_grupo = hashlib.sha256()
+    total_bytes = 0
+    ultima_modificacion = None
+
+    for segmento in segmentos:
+        inspeccion = inspeccionar_origen_importacion(segmento.ruta)
+        ruta_rel = os.path.basename(segmento.ruta)
+        hash_grupo.update(ruta_rel.encode("utf-8"))
+        hash_grupo.update(b"|")
+        hash_grupo.update(inspeccion["sha256"].encode("utf-8"))
+        hash_grupo.update(b"\n")
+        total_bytes += inspeccion["tamano_bytes"]
+        if ultima_modificacion is None or inspeccion["modificado_en"] > ultima_modificacion:
+            ultima_modificacion = inspeccion["modificado_en"]
+        detalles.append(
+            {
+                "ruta": segmento.ruta,
+                "ruta_rel": ruta_rel,
+                "camara": segmento.camara,
+                "inicio_dt": segmento.inicio_dt,
+                "fin_dt": segmento.fin_dt,
+                "extension": segmento.extension,
+                **inspeccion,
+            }
+        )
+
+    return {
+        "grupo_origen": _grupo_origen_mdvr(carpeta_id, fecha, tipo_turno, camara),
+        "segmentos": detalles,
+        "segmentos_origen": [item["ruta_rel"] for item in detalles],
+        "ruta_origen": detalles[0]["ruta_rel"],
+        "origen_sha256": hash_grupo.hexdigest(),
+        "origen_tamano_bytes": total_bytes,
+        "origen_modificado_en": ultima_modificacion,
+    }
 
 
 def _registrar_omision(
@@ -641,6 +725,19 @@ def _archivo_listo_para_importar(ruta_archivo: str) -> tuple[bool, str | None]:
             ),
         )
 
+    firma_inicial = (st.st_size, getattr(st, "st_mtime_ns", int(st.st_mtime * 1_000_000_000)))
+    time.sleep(0.5)
+    try:
+        st_final = os.stat(ruta_archivo)
+    except OSError as exc:
+        return False, f"no se pudo revalidar metadatos del archivo ({exc})."
+    firma_final = (
+        st_final.st_size,
+        getattr(st_final, "st_mtime_ns", int(st_final.st_mtime * 1_000_000_000)),
+    )
+    if firma_final != firma_inicial:
+        return False, "archivo aún en cambio; espere a que finalice la subida."
+
     return True, None
 
 
@@ -697,72 +794,66 @@ def _concat_h264(segmentos: list[str], salida: str) -> tuple[bool, str | None]:
 def _concat_mp4_copiando(segmentos: list[str], salida: str) -> tuple[bool, str | None]:
     lista = _crear_lista_concat(segmentos)
     try:
-        comando = [
-            "ffmpeg",
-            "-hide_banner",
-            "-loglevel",
-            "error",
-            "-f",
-            "concat",
-            "-safe",
-            "0",
-            "-i",
-            lista,
-            "-c",
-            "copy",
-            "-movflags",
-            "+faststart",
-            "-y",
-            salida,
-        ]
-        subprocess.run(comando, capture_output=True, text=True, check=True)
+        run_command(
+            build_ffmpeg_command(
+                lista,
+                salida,
+                input_args=["-hide_banner", "-loglevel", "error", "-f", "concat", "-safe", "0"],
+                output_args=["-c", "copy", "-movflags", "+faststart"],
+            )
+        )
         if os.path.getsize(salida) <= 0:
             return False, "salida vacía tras concatenación MP4 por copia."
         return True, None
-    except subprocess.CalledProcessError as exc:
-        return False, _mensaje_error_subprocess(exc)
-    except (FileNotFoundError, OSError) as exc:
-        return False, _normalizar_error(exc)
+    except (ValidationError, OSError) as exc:
+        return False, validation_error_message(exc)
     finally:
         if os.path.exists(lista):
             os.remove(lista)
 
 
-def _concat_h264_transcodificando(segmentos: list[str], salida: str) -> tuple[bool, str | None]:
+def _concat_mp4_transcodificando(segmentos: list[str], salida: str) -> tuple[bool, str | None]:
     lista = _crear_lista_concat(segmentos)
     try:
-        comando = [
-            "ffmpeg",
-            "-hide_banner",
-            "-loglevel",
-            "error",
-            "-f",
-            "concat",
-            "-safe",
-            "0",
-            "-i",
-            lista,
-            "-c:v",
-            "libx264",
-            "-preset",
-            "veryfast",
-            "-crf",
-            "23",
-            "-pix_fmt",
-            "yuv420p",
-            "-an",
-            "-y",
-            salida,
-        ]
-        subprocess.run(comando, capture_output=True, text=True, check=True)
+        run_command(
+            build_ffmpeg_command(
+                lista,
+                salida,
+                input_args=["-hide_banner", "-loglevel", "error", "-f", "concat", "-safe", "0"],
+                output_args=[
+                    "-c:v",
+                    "libx264",
+                    "-preset",
+                    "veryfast",
+                    "-crf",
+                    "23",
+                    "-pix_fmt",
+                    "yuv420p",
+                    "-an",
+                ],
+            )
+        )
         return True, None
-    except subprocess.CalledProcessError as exc:
-        return False, _mensaje_error_subprocess(exc)
-    except (FileNotFoundError, OSError) as exc:
-        return False, _normalizar_error(exc)
+    except (ValidationError, OSError) as exc:
+        return False, validation_error_message(exc)
     finally:
         if os.path.exists(lista):
             os.remove(lista)
+
+
+def _normalizar_segmentos_raw_a_mp4(segmentos: list[SegmentoVideo]) -> tuple[list[str], list[str]]:
+    rutas_mp4 = []
+    temporales = []
+    for segmento in segmentos:
+        if segmento.extension == ".mp4":
+            rutas_mp4.append(segmento.ruta)
+            continue
+        ruta_temporal_raw = tempfile.NamedTemporaryFile(delete=False, suffix=segmento.extension).name
+        shutil.copyfile(segmento.ruta, ruta_temporal_raw)
+        ruta_mp4 = envolver_h264_en_mp4(ruta_temporal_raw)
+        temporales.extend([ruta_temporal_raw, ruta_mp4])
+        rutas_mp4.append(ruta_mp4)
+    return rutas_mp4, temporales
 
 
 def _concatenar_segmentos(segmentos: list[SegmentoVideo], salida: str) -> tuple[bool, str | None]:
@@ -770,33 +861,31 @@ def _concatenar_segmentos(segmentos: list[SegmentoVideo], salida: str) -> tuple[
     if not rutas:
         return False, "sin segmentos para concatenar."
 
-    son_raw = all(seg.extension in RAW_VIDEO_EXTENSIONS for seg in segmentos)
-    if son_raw:
-        ok, error = _concat_h264(rutas, salida)
-        if ok:
-            return True, None
-
     son_mp4 = all(seg.extension == ".mp4" for seg in segmentos)
     if son_mp4:
         ok, error = _concat_mp4_copiando(rutas, salida)
         if ok:
             return True, None
-
-    ok, error = _concat_h264_transcodificando(rutas, salida)
-    if ok:
-        return True, None
-
-    segmentos_validos = [ruta for ruta in rutas if _ffprobe_ok(ruta)]
-    if segmentos_validos and len(segmentos_validos) < len(rutas):
-        if son_mp4:
-            ok, error = _concat_mp4_copiando(segmentos_validos, salida)
-            if ok:
-                return True, None
-        ok, error = _concat_h264_transcodificando(segmentos_validos, salida)
+        ok, error = _concat_mp4_transcodificando(rutas, salida)
         if ok:
             return True, None
+        return False, error
 
-    return False, error
+    temporales = []
+    try:
+        rutas_mp4, temporales = _normalizar_segmentos_raw_a_mp4(segmentos)
+        ok, error = _concat_mp4_copiando(rutas_mp4, salida)
+        if ok:
+            return True, None
+        ok, error = _concat_mp4_transcodificando(rutas_mp4, salida)
+        if ok:
+            return True, None
+        return False, error
+    except Exception as exc:
+        return False, _normalizar_error(exc)
+    finally:
+        for ruta in temporales:
+            remove_if_exists(ruta)
 
 
 def _subir_archivo_temporal(ruta_local: str, nombre_base: str) -> str:
@@ -1316,25 +1405,74 @@ def _importar_camion_mdvr(
                 )
                 turnos_creados[tipo_turno] = turno
 
-            nombre_video = (
-                f"MDVR_{carpeta_id}_{fecha.isoformat()}_{tipo_turno}_C{camara}"
+            inspeccion_mdvr = _inspeccionar_segmentos_mdvr(
+                lista,
+                carpeta_id=carpeta_id,
+                fecha=fecha,
+                tipo_turno=tipo_turno,
+                camara=camara,
+            )
+            grupo_origen = inspeccion_mdvr["grupo_origen"]
+            nombre_video = f"MDVR_{carpeta_id}_{fecha.isoformat()}_{tipo_turno}_C{camara}"
+            duracion_esperada = sum(
+                max(1, int((segmento.fin_dt - segmento.inicio_dt).total_seconds()))
+                for segmento in lista
             )
             ahora = timezone.now()
             video_listo = (
                 Video.objects.filter(
-                    nombre=nombre_video,
                     id_turno=turno,
+                    camara=camara,
                     estado=EstadoVideo.LISTO,
+                    grupo_origen=grupo_origen,
                 )
                 .order_by("-id")
                 .first()
             )
-            if video_listo:
+            if video_listo is None:
+                video_listo = (
+                    Video.objects.filter(
+                        nombre=nombre_video,
+                        id_turno=turno,
+                        camara=camara,
+                        estado=EstadoVideo.LISTO,
+                    )
+                    .order_by("-id")
+                    .first()
+                )
+            if (
+                video_listo
+                and video_listo.origen_sha256 == inspeccion_mdvr["origen_sha256"]
+                and video_listo.ruta_archivo
+                and video_listo.ruta_archivo.name
+                and default_storage.exists(video_listo.ruta_archivo.name)
+            ):
+                cambios_listo = []
                 if not getattr(video_listo, "mapa_segmentos", None):
                     mapa_segmentos = _construir_mapa_segmentos(lista, video_listo.duracion)
                     if mapa_segmentos:
                         video_listo.mapa_segmentos = mapa_segmentos
-                        video_listo.save(update_fields=["mapa_segmentos"])
+                        cambios_listo.append("mapa_segmentos")
+                if not (video_listo.ruta_origen or ""):
+                    video_listo.ruta_origen = inspeccion_mdvr["ruta_origen"]
+                    cambios_listo.append("ruta_origen")
+                if not (video_listo.grupo_origen or ""):
+                    video_listo.grupo_origen = grupo_origen
+                    cambios_listo.append("grupo_origen")
+                if not getattr(video_listo, "segmentos_origen", None):
+                    video_listo.segmentos_origen = inspeccion_mdvr["segmentos_origen"]
+                    cambios_listo.append("segmentos_origen")
+                if not (video_listo.origen_sha256 or ""):
+                    video_listo.origen_sha256 = inspeccion_mdvr["origen_sha256"]
+                    cambios_listo.append("origen_sha256")
+                if not video_listo.origen_tamano_bytes:
+                    video_listo.origen_tamano_bytes = inspeccion_mdvr["origen_tamano_bytes"]
+                    cambios_listo.append("origen_tamano_bytes")
+                if not video_listo.origen_modificado_en:
+                    video_listo.origen_modificado_en = inspeccion_mdvr["origen_modificado_en"]
+                    cambios_listo.append("origen_modificado_en")
+                if cambios_listo:
+                    video_listo.save(update_fields=cambios_listo)
                 if (
                     importar_velocidades
                     and video_listo.estado_velocidades == EstadoVelocidadesVideo.PENDIENTE
@@ -1362,19 +1500,24 @@ def _importar_camion_mdvr(
                     continue
                 _registrar_omision(
                     detalles,
-                    motivo="ya existe video LISTO para turno y cámara.",
+                    motivo="ya existe video LISTO para turno y cámara con la misma huella de origen.",
                     nombre_video=nombre_video,
                     omision_video=True,
                 )
                 continue
 
-            video_existente = (
+            reemplazar_video_listo = bool(video_listo)
+            video_existente = video_listo or (
                 Video.objects.filter(nombre=nombre_video, id_turno=turno)
                 .exclude(estado=EstadoVideo.LISTO)
                 .order_by("-id")
                 .first()
             )
-            if video_existente and not _puede_reprocesarse(video_existente, ahora):
+            if (
+                video_existente
+                and not reemplazar_video_listo
+                and not _puede_reprocesarse(video_existente, ahora)
+            ):
                 if (
                     video_existente.estado == EstadoVideo.ERROR
                     and (video_existente.reintentos or 0) >= MAX_REINTENTOS_MDVR
@@ -1404,8 +1547,7 @@ def _importar_camion_mdvr(
             video = video_existente
             tmp_dir = tempfile.mkdtemp(prefix="mdvr_")
             try:
-                salida_es_raw = all(seg.extension in RAW_VIDEO_EXTENSIONS for seg in lista)
-                ext_salida = ".h264" if salida_es_raw else ".mp4"
+                ext_salida = ".mp4"
                 inicio_dt = lista[0].inicio_dt
                 lease_hasta = timezone.now() + datetime.timedelta(seconds=PROCESANDO_LEASE_SEGUNDOS)
                 ruta_previa = ""
@@ -1413,12 +1555,21 @@ def _importar_camion_mdvr(
                     ruta_previa = (video_existente.ruta_archivo.name or "").strip()
                     video_existente.camara = camara
                     video_existente.fecha_inicio = inicio_dt
-                    video_existente.fecha_subida = timezone.localdate()
+                    video_existente.fecha_subida = fecha
                     video_existente.inicio_timestamp = inicio_dt.time()
                     video_existente.estado = EstadoVideo.PROCESANDO
                     video_existente.duracion = None
+                    video_existente.fecha_fin = None
                     video_existente.fin_timestamp = None
                     video_existente.mimetype = ""
+                    video_existente.ruta_origen = inspeccion_mdvr["ruta_origen"]
+                    video_existente.grupo_origen = grupo_origen
+                    video_existente.segmentos_origen = inspeccion_mdvr["segmentos_origen"]
+                    video_existente.origen_sha256 = inspeccion_mdvr["origen_sha256"]
+                    video_existente.origen_tamano_bytes = inspeccion_mdvr["origen_tamano_bytes"]
+                    video_existente.origen_modificado_en = inspeccion_mdvr["origen_modificado_en"]
+                    video_existente.error_tipo = ""
+                    video_existente.detalle_error = ""
                     video_existente.procesamiento_iniciado_en = timezone.now()
                     video_existente.procesamiento_finalizado_en = None
                     video_existente.tiempo_procesamiento_segundos = None
@@ -1435,8 +1586,17 @@ def _importar_camion_mdvr(
                             "inicio_timestamp",
                             "estado",
                             "duracion",
+                            "fecha_fin",
                             "fin_timestamp",
                             "mimetype",
+                            "ruta_origen",
+                            "grupo_origen",
+                            "segmentos_origen",
+                            "origen_sha256",
+                            "origen_tamano_bytes",
+                            "origen_modificado_en",
+                            "error_tipo",
+                            "detalle_error",
                             "procesamiento_iniciado_en",
                             "procesamiento_finalizado_en",
                             "tiempo_procesamiento_segundos",
@@ -1456,10 +1616,18 @@ def _importar_camion_mdvr(
                         nombre=nombre_video,
                         camara=camara,
                         ruta_archivo=ruta_pendiente,
+                        ruta_origen=inspeccion_mdvr["ruta_origen"],
+                        grupo_origen=grupo_origen,
+                        segmentos_origen=inspeccion_mdvr["segmentos_origen"],
+                        origen_sha256=inspeccion_mdvr["origen_sha256"],
+                        origen_tamano_bytes=inspeccion_mdvr["origen_tamano_bytes"],
+                        origen_modificado_en=inspeccion_mdvr["origen_modificado_en"],
                         fecha_inicio=inicio_dt,
-                        fecha_subida=timezone.localdate(),
+                        fecha_subida=fecha,
                         inicio_timestamp=inicio_dt.time(),
                         estado=EstadoVideo.PROCESANDO,
+                        error_tipo="",
+                        detalle_error="",
                         procesamiento_iniciado_en=timezone.now(),
                         proximo_reintento_en=lease_hasta,
                         estado_velocidades=EstadoVelocidadesVideo.PENDIENTE,
@@ -1482,7 +1650,11 @@ def _importar_camion_mdvr(
                     except Exception:
                         pass
 
-                procesar_video_subida(video, video.ruta_archivo)
+                procesar_video_subida(
+                    video,
+                    video.ruta_archivo,
+                    duracion_esperada=duracion_esperada,
+                )
                 mapa_segmentos = _construir_mapa_segmentos(lista, video.duracion)
                 if mapa_segmentos:
                     video.mapa_segmentos = mapa_segmentos

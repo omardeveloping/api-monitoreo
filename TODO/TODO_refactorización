@@ -1,0 +1,13 @@
+# TODO de refactorización para DECO
+
+## Estado actual
+- No quedan tareas abiertas en este backlog después de los cambios aplicados.
+
+## Refactors absorbidos
+- Se creó `dashboard/services/video_commands.py` para centralizar ejecución de `ffmpeg` y `ffprobe`.
+- Se creó `dashboard/services/turnos_tiempo.py` para reutilizar la lógica temporal de turnos.
+- Se creó `dashboard/services/video_importacion.py` para encapsular importación desde servidor, validación de rutas, estabilidad, huella y creación/procesamiento.
+- `dashboard/views.py` dejó de mezclar tanto HTTP con filesystem y subprocess en la importación manual.
+- `dashboard/tasks.py` usa `bulk_update()` para actualizar estados de turnos y suma la task manual de importación.
+- `dashboard/services/importar_velocidades_csv.py` quedó partido en helpers pequeños para lectura, resolución de columnas e iteración de muestras válidas.
+- `dashboard/services/preview_video.py` ya reutiliza la capa común de comandos.

@@ -82,6 +82,20 @@ def _buscar_columna(fieldnames, candidatos):
     return None
 
 
+def _resolver_columnas(fieldnames):
+    campo_velocidad = _buscar_columna(fieldnames, _CANDIDATOS_VELOCIDAD)
+    if not campo_velocidad:
+        raise ValidationError("No se encontro la columna de velocidad.")
+
+    campo_hora = _buscar_columna(fieldnames, {"hora"})
+    campo_recibir = _buscar_columna(fieldnames, {"recibirtiempo"})
+    campo_alterno = None
+    if not campo_hora and not campo_recibir:
+        campo_alterno = _buscar_columna(fieldnames, _CANDIDATOS_HORA)
+
+    return campo_velocidad, campo_hora, campo_recibir, campo_alterno
+
+
 def _parsear_velocidad(valor):
     if valor is None:
         return None
@@ -111,11 +125,47 @@ def _parsear_fecha(valor):
     return None
 
 
+def _iterar_muestras_validas(filas_iterable, columnas):
+    campo_velocidad, campo_hora, campo_recibir, campo_alterno = columnas
+    muestras_raw = []
+    filas = 0
+    descartadas = 0
+
+    for idx, fila in enumerate(filas_iterable):
+        filas += 1
+        velocidad = _parsear_velocidad(fila.get(campo_velocidad))
+        if velocidad is None:
+            descartadas += 1
+            continue
+
+        timestamp = None
+        if campo_hora:
+            timestamp = _parsear_fecha(fila.get(campo_hora))
+        if timestamp is None and campo_recibir:
+            timestamp = _parsear_fecha(fila.get(campo_recibir))
+        if timestamp is None and campo_alterno:
+            timestamp = _parsear_fecha(fila.get(campo_alterno))
+        if timestamp is None:
+            descartadas += 1
+            continue
+
+        muestras_raw.append((timestamp, velocidad, idx))
+
+    return muestras_raw, filas, descartadas
+
+
 def _detectar_dialecto(texto):
     try:
         return csv.Sniffer().sniff(texto, delimiters="\t,;")
     except csv.Error:
         return csv.excel_tab
+
+
+def _leer_csv_texto(archivo):
+    contenido = archivo.read()
+    if isinstance(contenido, bytes):
+        return contenido.decode("utf-8-sig", errors="replace")
+    return str(contenido)
 
 
 def _es_video_mdvr(video):
@@ -252,39 +302,8 @@ def importar_velocidades_tabulares(video, fieldnames, filas_iterable):
     if not fieldnames:
         raise ValidationError("El archivo no tiene encabezados.")
 
-    campo_velocidad = _buscar_columna(fieldnames, _CANDIDATOS_VELOCIDAD)
-    if not campo_velocidad:
-        raise ValidationError("No se encontro la columna de velocidad.")
-
-    campo_hora = _buscar_columna(fieldnames, {"hora"})
-    campo_recibir = _buscar_columna(fieldnames, {"recibirtiempo"})
-    campo_alterno = None
-    if not campo_hora and not campo_recibir:
-        campo_alterno = _buscar_columna(fieldnames, _CANDIDATOS_HORA)
-
-    muestras_raw = []
-    filas = 0
-    descartadas = 0
-
-    for idx, fila in enumerate(filas_iterable):
-        filas += 1
-        velocidad = _parsear_velocidad(fila.get(campo_velocidad))
-        if velocidad is None:
-            descartadas += 1
-            continue
-
-        timestamp = None
-        if campo_hora:
-            timestamp = _parsear_fecha(fila.get(campo_hora))
-        if timestamp is None and campo_recibir:
-            timestamp = _parsear_fecha(fila.get(campo_recibir))
-        if timestamp is None and campo_alterno:
-            timestamp = _parsear_fecha(fila.get(campo_alterno))
-        if timestamp is None:
-            descartadas += 1
-            continue
-
-        muestras_raw.append((timestamp, velocidad, idx))
+    columnas = _resolver_columnas(fieldnames)
+    muestras_raw, filas, descartadas = _iterar_muestras_validas(filas_iterable, columnas)
 
     if not muestras_raw:
         raise ValidationError("No se encontraron filas con velocidad valida.")
@@ -398,6 +417,17 @@ def importar_velocidades_tabulares(video, fieldnames, filas_iterable):
             timestamp = timestamp_mapeado
         else:
             timestamp = base_ts + datetime.timedelta(seconds=segundo)
+        if usar_mapa_segmentos and timestamp is None:
+            registros[segundo] = VelocidadTurno(
+                turno=turno,
+                segundo=segundo,
+                velocidad_kmh=0,
+                timestamp_csv=None,
+                interpolado=True,
+                sin_datos=True,
+            )
+            interpoladas += 1
+            continue
         gap_desde_muestra = (
             segundo - ultimo_segundo_con_muestra
             if ultimo_segundo_con_muestra is not None
@@ -431,11 +461,7 @@ def importar_velocidades_tabulares(video, fieldnames, filas_iterable):
 
 
 def importar_velocidades_csv(video, archivo):
-    contenido = archivo.read()
-    if isinstance(contenido, bytes):
-        texto = contenido.decode("utf-8-sig", errors="replace")
-    else:
-        texto = str(contenido)
+    texto = _leer_csv_texto(archivo)
 
     if not texto.strip():
         raise ValidationError("El CSV esta vacio.")

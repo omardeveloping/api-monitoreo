@@ -36,7 +36,14 @@ from dashboard.services.calcular_duracion_video import (
 from dashboard.services.importar_velocidades_csv import importar_velocidades_csv
 from dashboard.services.importar_velocidades_xlsx import importar_velocidades_xlsx
 from dashboard.services.preview_video import obtener_preview_video
-from dashboard.tasks import importar_videos_mdvr_task
+from dashboard.services.video_importacion import (
+    crear_video_desde_serializer,
+    crear_video_pendiente_desde_ruta_servidor,
+    listar_archivos_servidor,
+    obtener_base_importacion,
+    resolver_ruta_importacion,
+)
+from dashboard.tasks import importar_video_desde_servidor_task, importar_videos_mdvr_task
 
 _PATRON_NOMBRE_VIDEO = re.compile(
     r"^(?P<equipo>\d+)-(?P<fecha>\d{6})-(?P<inicio>\d{6})-(?P<fin>\d{6})-(?P<codigo>\d+)$"
@@ -310,76 +317,44 @@ class VideoViewSet(viewsets.ModelViewSet):
     permission_classes = [IsAuthenticated, DjangoModelPermissions]
 
     def perform_create(self, serializer):
-        video = serializer.save(procesamiento_iniciado_en=timezone.now())
-        archivo = serializer.validated_data.get("ruta_archivo")
-        procesar_video_subida(video, archivo)
+        return crear_video_desde_serializer(serializer)
 
     def create(self, request, *args, **kwargs):
         serializer = self.get_serializer(data=request.data)
         serializer.is_valid(raise_exception=True)
-        self.perform_create(serializer)
-        headers = self.get_success_headers(serializer.data)
-        return Response(serializer.data, status=status.HTTP_201_CREATED, headers=headers)
+        video = self.perform_create(serializer)
+        response_serializer = self.get_serializer(video)
+        headers = self.get_success_headers(response_serializer.data)
+        return Response(response_serializer.data, status=status.HTTP_201_CREATED, headers=headers)
 
     @action(detail=False, methods=["post"], url_path="importar-desde-servidor")
     def importar_desde_servidor(self, request):
         serializer = VideoImportSerializer(data=request.data)
         serializer.is_valid(raise_exception=True)
-
-        base_dir = getattr(settings, "VIDEOS_IMPORT_DIR", "")
-        if not base_dir:
-            raise ValidationError("VIDEOS_IMPORT_DIR no está configurado en el servidor.")
-
-        base_dir_real = os.path.realpath(base_dir)
-        if not os.path.isdir(base_dir_real):
-            raise ValidationError("VIDEOS_IMPORT_DIR no apunta a un directorio válido.")
-
-        ruta_origen = serializer.validated_data["ruta_origen"].strip()
-        if not ruta_origen:
-            raise ValidationError("Debe indicar 'ruta_origen'.")
-        if os.path.isabs(ruta_origen):
-            raise ValidationError("La ruta debe ser relativa al directorio configurado.")
-
-        origen_real = os.path.realpath(os.path.join(base_dir_real, ruta_origen))
-        if not (origen_real == base_dir_real or origen_real.startswith(base_dir_real + os.sep)):
-            raise ValidationError("La ruta indicada sale del directorio permitido.")
-        if not os.path.isfile(origen_real):
-            raise ValidationError("El archivo indicado no existe.")
-
-        nombre_archivo = get_valid_filename(os.path.basename(origen_real))
-        if not nombre_archivo:
-            raise ValidationError("Nombre de archivo inválido.")
-
-        destino_rel = default_storage.get_available_name(os.path.join("videos", nombre_archivo))
-        with open(origen_real, "rb") as archivo_origen:
-            destino_rel = default_storage.save(destino_rel, File(archivo_origen))
-
-        nombre = serializer.validated_data.get("nombre") or os.path.splitext(nombre_archivo)[0]
-        video = Video.objects.create(
-            nombre=nombre,
-            camara=serializer.validated_data["camara"],
-            ruta_archivo=destino_rel,
-            fecha_inicio=serializer.validated_data.get("fecha_inicio"),
-            fecha_subida=serializer.validated_data.get("fecha_subida") or timezone.localdate(),
-            inicio_timestamp=serializer.validated_data.get("inicio_timestamp"),
-            procesamiento_iniciado_en=timezone.now(),
-            id_turno=serializer.validated_data["id_turno"],
+        base_dir_real = obtener_base_importacion()
+        ruta_origen, origen_real = resolver_ruta_importacion(
+            base_dir_real,
+            serializer.validated_data["ruta_origen"],
         )
-
-        procesar_video_subida(video, video.ruta_archivo)
-
+        video = crear_video_pendiente_desde_ruta_servidor(
+            serializer.validated_data,
+            origen_real,
+            ruta_origen=ruta_origen,
+        )
+        task = importar_video_desde_servidor_task.delay(
+            video.pk,
+            ruta_origen,
+            serializer.validated_data.get("duracion_esperada_segundos"),
+        )
         response_serializer = VideoSerializer(video, context={"request": request})
-        return Response(response_serializer.data, status=status.HTTP_201_CREATED)
+        data = dict(response_serializer.data)
+        data["task_id"] = task.id
+        data["encolado"] = True
+        return Response(data, status=status.HTTP_202_ACCEPTED)
 
     @action(detail=False, methods=["get"], url_path="archivos-servidor")
     def archivos_servidor(self, request):
-        base_dir = getattr(settings, "VIDEOS_IMPORT_DIR", "")
-        if not base_dir:
-            raise ValidationError("VIDEOS_IMPORT_DIR no está configurado en el servidor.")
-
-        base_dir_real = os.path.realpath(base_dir)
-        if not os.path.isdir(base_dir_real):
-            raise ValidationError("VIDEOS_IMPORT_DIR no apunta a un directorio válido.")
+        base_dir_real = obtener_base_importacion()
 
         include_all = request.query_params.get("todo", "").lower() in {"1", "true", "yes"}
         exts_param = (request.query_params.get("extensiones") or "").strip()
@@ -402,66 +377,23 @@ class VideoViewSet(viewsets.ModelViewSet):
             raise ValidationError("Los parámetros 'limit' y 'offset' deben ser >= 0.")
 
         limit = min(limit, 5000)
-
-        archivos = []
-        for raiz, _dirs, files in os.walk(base_dir_real):
-            for nombre in files:
-                ext = os.path.splitext(nombre)[1].lower()
-                if not include_all and ext not in extensiones:
-                    continue
-                ruta_absoluta = os.path.join(raiz, nombre)
-                ruta_relativa = os.path.relpath(ruta_absoluta, base_dir_real)
-                try:
-                    stat = os.stat(ruta_absoluta)
-                except OSError:
-                    continue
-                archivos.append(
-                    {
-                        "ruta_origen": ruta_relativa.replace(os.sep, "/"),
-                        "nombre_archivo": nombre,
-                        "nombre_formateado": _formatear_nombre_archivo(nombre),
-                        "tamano_bytes": stat.st_size,
-                        "modificado_en": datetime.fromtimestamp(
-                            stat.st_mtime, tz=timezone.get_current_timezone()
-                        ).isoformat(),
-                    }
-                )
-
-        archivos.sort(key=lambda item: item["ruta_origen"])
-        total = len(archivos)
-        resultados = archivos[offset : offset + limit] if limit else archivos[offset:]
-
         return Response(
-            {
-                "total": total,
-                "count": len(resultados),
-                "limit": limit,
-                "offset": offset,
-                "resultados": resultados,
-            }
+            listar_archivos_servidor(
+                base_dir_real,
+                include_all=include_all,
+                extensiones=extensiones,
+                limit=limit,
+                offset=offset,
+            )
         )
 
     @action(detail=False, methods=["get"], url_path="preview-servidor")
     def preview_servidor(self, request):
-        base_dir = getattr(settings, "VIDEOS_IMPORT_DIR", "")
-        if not base_dir:
-            raise ValidationError("VIDEOS_IMPORT_DIR no está configurado en el servidor.")
-
-        base_dir_real = os.path.realpath(base_dir)
-        if not os.path.isdir(base_dir_real):
-            raise ValidationError("VIDEOS_IMPORT_DIR no apunta a un directorio válido.")
-
-        ruta_origen = (request.query_params.get("ruta_origen") or "").strip()
-        if not ruta_origen:
-            raise ValidationError("Debe indicar 'ruta_origen'.")
-        if os.path.isabs(ruta_origen):
-            raise ValidationError("La ruta debe ser relativa al directorio configurado.")
-
-        origen_real = os.path.realpath(os.path.join(base_dir_real, ruta_origen))
-        if not (origen_real == base_dir_real or origen_real.startswith(base_dir_real + os.sep)):
-            raise ValidationError("La ruta indicada sale del directorio permitido.")
-        if not os.path.isfile(origen_real):
-            raise ValidationError("El archivo indicado no existe.")
+        base_dir_real = obtener_base_importacion()
+        ruta_origen, origen_real = resolver_ruta_importacion(
+            base_dir_real,
+            request.query_params.get("ruta_origen"),
+        )
 
         preview_rel, cached = obtener_preview_video(origen_real, ruta_origen)
 
@@ -545,15 +477,15 @@ class VideoViewSet(viewsets.ModelViewSet):
 
     @action(detail=False, methods=["get"], url_path="conteo-hoy")
     def conteo_hoy(self, request):
-        """Devuelve el total histórico de videos y el conteo del día actual."""
+        """Devuelve la cantidad de videos del material de hoy y lo ingerido hoy."""
         hoy = timezone.localdate()
-        cantidad_total = Video.objects.count()
-        cantidad_hoy = Video.objects.filter(fecha_subida=hoy).count()
+        cantidad_material = Video.objects.filter(fecha_subida=hoy).count()
+        cantidad_ingestada = Video.objects.filter(creado_en__date=hoy).count()
         return Response(
             {
-                "cantidad": cantidad_total,
-                "cantidad_hoy": cantidad_hoy,
-                "fecha_hoy": hoy,
+                "fecha": hoy,
+                "cantidad_material_hoy": cantidad_material,
+                "cantidad_ingestada_hoy": cantidad_ingestada,
             }
         )
 

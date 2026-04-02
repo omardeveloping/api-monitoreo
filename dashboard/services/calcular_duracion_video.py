@@ -9,15 +9,24 @@ import tempfile
 from django.conf import settings
 from django.utils import timezone
 from rest_framework.exceptions import ValidationError
+from dashboard.models import EstadoVideo
+from dashboard.services.video_commands import (
+    FFMPEG_LARGE_PROBE_ARGS,
+    build_ffmpeg_command,
+    remove_if_exists,
+    run_command,
+    run_ffprobe_json,
+    validation_error_message,
+)
 
 ### Tengo que acordarme de poner constantes en mayusculas
 FORMATO_VIDEO_VALIDO = {"video/mp4", "video/h264", "video/x-h264"}
 H264_EXTENSIONS = {".h264", ".grec"}
 EXTENSIONES_VALIDAS = {".mp4", *H264_EXTENSIONS}
-MAX_BYTES_START_CODES = 1024 * 1024
-MAX_TAMANO_NAL = 50 * 1024 * 1024
+_MAX_BYTES_START_CODES_DEFAULT = 4 * 1024 * 1024
+_MAX_TAMANO_NAL_DEFAULT = 50 * 1024 * 1024
 LONGITUDES_NAL_H264 = (4, 3)
-MAX_BYTES_SCAN_LONGITUD = 8 * 1024 * 1024
+_MAX_BYTES_SCAN_LONGITUD_DEFAULT = 64 * 1024 * 1024
 CODECS_VIDEO_MP4_COMPATIBLES = {"h264"}
 PIX_FMT_MP4_COMPATIBLES = {"yuv420p"}
 CODEC_TAGS_VIDEO_MP4_COMPATIBLES = {"avc1"}
@@ -33,7 +42,29 @@ PERMISOS_ARCHIVO_VIDEO = 0o644
 _AUDIO_SAMPLE_RATE_MP4_DEFAULT = 44100
 _AUDIO_SAMPLE_RATE_MIN_DEFAULT = 22050
 _FPS_DIFF_UMBRAL_DEFAULT = 0.02
+_VIDEO_IMPORT_DURATION_TOLERANCE_DEFAULT = 2
 _H264_OUTPUT_FPS_DEFAULT = "25"
+
+
+def _get_env_int(name: str, default: int, *, minimum: int = 1) -> int:
+    try:
+        return max(minimum, int(os.environ.get(name, default)))
+    except (TypeError, ValueError):
+        return default
+
+
+MAX_BYTES_START_CODES = _get_env_int(
+    "VIDEO_H264_MAX_BYTES_START_CODES",
+    _MAX_BYTES_START_CODES_DEFAULT,
+)
+MAX_TAMANO_NAL = _get_env_int(
+    "VIDEO_H264_MAX_TAMANO_NAL",
+    _MAX_TAMANO_NAL_DEFAULT,
+)
+MAX_BYTES_SCAN_LONGITUD = _get_env_int(
+    "VIDEO_H264_MAX_BYTES_SCAN_LONGITUD",
+    _MAX_BYTES_SCAN_LONGITUD_DEFAULT,
+)
 MP4_VIDEO_PROFILE = (os.environ.get("MP4_VIDEO_PROFILE", "baseline") or "").strip().lower()
 MP4_VIDEO_LEVEL = (os.environ.get("MP4_VIDEO_LEVEL", "") or "").strip()
 MP4_TARGET_FPS = (os.environ.get("MP4_TARGET_FPS", "") or "").strip()
@@ -53,6 +84,15 @@ try:
     FPS_DIFF_UMBRAL = float(os.environ.get("MP4_FPS_DIFF_UMBRAL", _FPS_DIFF_UMBRAL_DEFAULT))
 except ValueError:
     FPS_DIFF_UMBRAL = _FPS_DIFF_UMBRAL_DEFAULT
+try:
+    VIDEO_IMPORT_DURATION_TOLERANCE_SECONDS = int(
+        os.environ.get(
+            "VIDEO_IMPORT_DURATION_TOLERANCE_SECONDS",
+            _VIDEO_IMPORT_DURATION_TOLERANCE_DEFAULT,
+        )
+    )
+except ValueError:
+    VIDEO_IMPORT_DURATION_TOLERANCE_SECONDS = _VIDEO_IMPORT_DURATION_TOLERANCE_DEFAULT
 
 
 def _tiene_start_codes(ruta_h264):
@@ -380,7 +420,7 @@ def asegurar_mp4_compatible(ruta_mp4):
 def validar_formato(video):
     content_type = (getattr(video, "content_type", "") or "").lower()
     nombre_archivo = getattr(video, "name", "") or ""
-    extension = os.path.splitext(nombre_archivo)[1].lower()
+    extension = _extension_video(nombre_archivo)
 
     permitido_por_content_type = content_type in FORMATO_VIDEO_VALIDO
     permitido_por_extension = extension in EXTENSIONES_VALIDAS
@@ -389,6 +429,49 @@ def validar_formato(video):
         raise ValidationError(
             "Formato de video no válido. Solo se permiten archivos MP4, H264 o GREC."
         )
+
+
+def _extension_video(nombre_archivo: str) -> str:
+    return os.path.splitext(nombre_archivo or "")[1].lower()
+
+
+def _raw_h264_parece_valido(ruta_h264: str) -> bool:
+    if _tiene_start_codes(ruta_h264):
+        return True
+    if _buscar_offset_start_code(ruta_h264, max_bytes=MAX_BYTES_START_CODES) is not None:
+        return True
+    for longitud in LONGITUDES_NAL_H264:
+        if _buscar_offset_longitudes(ruta_h264, longitud) is not None:
+            return True
+    return False
+
+
+def prevalidar_video_origen(ruta_video: str) -> None:
+    extension = _extension_video(ruta_video)
+    if extension not in EXTENSIONES_VALIDAS:
+        raise ValidationError(
+            "Formato de video no válido. Solo se permiten archivos MP4, H264 o GREC."
+        )
+    try:
+        if os.path.getsize(ruta_video) <= 0:
+            raise ValidationError("El archivo de video está vacío o aún no terminó de subirse.")
+    except OSError as exc:
+        raise ValidationError("No se pudo acceder al archivo de video origen.") from exc
+
+    if extension == ".mp4":
+        data = run_ffprobe_json(
+            ruta_video,
+            show_entries="stream=codec_type,codec_name",
+            error_prefix="No se pudo inspeccionar el MP4 origen",
+        )
+        streams = data.get("streams", [])
+        if not any((stream.get("codec_type") == "video") for stream in streams):
+            raise ValidationError("El archivo MP4 origen no contiene pista de video.")
+        calcular_duracion_video(ruta_video)
+        return
+
+    if not _raw_h264_parece_valido(ruta_video):
+        raise ValidationError("El archivo H264/GREC origen no parece contener un stream válido.")
 
 
 def envolver_h264_en_mp4(ruta_h264):
@@ -557,23 +640,20 @@ def envolver_h264_en_mp4(ruta_h264):
 
 
 def calcular_duracion_video(video):
-    probe = subprocess.run(
-        ["ffprobe", "-v", "error", "-show_entries", "format=duration", "-of", "json", video],
-        capture_output=True,
-        text=True,
-        check=True,
+    data = run_ffprobe_json(
+        video,
+        show_entries="format=duration",
+        error_prefix="No se pudo calcular la duración del video",
     )
-    seconds = float(json.loads(probe.stdout)["format"]["duration"])
+    seconds = float(data["format"]["duration"])
     return datetime.timedelta(seconds=seconds).total_seconds()
 
 
-def procesar_video_subida(video_obj, archivo):
+def procesar_video_subida(video_obj, archivo, *, duracion_esperada: int | None = None):
     """
     Valida, convierte H264 a MP4 si es necesario, calcula duración y persiste cambios.
     Elimina archivos y el registro si ocurre algún error para evitar residuos.
     """
-    from dashboard.models import EstadoVideo
-
     validar_formato(archivo)
     content_type = (getattr(archivo, "content_type", "") or "").lower()
     inicio_procesamiento = video_obj.procesamiento_iniciado_en or timezone.now()
@@ -597,19 +677,37 @@ def procesar_video_subida(video_obj, archivo):
         if ruta_final.lower().endswith(".mp4") and not convertido_desde_h264:
             asegurar_mp4_compatible(ruta_final)
 
-        video_obj.duracion = math.floor(calcular_duracion_video(video_obj.ruta_archivo.path))
+        duracion_real = math.floor(calcular_duracion_video(video_obj.ruta_archivo.path))
+        if (
+            duracion_esperada is not None
+            and duracion_real + VIDEO_IMPORT_DURATION_TOLERANCE_SECONDS < duracion_esperada
+        ):
+            raise ValidationError(
+                "El video parece incompleto: "
+                f"se esperaban al menos {duracion_esperada}s y solo se obtuvieron "
+                f"{duracion_real}s."
+            )
+        video_obj.duracion = duracion_real
         video_obj.estado = EstadoVideo.LISTO
         video_obj.reintentos = 0
         video_obj.ultimo_error = ""
         video_obj.proximo_reintento_en = None
+        video_obj.error_tipo = ""
+        video_obj.detalle_error = ""
 
         inicio = video_obj.inicio_timestamp or datetime.time(0, 0)
         if isinstance(inicio, datetime.datetime):
             inicio = inicio.time()
-        fin = (
-            datetime.datetime.combine(datetime.date.today(), inicio)
-            + datetime.timedelta(seconds=video_obj.duracion or 0)
-        ).time()
+        if video_obj.fecha_inicio is not None:
+            fecha_fin = video_obj.fecha_inicio + datetime.timedelta(seconds=video_obj.duracion or 0)
+            fin = fecha_fin.timetz().replace(tzinfo=None)
+            video_obj.fecha_fin = fecha_fin
+        else:
+            fecha_fin = None
+            fin = (
+                datetime.datetime.combine(datetime.date.today(), inicio)
+                + datetime.timedelta(seconds=video_obj.duracion or 0)
+            ).time()
         video_obj.inicio_timestamp = inicio
         video_obj.fin_timestamp = fin
 
@@ -631,7 +729,10 @@ def procesar_video_subida(video_obj, archivo):
             "estado",
             "inicio_timestamp",
             "fin_timestamp",
+            "fecha_fin",
             "mimetype",
+            "error_tipo",
+            "detalle_error",
             "procesamiento_iniciado_en",
             "procesamiento_finalizado_en",
             "tiempo_procesamiento_segundos",
@@ -654,6 +755,8 @@ def procesar_video_subida(video_obj, archivo):
             video_obj.estado = EstadoVideo.ERROR
         mensaje_error = (str(exc) or exc.__class__.__name__).strip()
         video_obj.ultimo_error = mensaje_error[:2000]
+        video_obj.error_tipo = "validacion" if isinstance(exc, ValidationError) else "procesamiento"
+        video_obj.detalle_error = validation_error_message(exc)[:2000]
         video_obj.procesamiento_finalizado_en = timezone.now()
         video_obj.tiempo_procesamiento_segundos = round(
             max(
@@ -668,6 +771,8 @@ def procesar_video_subida(video_obj, archivo):
             update_fields=[
                 "estado",
                 "ultimo_error",
+                "error_tipo",
+                "detalle_error",
                 "procesamiento_iniciado_en",
                 "procesamiento_finalizado_en",
                 "tiempo_procesamiento_segundos",

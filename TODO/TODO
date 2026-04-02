@@ -1,0 +1,15 @@
+# TODO: edge cases y robustez pendiente en DECO
+
+## Estado actual
+- No quedan tareas abiertas en este backlog después de los cambios aplicados.
+
+## Cambios absorbidos en el código
+- `importar-desde-servidor` ahora usa task dedicada y servicio compartido.
+- Se agregaron chequeos de estabilidad, antigüedad mínima, huella SHA256 y validación previa del origen.
+- El modelo `Video` ahora guarda metadatos de origen, `fecha_fin`, `error_tipo` y `detalle_error`.
+- La importación manual y la MDVR ya comparten más reglas de diagnóstico, limpieza y trazabilidad.
+- El flujo MDVR deja de reutilizar un `LISTO` si cambió la huella del grupo de segmentos.
+- La reconstrucción de grupos raw dejó de depender de concatenación binaria ciega.
+- `procesar_video_subida()` ya puede rechazar material decodificable pero incompleto mediante duración esperada.
+- La proyección de velocidades ya no rellena segundos que caen fuera de tramos reales del `mapa_segmentos`.
+- `conteo-hoy` ahora diferencia material del día e ingestión del día.
