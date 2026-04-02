@@ -960,6 +960,47 @@ def _planificar_timeline_segmentos(segmentos: list[SegmentoVideo]) -> tuple[list
     return plan, cursor
 
 
+def _segmentos_contiguos_hasta_primer_hueco(
+    segmentos: list[SegmentoVideo],
+) -> tuple[list[SegmentoVideo], dict | None]:
+    if not segmentos:
+        return [], None
+
+    duraciones = [max(1.0, _duracion_segmento_real(seg)) for seg in segmentos]
+    for idx in range(len(segmentos) - 1):
+        hueco = _duracion_hueco_entre_segmentos(
+            segmentos[idx],
+            duraciones[idx],
+            segmentos[idx + 1],
+        )
+        if hueco >= GAP_PADDING_MIN_SEGUNDOS:
+            return segmentos[: idx + 1], {
+                "duracion_segundos": float(hueco),
+                "segmento_previo": segmentos[idx],
+                "segmento_siguiente": segmentos[idx + 1],
+                "segmentos_omitidos": len(segmentos) - (idx + 1),
+            }
+    return list(segmentos), None
+
+
+def _mensaje_video_cortado_en_hueco(info_hueco: dict | None) -> str:
+    if not info_hueco:
+        return ""
+    hueco = int(round(float(info_hueco.get("duracion_segundos") or 0.0)))
+    segmento_previo = info_hueco.get("segmento_previo")
+    segmento_siguiente = info_hueco.get("segmento_siguiente")
+    omitidos = int(info_hueco.get("segmentos_omitidos") or 0)
+    previo_nombre = os.path.basename(getattr(segmento_previo, "ruta", "") or "")
+    siguiente_nombre = os.path.basename(getattr(segmento_siguiente, "ruta", "") or "")
+    return (
+        "Se procesó solo el tramo continuo inicial del video: "
+        f"se detectó un hueco de aproximadamente {hueco}s entre "
+        f"'{previo_nombre}' y '{siguiente_nombre}'. "
+        f"Quedaron {omitidos} segmento(s) pendientes después del hueco; "
+        "el video se regenerará cuando aparezca continuidad."
+    )[:2000]
+
+
 def _crear_padding_negro_mp4(segundos: float, referencia_ruta: str) -> str:
     ancho, alto, fps_expr = _obtener_parametros_padding_video(referencia_ruta)
     ruta_padding = tempfile.NamedTemporaryFile(delete=False, suffix=".mp4").name
@@ -1004,23 +1045,7 @@ def _preparar_segmentos_para_concat(
         rutas_mp4 = [seg.ruta for seg in segmentos]
     else:
         rutas_mp4, temporales = _normalizar_segmentos_raw_a_mp4(segmentos)
-
-    plan, _total_timeline = _planificar_timeline_segmentos(segmentos)
-    if not plan:
-        return rutas_mp4, temporales, False
-
-    rutas_finales: list[str] = []
-    hubo_padding = False
-    for idx, item in enumerate(plan):
-        rutas_finales.append(rutas_mp4[idx])
-        hueco = float(item.get("hueco_despues") or 0.0)
-        if hueco >= GAP_PADDING_MIN_SEGUNDOS:
-            ruta_padding = _crear_padding_negro_mp4(hueco, rutas_mp4[idx])
-            temporales.append(ruta_padding)
-            rutas_finales.append(ruta_padding)
-            hubo_padding = True
-
-    return rutas_finales, temporales, hubo_padding
+    return rutas_mp4, temporales, False
 
 
 def _crear_lista_concat(segmentos: list[str]) -> str:
@@ -1641,6 +1666,15 @@ def _importar_camion_mdvr(
 
         for (tipo_turno, camara), lista in grupos.items():
             lista.sort(key=lambda s: s.inicio_dt)
+            lista_procesable, info_hueco = _segmentos_contiguos_hasta_primer_hueco(lista)
+            if not lista_procesable:
+                _registrar_omision(
+                    detalles,
+                    motivo="sin segmentos continuos procesables para turno y cámara.",
+                    nombre_video=f"MDVR_{carpeta_id}_{fecha.isoformat()}_{tipo_turno}_C{camara}",
+                    omision_video=True,
+                )
+                continue
             turno = turnos_creados.get(tipo_turno)
             if turno is None:
                 turno = _obtener_o_crear_turno(
@@ -1652,7 +1686,7 @@ def _importar_camion_mdvr(
                 turnos_creados[tipo_turno] = turno
 
             inspeccion_mdvr = _inspeccionar_segmentos_mdvr(
-                lista,
+                lista_procesable,
                 carpeta_id=carpeta_id,
                 fecha=fecha,
                 tipo_turno=tipo_turno,
@@ -1662,7 +1696,7 @@ def _importar_camion_mdvr(
             nombre_video = f"MDVR_{carpeta_id}_{fecha.isoformat()}_{tipo_turno}_C{camara}"
             duracion_esperada = sum(
                 max(1, int((segmento.fin_dt - segmento.inicio_dt).total_seconds()))
-                for segmento in lista
+                for segmento in lista_procesable
             )
             ahora = timezone.now()
             video_listo = (
@@ -1717,7 +1751,9 @@ def _importar_camion_mdvr(
                 _rehidratar_metadata_video_existente(video_listo)
                 cambios_listo = []
                 if not getattr(video_listo, "mapa_segmentos", None):
-                    mapa_segmentos = _construir_mapa_segmentos(lista, video_listo.duracion)
+                    mapa_segmentos = _construir_mapa_segmentos(
+                        lista_procesable, video_listo.duracion
+                    )
                     if mapa_segmentos:
                         video_listo.mapa_segmentos = mapa_segmentos
                         cambios_listo.append("mapa_segmentos")
@@ -1745,7 +1781,7 @@ def _importar_camion_mdvr(
                     importar_velocidades
                     and video_listo.estado_velocidades == EstadoVelocidadesVideo.PENDIENTE
                 ):
-                    inicio_para_xlsx = lista[0].inicio_dt
+                    inicio_para_xlsx = lista_procesable[0].inicio_dt
                     if video_listo.fecha_inicio is not None:
                         inicio_para_xlsx = video_listo.fecha_inicio
                         if timezone.is_aware(inicio_para_xlsx):
@@ -1778,7 +1814,9 @@ def _importar_camion_mdvr(
                 _rehidratar_metadata_video_existente(video_incompleto)
                 cambios_incompleto = []
                 if not getattr(video_incompleto, "mapa_segmentos", None):
-                    mapa_segmentos = _construir_mapa_segmentos(lista, video_incompleto.duracion)
+                    mapa_segmentos = _construir_mapa_segmentos(
+                        lista_procesable, video_incompleto.duracion
+                    )
                     if mapa_segmentos:
                         video_incompleto.mapa_segmentos = mapa_segmentos
                         cambios_incompleto.append("mapa_segmentos")
@@ -1806,7 +1844,7 @@ def _importar_camion_mdvr(
                     importar_velocidades
                     and video_incompleto.estado_velocidades == EstadoVelocidadesVideo.PENDIENTE
                 ):
-                    inicio_para_xlsx = lista[0].inicio_dt
+                    inicio_para_xlsx = lista_procesable[0].inicio_dt
                     if video_incompleto.fecha_inicio is not None:
                         inicio_para_xlsx = video_incompleto.fecha_inicio
                         if timezone.is_aware(inicio_para_xlsx):
@@ -1871,7 +1909,7 @@ def _importar_camion_mdvr(
             tmp_dir = tempfile.mkdtemp(prefix="mdvr_")
             try:
                 ext_salida = ".mp4"
-                inicio_dt = lista[0].inicio_dt
+                inicio_dt = lista_procesable[0].inicio_dt
                 lease_hasta = timezone.now() + datetime.timedelta(seconds=PROCESANDO_LEASE_SEGUNDOS)
                 ruta_previa = ""
                 if video_existente:
@@ -1958,7 +1996,7 @@ def _importar_camion_mdvr(
                     )
 
                 ruta_salida = os.path.join(tmp_dir, f"{nombre_video}{ext_salida}")
-                ok, error = _concatenar_segmentos(lista, ruta_salida)
+                ok, error = _concatenar_segmentos(lista_procesable, ruta_salida)
                 if not ok:
                     raise ValidationError(f"No se pudo concatenar segmentos ({error}).")
 
@@ -1978,10 +2016,28 @@ def _importar_camion_mdvr(
                     video.ruta_archivo,
                     duracion_esperada=duracion_esperada,
                 )
-                mapa_segmentos = _construir_mapa_segmentos(lista, video.duracion)
+                mapa_segmentos = _construir_mapa_segmentos(lista_procesable, video.duracion)
                 if mapa_segmentos:
                     video.mapa_segmentos = mapa_segmentos
                     video.save(update_fields=["mapa_segmentos"])
+                if info_hueco and video.estado == EstadoVideo.LISTO:
+                    mensaje_hueco = _mensaje_video_cortado_en_hueco(info_hueco)
+                    video.estado = EstadoVideo.INCOMPLETO
+                    video.error_tipo = "incompleto"
+                    video.detalle_error = mensaje_hueco
+                    video.ultimo_error = mensaje_hueco
+                    video.reintentos = 0
+                    video.proximo_reintento_en = None
+                    video.save(
+                        update_fields=[
+                            "estado",
+                            "error_tipo",
+                            "detalle_error",
+                            "ultimo_error",
+                            "reintentos",
+                            "proximo_reintento_en",
+                        ]
+                    )
                 if video.estado == EstadoVideo.LISTO:
                     _normalizar_video_exitoso(video)
                 detalles["videos_creados"] += 1
@@ -2007,6 +2063,11 @@ def _importar_camion_mdvr(
                     }
                 )
                 if video.estado == EstadoVideo.INCOMPLETO:
+                    if info_hueco:
+                        detalles["errores"].append(
+                            f"{nombre_video}: se procesó hasta el primer hueco detectado; "
+                            "se regenerará si aparece continuidad."
+                        )
                     if importar_velocidades:
                         inicio_para_xlsx = inicio_dt
                         if video.fecha_inicio is not None:
