@@ -65,6 +65,7 @@ class NumeroCamara(models.IntegerChoices):
 class EstadoVideo(models.TextChoices):
     PROCESANDO = "procesando", "Procesando"
     LISTO = "listo", "Listo"
+    INCOMPLETO = "incompleto", "Incompleto"
     ERROR = "error", "Error"
     ERROR_PERMANENTE = "error_permanente", "Error permanente"
 

@@ -65,7 +65,8 @@ class VideoSerializer(serializers.ModelSerializer):
 
     def to_representation(self, instance):
         data = super().to_representation(instance)
-        if instance.estado != EstadoVideo.LISTO:
+        estados_con_archivo = {EstadoVideo.LISTO, EstadoVideo.INCOMPLETO}
+        if instance.estado not in estados_con_archivo:
             data["duracion"] = None
             data["ruta_archivo"] = None
             data["fin_timestamp"] = None
@@ -75,7 +76,10 @@ class VideoSerializer(serializers.ModelSerializer):
             ruta = data.get("ruta_archivo")
             if ruta:
                 # Keep URL stable per object state while busting stale browser/CDN cache.
-                token = f"{instance.id}-{instance.duracion or 0}-{instance.fin_timestamp or ''}"
+                token = (
+                    f"{instance.id}-{instance.estado}-"
+                    f"{instance.duracion or 0}-{instance.fin_timestamp or ''}"
+                )
                 data["ruta_archivo"] = _with_query_param(ruta, "v", token)
         return data
 

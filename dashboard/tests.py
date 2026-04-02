@@ -85,6 +85,59 @@ class ProcesamientoVideoTimerTests(TestCase):
         self.assertEqual(video.procesamiento_finalizado_en, fin)
         self.assertEqual(video.tiempo_procesamiento_segundos, 12.345)
 
+    def test_video_incompleto_se_conserva_con_estado_visible(self):
+        camion = Camion.objects.create(patente="BKCD98", carpeta_id="4462510998")
+        turno = Turno.objects.create(
+            fecha=datetime.date(2026, 3, 4),
+            id_camion=camion,
+            tipo_turno=TipoTurnoChoices.MANANA,
+            hora_inicio=datetime.time(8, 0),
+            hora_fin=datetime.time(16, 0),
+        )
+        inicio = timezone.make_aware(datetime.datetime(2026, 3, 4, 10, 0, 0))
+        fin = timezone.make_aware(datetime.datetime(2026, 3, 4, 10, 0, 12))
+        video = Video.objects.create(
+            nombre="video_incompleto",
+            camara=1,
+            ruta_archivo="videos/video_incompleto.mp4",
+            id_turno=turno,
+            estado=EstadoVideo.PROCESANDO,
+            procesamiento_iniciado_en=inicio,
+        )
+
+        with patch(
+            "dashboard.services.calcular_duracion_video.validar_formato"
+        ), patch(
+            "dashboard.services.calcular_duracion_video.asegurar_mp4_compatible"
+        ), patch(
+            "dashboard.services.calcular_duracion_video.calcular_duracion_video",
+            return_value=1504.2,
+        ), patch(
+            "dashboard.services.calcular_duracion_video.timezone.now",
+            return_value=fin,
+        ), patch(
+            "dashboard.services.calcular_duracion_video.os.path.exists",
+            return_value=False,
+        ):
+            from dashboard.services.calcular_duracion_video import procesar_video_subida
+
+            procesar_video_subida(
+                video,
+                video.ruta_archivo,
+                duracion_esperada=14573,
+            )
+
+        video.refresh_from_db()
+        self.assertEqual(video.estado, EstadoVideo.INCOMPLETO)
+        self.assertEqual(video.error_tipo, "incompleto")
+        self.assertEqual(video.duracion, 1504)
+        self.assertTrue(video.ruta_archivo.name.endswith("video_incompleto.mp4"))
+        self.assertIn("parece incompleto", video.detalle_error)
+
+        data = VideoSerializer(video).data
+        self.assertIsNotNone(data["ruta_archivo"])
+        self.assertEqual(data["duracion"], 1504)
+
     def test_serializer_expone_tiempo_actual_mientras_procesa(self):
         camion = Camion.objects.create(patente="BKCE00", carpeta_id="4462511000")
         turno = Turno.objects.create(

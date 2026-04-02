@@ -649,6 +649,14 @@ def calcular_duracion_video(video):
     return datetime.timedelta(seconds=seconds).total_seconds()
 
 
+def _mensaje_video_incompleto(duracion_esperada: int, duracion_real: int) -> str:
+    return (
+        "El video parece incompleto: "
+        f"se esperaban al menos {duracion_esperada}s y solo se obtuvieron "
+        f"{duracion_real}s."
+    )
+
+
 def procesar_video_subida(video_obj, archivo, *, duracion_esperada: int | None = None):
     """
     Valida, convierte H264 a MP4 si es necesario, calcula duración y persiste cambios.
@@ -678,22 +686,7 @@ def procesar_video_subida(video_obj, archivo, *, duracion_esperada: int | None =
             asegurar_mp4_compatible(ruta_final)
 
         duracion_real = math.floor(calcular_duracion_video(video_obj.ruta_archivo.path))
-        if (
-            duracion_esperada is not None
-            and duracion_real + VIDEO_IMPORT_DURATION_TOLERANCE_SECONDS < duracion_esperada
-        ):
-            raise ValidationError(
-                "El video parece incompleto: "
-                f"se esperaban al menos {duracion_esperada}s y solo se obtuvieron "
-                f"{duracion_real}s."
-            )
         video_obj.duracion = duracion_real
-        video_obj.estado = EstadoVideo.LISTO
-        video_obj.reintentos = 0
-        video_obj.ultimo_error = ""
-        video_obj.proximo_reintento_en = None
-        video_obj.error_tipo = ""
-        video_obj.detalle_error = ""
 
         inicio = video_obj.inicio_timestamp or datetime.time(0, 0)
         if isinstance(inicio, datetime.datetime):
@@ -723,6 +716,31 @@ def procesar_video_subida(video_obj, archivo, *, duracion_esperada: int | None =
             ),
             3,
         )
+
+        mensaje_incompleto = ""
+        if (
+            duracion_esperada is not None
+            and duracion_real + VIDEO_IMPORT_DURATION_TOLERANCE_SECONDS < duracion_esperada
+        ):
+            mensaje_incompleto = _mensaje_video_incompleto(
+                duracion_esperada,
+                duracion_real,
+            )
+
+        if mensaje_incompleto:
+            video_obj.estado = EstadoVideo.INCOMPLETO
+            video_obj.reintentos = 0
+            video_obj.ultimo_error = mensaje_incompleto[:2000]
+            video_obj.proximo_reintento_en = None
+            video_obj.error_tipo = "incompleto"
+            video_obj.detalle_error = mensaje_incompleto
+        else:
+            video_obj.estado = EstadoVideo.LISTO
+            video_obj.reintentos = 0
+            video_obj.ultimo_error = ""
+            video_obj.proximo_reintento_en = None
+            video_obj.error_tipo = ""
+            video_obj.detalle_error = ""
 
         campos = [
             "duracion",

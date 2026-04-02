@@ -1044,7 +1044,7 @@ def crear_video_desde_ruta_servidor(
     if (
         video_existente
         and video_existente.origen_sha256 == manifest["origen_sha256"]
-        and video_existente.estado == EstadoVideo.LISTO
+        and video_existente.estado in {EstadoVideo.LISTO, EstadoVideo.INCOMPLETO}
         and video_existente.ruta_archivo.name
         and default_storage.exists(video_existente.ruta_archivo.name)
     ):

@@ -1440,6 +1440,27 @@ def _importar_camion_mdvr(
                     .order_by("-id")
                     .first()
                 )
+            video_incompleto = (
+                Video.objects.filter(
+                    id_turno=turno,
+                    camara=camara,
+                    estado=EstadoVideo.INCOMPLETO,
+                    grupo_origen=grupo_origen,
+                )
+                .order_by("-id")
+                .first()
+            )
+            if video_incompleto is None:
+                video_incompleto = (
+                    Video.objects.filter(
+                        nombre=nombre_video,
+                        id_turno=turno,
+                        camara=camara,
+                        estado=EstadoVideo.INCOMPLETO,
+                    )
+                    .order_by("-id")
+                    .first()
+                )
             if (
                 video_listo
                 and video_listo.origen_sha256 == inspeccion_mdvr["origen_sha256"]
@@ -1505,11 +1526,56 @@ def _importar_camion_mdvr(
                     omision_video=True,
                 )
                 continue
+            if (
+                video_incompleto
+                and video_incompleto.origen_sha256 == inspeccion_mdvr["origen_sha256"]
+                and video_incompleto.ruta_archivo
+                and video_incompleto.ruta_archivo.name
+                and default_storage.exists(video_incompleto.ruta_archivo.name)
+            ):
+                cambios_incompleto = []
+                if not getattr(video_incompleto, "mapa_segmentos", None):
+                    mapa_segmentos = _construir_mapa_segmentos(lista, video_incompleto.duracion)
+                    if mapa_segmentos:
+                        video_incompleto.mapa_segmentos = mapa_segmentos
+                        cambios_incompleto.append("mapa_segmentos")
+                if not (video_incompleto.ruta_origen or ""):
+                    video_incompleto.ruta_origen = inspeccion_mdvr["ruta_origen"]
+                    cambios_incompleto.append("ruta_origen")
+                if not (video_incompleto.grupo_origen or ""):
+                    video_incompleto.grupo_origen = grupo_origen
+                    cambios_incompleto.append("grupo_origen")
+                if not getattr(video_incompleto, "segmentos_origen", None):
+                    video_incompleto.segmentos_origen = inspeccion_mdvr["segmentos_origen"]
+                    cambios_incompleto.append("segmentos_origen")
+                if not (video_incompleto.origen_sha256 or ""):
+                    video_incompleto.origen_sha256 = inspeccion_mdvr["origen_sha256"]
+                    cambios_incompleto.append("origen_sha256")
+                if not video_incompleto.origen_tamano_bytes:
+                    video_incompleto.origen_tamano_bytes = inspeccion_mdvr["origen_tamano_bytes"]
+                    cambios_incompleto.append("origen_tamano_bytes")
+                if not video_incompleto.origen_modificado_en:
+                    video_incompleto.origen_modificado_en = inspeccion_mdvr["origen_modificado_en"]
+                    cambios_incompleto.append("origen_modificado_en")
+                if cambios_incompleto:
+                    video_incompleto.save(update_fields=cambios_incompleto)
+                _actualizar_estado_velocidades(
+                    video_incompleto,
+                    EstadoVelocidadesVideo.ERROR,
+                    error="Video incompleto; no se importaron velocidades automáticamente.",
+                )
+                _registrar_omision(
+                    detalles,
+                    motivo="ya existe video INCOMPLETO para turno y cámara con la misma huella de origen.",
+                    nombre_video=nombre_video,
+                    omision_video=True,
+                )
+                continue
 
-            reemplazar_video_listo = bool(video_listo)
-            video_existente = video_listo or (
+            reemplazar_video_listo = bool(video_listo or video_incompleto)
+            video_existente = video_listo or video_incompleto or (
                 Video.objects.filter(nombre=nombre_video, id_turno=turno)
-                .exclude(estado=EstadoVideo.LISTO)
+                .exclude(estado__in=[EstadoVideo.LISTO, EstadoVideo.INCOMPLETO])
                 .order_by("-id")
                 .first()
             )
@@ -1659,13 +1725,16 @@ def _importar_camion_mdvr(
                 if mapa_segmentos:
                     video.mapa_segmentos = mapa_segmentos
                     video.save(update_fields=["mapa_segmentos"])
-                _normalizar_video_exitoso(video)
+                if video.estado == EstadoVideo.LISTO:
+                    _normalizar_video_exitoso(video)
                 detalles["videos_creados"] += 1
                 detalles["videos_procesados"].append(
                     {
                         "video_id": video.id,
                         "nombre": video.nombre,
                         "camara": video.camara,
+                        "estado": video.estado,
+                        "error_tipo": video.error_tipo,
                         "turno_id": turno.id,
                         "procesamiento_iniciado_en": (
                             video.procesamiento_iniciado_en.isoformat()
@@ -1680,6 +1749,16 @@ def _importar_camion_mdvr(
                         "tiempo_procesamiento_segundos": video.tiempo_procesamiento_segundos,
                     }
                 )
+                if video.estado == EstadoVideo.INCOMPLETO:
+                    _actualizar_estado_velocidades(
+                        video,
+                        EstadoVelocidadesVideo.ERROR,
+                        error="Video incompleto; no se importaron velocidades automáticamente.",
+                    )
+                    detalles["errores"].append(
+                        f"{nombre_video}: video guardado como incompleto; no se importaron velocidades."
+                    )
+                    continue
                 videos_turno.setdefault(tipo_turno, []).append(video)
 
                 if importar_velocidades:
