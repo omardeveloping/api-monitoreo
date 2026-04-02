@@ -384,6 +384,9 @@ class ImportarMdvrBackfillVelocidadesTests(TestCase):
                 "dashboard.services.importar_videos_mdvr.MIN_ANTIGUEDAD_ARCHIVO_SEGUNDOS",
                 0,
             ), patch(
+                "dashboard.services.importar_videos_mdvr.default_storage.exists",
+                return_value=True,
+            ), patch(
                 "dashboard.services.importar_videos_mdvr.importar_velocidades_xlsx",
                 return_value={"guardadas": 1},
             ) as importar_mock, patch(
@@ -453,6 +456,15 @@ class ImportarMdvrBackfillVelocidadesTests(TestCase):
                 "dashboard.services.importar_videos_mdvr.MIN_ANTIGUEDAD_ARCHIVO_SEGUNDOS",
                 0,
             ), patch(
+                "dashboard.services.importar_videos_mdvr.default_storage.exists",
+                return_value=True,
+            ), patch(
+                "dashboard.services.importar_videos_mdvr.os.path.exists",
+                return_value=True,
+            ), patch(
+                "dashboard.services.importar_videos_mdvr.calcular_duracion_video",
+                return_value=654.0,
+            ), patch(
                 "dashboard.services.importar_videos_mdvr.importar_velocidades_xlsx",
                 return_value={"guardadas": 1},
             ) as importar_mock, patch(
@@ -471,6 +483,9 @@ class ImportarMdvrBackfillVelocidadesTests(TestCase):
         procesar_video_mock.assert_not_called()
 
         video.refresh_from_db()
+        self.assertEqual(video.duracion, 654)
+        self.assertIsNotNone(video.fecha_fin)
+        self.assertEqual(video.fin_timestamp, datetime.time(8, 11, 41))
         self.assertEqual(video.estado_velocidades, EstadoVelocidadesVideo.IMPORTADA)
         self.assertEqual(video.velocidades_error, "")
         self.assertIsNotNone(video.velocidades_actualizadas_en)

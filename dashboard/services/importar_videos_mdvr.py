@@ -2,6 +2,7 @@ import datetime
 import errno
 import hashlib
 import logging
+import mimetypes
 import math
 import os
 import re
@@ -545,6 +546,63 @@ def _normalizar_video_exitoso(video: Video):
     if getattr(video, "error_tipo", ""):
         video.error_tipo = ""
         cambios.append("error_tipo")
+    if cambios:
+        video.save(update_fields=cambios)
+
+
+def _rehidratar_metadata_video_existente(video: Video):
+    necesita_duracion = video.duracion is None or video.duracion <= 0
+    necesita_fin = video.fecha_inicio is not None and (
+        video.fecha_fin is None or video.fin_timestamp is None
+    )
+    necesita_mimetype = not (video.mimetype or "").strip()
+    if not (necesita_duracion or necesita_fin or necesita_mimetype):
+        return
+
+    ruta_archivo = getattr(video, "ruta_archivo", None)
+    if not ruta_archivo or not getattr(ruta_archivo, "name", ""):
+        return
+
+    try:
+        ruta = ruta_archivo.path
+    except Exception:
+        return
+
+    if not ruta or not os.path.exists(ruta):
+        return
+
+    cambios = []
+    duracion_recalculada = None
+    if necesita_duracion or necesita_fin:
+        try:
+            duracion_recalculada = math.floor(calcular_duracion_video(ruta))
+        except Exception:
+            duracion_recalculada = None
+
+    if necesita_duracion and duracion_recalculada is not None and duracion_recalculada > 0:
+        video.duracion = duracion_recalculada
+        cambios.append("duracion")
+
+    duracion_base = video.duracion
+    if (duracion_base is None or duracion_base <= 0) and duracion_recalculada is not None:
+        duracion_base = duracion_recalculada
+
+    if necesita_fin and duracion_base is not None and duracion_base > 0:
+        fecha_fin = video.fecha_inicio + datetime.timedelta(seconds=int(duracion_base))
+        fin = fecha_fin.timetz().replace(tzinfo=None)
+        if video.fecha_fin != fecha_fin:
+            video.fecha_fin = fecha_fin
+            cambios.append("fecha_fin")
+        if video.fin_timestamp != fin:
+            video.fin_timestamp = fin
+            cambios.append("fin_timestamp")
+
+    if necesita_mimetype:
+        mimetype = mimetypes.guess_type(ruta)[0] or ""
+        if mimetype and video.mimetype != mimetype:
+            video.mimetype = mimetype
+            cambios.append("mimetype")
+
     if cambios:
         video.save(update_fields=cambios)
 
@@ -1496,6 +1554,7 @@ def _importar_camion_mdvr(
                 and video_listo.ruta_archivo.name
                 and default_storage.exists(video_listo.ruta_archivo.name)
             ):
+                _rehidratar_metadata_video_existente(video_listo)
                 cambios_listo = []
                 if not getattr(video_listo, "mapa_segmentos", None):
                     mapa_segmentos = _construir_mapa_segmentos(lista, video_listo.duracion)
@@ -1556,6 +1615,7 @@ def _importar_camion_mdvr(
                 and video_incompleto.ruta_archivo.name
                 and default_storage.exists(video_incompleto.ruta_archivo.name)
             ):
+                _rehidratar_metadata_video_existente(video_incompleto)
                 cambios_incompleto = []
                 if not getattr(video_incompleto, "mapa_segmentos", None):
                     mapa_segmentos = _construir_mapa_segmentos(lista, video_incompleto.duracion)
