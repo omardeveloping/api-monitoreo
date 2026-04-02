@@ -5,6 +5,7 @@ import os
 import tempfile
 
 from django.conf import settings
+from django.utils import timezone
 from rest_framework.exceptions import ValidationError
 
 from dashboard.models import EstadoVideo
@@ -17,14 +18,10 @@ from dashboard.services.video_commands import (
     validation_error_message,
 )
 
-### Tengo que acordarme de poner constantes en mayusculas
 FORMATO_VIDEO_VALIDO = {"video/mp4", "video/h264", "video/x-h264"}
 H264_EXTENSIONS = {".h264", ".grec"}
 EXTENSIONES_VALIDAS = {".mp4", *H264_EXTENSIONS}
-MAX_BYTES_START_CODES = 1024 * 1024
-MAX_TAMANO_NAL = 50 * 1024 * 1024
 LONGITUDES_NAL_H264 = (4, 3)
-MAX_BYTES_SCAN_LONGITUD = 8 * 1024 * 1024
 CODECS_VIDEO_MP4_COMPATIBLES = {"h264"}
 PIX_FMT_MP4_COMPATIBLES = {"yuv420p"}
 CODEC_TAGS_VIDEO_MP4_COMPATIBLES = {"avc1"}
@@ -41,6 +38,36 @@ _AUDIO_SAMPLE_RATE_MP4_DEFAULT = 44100
 _AUDIO_SAMPLE_RATE_MIN_DEFAULT = 22050
 _FPS_DIFF_UMBRAL_DEFAULT = 0.02
 _VIDEO_IMPORT_DURATION_TOLERANCE_DEFAULT = 2
+_MAX_BYTES_START_CODES_DEFAULT = 4 * 1024 * 1024
+_MAX_TAMANO_NAL_DEFAULT = 50 * 1024 * 1024
+_MAX_BYTES_SCAN_LONGITUD_DEFAULT = 64 * 1024 * 1024
+_BUSCAR_OFFSET_CHUNK_SIZE_DEFAULT = 1024 * 1024
+
+
+def _get_env_int(name: str, default: int, *, minimum: int = 1) -> int:
+    try:
+        return max(minimum, int(os.environ.get(name, default)))
+    except (TypeError, ValueError):
+        return default
+
+
+MAX_BYTES_START_CODES = _get_env_int(
+    "VIDEO_H264_MAX_BYTES_START_CODES",
+    _MAX_BYTES_START_CODES_DEFAULT,
+)
+MAX_TAMANO_NAL = _get_env_int(
+    "VIDEO_H264_MAX_TAMANO_NAL",
+    _MAX_TAMANO_NAL_DEFAULT,
+)
+MAX_BYTES_SCAN_LONGITUD = _get_env_int(
+    "VIDEO_H264_MAX_BYTES_SCAN_LONGITUD",
+    _MAX_BYTES_SCAN_LONGITUD_DEFAULT,
+)
+BUSCAR_OFFSET_CHUNK_SIZE = _get_env_int(
+    "VIDEO_H264_BUSCAR_OFFSET_CHUNK_SIZE",
+    _BUSCAR_OFFSET_CHUNK_SIZE_DEFAULT,
+    minimum=1024,
+)
 MP4_VIDEO_PROFILE = (os.environ.get("MP4_VIDEO_PROFILE", "baseline") or "").strip().lower()
 MP4_VIDEO_LEVEL = (os.environ.get("MP4_VIDEO_LEVEL", "") or "").strip()
 MP4_TARGET_FPS = (os.environ.get("MP4_TARGET_FPS", "") or "").strip()
@@ -107,7 +134,7 @@ def _convertir_longitudes_a_annexb(ruta_h264, ruta_salida, longitud_nal, offset=
 
 def _buscar_offset_start_code(ruta_h264, max_bytes=None):
     patrones = (b"\x00\x00\x00\x01", b"\x00\x00\x01")
-    chunk_size = 1024 * 1024
+    chunk_size = BUSCAR_OFFSET_CHUNK_SIZE
     offset = 0
     tail = b""
     try:
@@ -631,17 +658,36 @@ def procesar_video_subida(video_obj, archivo, *, duracion_esperada: int | None =
         inicio = video_obj.inicio_timestamp or datetime.time(0, 0)
         if isinstance(inicio, datetime.datetime):
             inicio = inicio.time()
-        fin = (
-            datetime.datetime.combine(datetime.date.today(), inicio)
-            + datetime.timedelta(seconds=video_obj.duracion or 0)
-        ).time()
+        if video_obj.fecha_inicio:
+            fecha_inicio = video_obj.fecha_inicio
+            if timezone.is_naive(fecha_inicio):
+                fecha_inicio = timezone.make_aware(fecha_inicio, timezone.get_current_timezone())
+        else:
+            fecha_inicio = timezone.make_aware(
+                datetime.datetime.combine(datetime.date.today(), inicio),
+                timezone.get_current_timezone(),
+            )
+        fecha_fin = fecha_inicio + datetime.timedelta(seconds=video_obj.duracion or 0)
+        fin = fecha_fin.timetz().replace(tzinfo=None)
         video_obj.inicio_timestamp = inicio
         video_obj.fin_timestamp = fin
+        video_obj.fecha_fin = fecha_fin
 
         final_mimetype = mimetypes.guess_type(video_obj.ruta_archivo.path)[0] or content_type or ""
         video_obj.mimetype = final_mimetype
+        video_obj.error_tipo = ""
+        video_obj.detalle_error = ""
 
-        campos = ["duracion", "estado", "inicio_timestamp", "fin_timestamp", "mimetype"]
+        campos = [
+            "duracion",
+            "estado",
+            "inicio_timestamp",
+            "fin_timestamp",
+            "fecha_fin",
+            "mimetype",
+            "error_tipo",
+            "detalle_error",
+        ]
         if ruta_convertida:
             campos.append("ruta_archivo")
         video_obj.save(update_fields=campos)

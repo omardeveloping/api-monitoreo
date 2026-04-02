@@ -25,12 +25,13 @@ from .serializers import (
 from dashboard.services.importar_velocidades_csv import importar_velocidades_csv
 from dashboard.services.preview_video import obtener_preview_video
 from dashboard.services.video_importacion import (
-    crear_video_desde_ruta_servidor,
+    crear_video_pendiente_desde_ruta_servidor,
     crear_video_desde_serializer,
     formatear_nombre_video,
     obtener_base_importacion,
     resolver_ruta_importacion,
 )
+from dashboard.tasks import importar_video_desde_servidor_task
 
 
 class CamionViewSet(viewsets.ModelViewSet):
@@ -99,14 +100,22 @@ class VideoViewSet(viewsets.ModelViewSet):
             base_dir_real,
             serializer.validated_data["ruta_origen"],
         )
-        video = crear_video_desde_ruta_servidor(
+        video = crear_video_pendiente_desde_ruta_servidor(
             serializer.validated_data,
             origen_real,
             ruta_origen=ruta_origen,
         )
+        task = importar_video_desde_servidor_task.delay(
+            video.pk,
+            ruta_origen,
+            serializer.validated_data.get("duracion_esperada_segundos"),
+        )
 
         response_serializer = VideoSerializer(video, context={"request": request})
-        return Response(response_serializer.data, status=status.HTTP_201_CREATED)
+        data = dict(response_serializer.data)
+        data["task_id"] = task.id
+        data["encolado"] = True
+        return Response(data, status=status.HTTP_202_ACCEPTED)
 
     @action(detail=False, methods=["get"], url_path="archivos-servidor")
     def archivos_servidor(self, request):
@@ -241,10 +250,17 @@ class VideoViewSet(viewsets.ModelViewSet):
 
     @action(detail=False, methods=["get"], url_path="conteo-hoy")
     def conteo_hoy(self, request):
-        """Devuelve la cantidad de videos subidos hoy."""
+        """Devuelve la cantidad de videos del material de hoy y lo ingerido hoy."""
         hoy = timezone.localdate()
-        cantidad = Video.objects.filter(fecha_subida=hoy).count()
-        return Response({"fecha": hoy, "cantidad": cantidad})
+        cantidad_material = Video.objects.filter(fecha_subida=hoy).count()
+        cantidad_ingestada = Video.objects.filter(creado_en__date=hoy).count()
+        return Response(
+            {
+                "fecha": hoy,
+                "cantidad_material_hoy": cantidad_material,
+                "cantidad_ingestada_hoy": cantidad_ingestada,
+            }
+        )
 
 
 class OperadorViewSet(viewsets.ModelViewSet):

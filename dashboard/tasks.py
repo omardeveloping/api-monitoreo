@@ -3,10 +3,17 @@ from datetime import datetime, timedelta
 from celery import shared_task
 from django.utils import timezone
 
-from .models import Turno
+from .models import EstadoVideo, Turno, Video
 from dashboard.services.programar_turnos import (
     crear_asignaciones_semanales,
     crear_turnos_diarios,
+)
+from dashboard.services.video_importacion import (
+    _validated_data_desde_video,
+    crear_video_desde_ruta_servidor,
+    marcar_video_con_error,
+    obtener_base_importacion,
+    resolver_ruta_importacion,
 )
 
 
@@ -65,3 +72,35 @@ def generar_turnos_diarios():
 def generar_asignaciones_semanales():
     """Crea las asignaciones semanales de operadores (rotación A/B/C) cada lunes."""
     return crear_asignaciones_semanales()
+
+
+@shared_task(bind=True)
+def importar_video_desde_servidor_task(
+    self,
+    video_id: int,
+    ruta_origen: str,
+    duracion_esperada_segundos: int | None = None,
+):
+    video = Video.objects.select_related("id_turno").get(pk=video_id)
+    try:
+        base_dir_real = obtener_base_importacion()
+        ruta_origen, origen_real = resolver_ruta_importacion(base_dir_real, ruta_origen)
+        validated_data = _validated_data_desde_video(
+            video,
+            duracion_esperada_segundos=duracion_esperada_segundos,
+        )
+        resultado = crear_video_desde_ruta_servidor(
+            validated_data,
+            origen_real,
+            ruta_origen=ruta_origen,
+            video_obj=video,
+        )
+    except Exception as exc:
+        video.refresh_from_db(fields=["estado", "detalle_error"])
+        if video.estado != EstadoVideo.ERROR or not video.detalle_error:
+            marcar_video_con_error(video, exc)
+        raise
+
+    if resultado.pk != video.pk and video.estado != EstadoVideo.LISTO:
+        video.delete()
+    return {"video_id": resultado.pk, "estado": resultado.estado}

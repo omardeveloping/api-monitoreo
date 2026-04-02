@@ -52,6 +52,7 @@ class VideoSerializer(serializers.ModelSerializer):
             data["ruta_archivo"] = None
             data["fin_timestamp"] = None
             data["mimetype"] = None
+            data["fecha_fin"] = None
         return data
 
     class Meta:
@@ -61,14 +62,22 @@ class VideoSerializer(serializers.ModelSerializer):
             'nombre',
             'camara',
             'ruta_archivo',
+            'ruta_origen',
+            'grupo_origen',
+            'segmentos_origen',
+            'mapa_segmentos',
             'fecha_subida',
             'fecha_inicio',
+            'fecha_fin',
             'duracion',
             'inicio_timestamp',
             'fin_timestamp',
             'mimetype',
+            'error_tipo',
+            'detalle_error',
             'estado',
             'id_turno',
+            'creado_en',
         ]
 
 
@@ -80,6 +89,11 @@ class VideoImportSerializer(serializers.Serializer):
     fecha_inicio = serializers.DateTimeField(required=False, allow_null=True)
     fecha_subida = serializers.DateField(required=False, allow_null=True)
     inicio_timestamp = serializers.TimeField(required=False, allow_null=True)
+    duracion_esperada_segundos = serializers.IntegerField(
+        required=False,
+        allow_null=True,
+        min_value=1,
+    )
 
 
 class VelocidadVideoSerializer(serializers.ModelSerializer):

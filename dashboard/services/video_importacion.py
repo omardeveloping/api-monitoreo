@@ -9,6 +9,7 @@ from datetime import datetime, timedelta
 from django.conf import settings
 from django.core.files import File
 from django.core.files.storage import default_storage
+from django.db import transaction
 from django.utils import timezone
 from django.utils.text import get_valid_filename
 from rest_framework.exceptions import ValidationError
@@ -21,7 +22,12 @@ from dashboard.services.calcular_duracion_video import (
     prevalidar_video_origen,
     procesar_video_subida,
 )
-from dashboard.services.video_commands import build_ffmpeg_command, remove_if_exists, run_command
+from dashboard.services.video_commands import (
+    build_ffmpeg_command,
+    remove_if_exists,
+    run_command,
+    validation_error_message,
+)
 
 _PATRON_NOMBRE_VIDEO = re.compile(
     r"^(?P<equipo>\d+)-(?P<fecha>\d{6})-(?P<inicio>\d{6})-(?P<fin>\d{6})-(?P<codigo>\d+)$"
@@ -30,6 +36,10 @@ _VIDEO_IMPORT_HASH_CHUNK_SIZE_DEFAULT = 1024 * 1024
 _VIDEO_IMPORT_MIN_FILE_AGE_SECONDS_DEFAULT = 15
 _VIDEO_IMPORT_STABILITY_CHECKS_DEFAULT = 2
 _VIDEO_IMPORT_STABILITY_INTERVAL_MS_DEFAULT = 1000
+_VIDEO_IMPORT_GROUP_GAP_TOLERANCE_SECONDS_DEFAULT = 2
+_VIDEO_IMPORT_MIN_FREE_SPACE_BYTES_DEFAULT = 100 * 1024 * 1024
+_VIDEO_IMPORT_TEMP_SPACE_FACTOR_DEFAULT = 3
+_VIDEO_IMPORT_STORAGE_SPACE_FACTOR_DEFAULT = 2
 
 
 def _get_int_setting(name: str, default: int, *, minimum: int = 0) -> int:
@@ -58,6 +68,24 @@ VIDEO_IMPORT_STABILITY_CHECKS = _get_int_setting(
 VIDEO_IMPORT_STABILITY_INTERVAL_MS = _get_int_setting(
     "VIDEO_IMPORT_STABILITY_INTERVAL_MS",
     _VIDEO_IMPORT_STABILITY_INTERVAL_MS_DEFAULT,
+)
+VIDEO_IMPORT_GROUP_GAP_TOLERANCE_SECONDS = _get_int_setting(
+    "VIDEO_IMPORT_GROUP_GAP_TOLERANCE_SECONDS",
+    _VIDEO_IMPORT_GROUP_GAP_TOLERANCE_SECONDS_DEFAULT,
+)
+VIDEO_IMPORT_MIN_FREE_SPACE_BYTES = _get_int_setting(
+    "VIDEO_IMPORT_MIN_FREE_SPACE_BYTES",
+    _VIDEO_IMPORT_MIN_FREE_SPACE_BYTES_DEFAULT,
+)
+VIDEO_IMPORT_TEMP_SPACE_FACTOR = _get_int_setting(
+    "VIDEO_IMPORT_TEMP_SPACE_FACTOR",
+    _VIDEO_IMPORT_TEMP_SPACE_FACTOR_DEFAULT,
+    minimum=1,
+)
+VIDEO_IMPORT_STORAGE_SPACE_FACTOR = _get_int_setting(
+    "VIDEO_IMPORT_STORAGE_SPACE_FACTOR",
+    _VIDEO_IMPORT_STORAGE_SPACE_FACTOR_DEFAULT,
+    minimum=1,
 )
 
 
@@ -130,6 +158,145 @@ def _duracion_esperada_segmento(parsed: dict) -> int:
     return int((fin_dt - inicio_dt).total_seconds())
 
 
+def _duracion_segundos(inicio_dt: datetime, fin_dt: datetime) -> int:
+    return max(1, int((fin_dt - inicio_dt).total_seconds()))
+
+
+def _fecha_material_desde_mtime(origen_real: str):
+    stat = _stat_archivo(origen_real)
+    return datetime.fromtimestamp(
+        stat.st_mtime,
+        tz=timezone.get_current_timezone(),
+    ).date()
+
+
+def _segmento_mapa(
+    *,
+    ruta_origen: str,
+    inicio_real: datetime,
+    fin_real: datetime,
+    segundo_inicio_video: int,
+) -> dict:
+    duracion_segmento = _duracion_segundos(inicio_real, fin_real)
+    segundo_fin_video = segundo_inicio_video + duracion_segmento - 1
+    return {
+        "ruta_origen": ruta_origen,
+        "inicio_real": inicio_real.isoformat(),
+        "fin_real": fin_real.isoformat(),
+        "duracion_real_segundos": duracion_segmento,
+        "segundo_inicio_video": segundo_inicio_video,
+        "segundo_fin_video": segundo_fin_video,
+    }
+
+
+def _ajustar_mapa_segmentos_a_duracion(
+    mapa_segmentos: list[dict],
+    duracion_total: int | None,
+) -> list[dict]:
+    if not mapa_segmentos or duracion_total is None or duracion_total <= 0:
+        return mapa_segmentos
+
+    mapa = [dict(segmento) for segmento in mapa_segmentos]
+    ultimo = mapa[-1]
+    segundo_fin_actual = int(ultimo.get("segundo_fin_video", -1))
+    delta = duracion_total - (segundo_fin_actual + 1)
+    if delta == 0:
+        return mapa
+
+    nuevo_fin = max(int(ultimo.get("segundo_inicio_video", 0)), segundo_fin_actual + delta)
+    ultimo["segundo_fin_video"] = nuevo_fin
+    ultimo["duracion_video_segundos"] = nuevo_fin - int(ultimo.get("segundo_inicio_video", 0)) + 1
+    if mapa[:-1]:
+        for segmento in mapa[:-1]:
+            segmento["duracion_video_segundos"] = (
+                int(segmento.get("segundo_fin_video", -1))
+                - int(segmento.get("segundo_inicio_video", 0))
+                + 1
+            )
+    return mapa
+
+
+def _construir_mapa_segmentos_contiguos(segmentos: list[dict]) -> list[dict]:
+    mapa = []
+    segundo_inicio = 0
+    fin_anterior = None
+    for segmento in segmentos:
+        inicio_dt = segmento["inicio_dt"]
+        fin_dt = segmento["fin_dt"]
+        if fin_anterior is not None:
+            gap = int((inicio_dt - fin_anterior).total_seconds())
+            if gap > VIDEO_IMPORT_GROUP_GAP_TOLERANCE_SECONDS:
+                raise ValidationError(
+                    "El grupo de segmentos está incompleto: faltan tramos intermedios "
+                    f"antes de {segmento['ruta_rel']}."
+                )
+            if gap < -VIDEO_IMPORT_GROUP_GAP_TOLERANCE_SECONDS:
+                raise ValidationError(
+                    "El grupo de segmentos se solapa en exceso y no se puede reconstruir "
+                    f"confiablemente cerca de {segmento['ruta_rel']}."
+                )
+        mapa_segmento = _segmento_mapa(
+            ruta_origen=segmento["ruta_rel"],
+            inicio_real=inicio_dt,
+            fin_real=fin_dt,
+            segundo_inicio_video=segundo_inicio,
+        )
+        mapa_segmento["duracion_video_segundos"] = mapa_segmento["duracion_real_segundos"]
+        mapa.append(mapa_segmento)
+        segundo_inicio = int(mapa_segmento["segundo_fin_video"]) + 1
+        fin_anterior = fin_dt
+    return mapa
+
+
+def _asegurar_cobertura_confiable(
+    *,
+    nombre_archivo: str,
+    validated_data: dict,
+    ruta_origen: str,
+    fecha_referencia,
+) -> tuple[datetime, datetime.time, int, list[dict], datetime.date]:
+    metadatos_nombre = inferir_metadatos_desde_nombre(nombre_archivo)
+    fecha_inicio = validated_data.get("fecha_inicio") or metadatos_nombre.get("fecha_inicio")
+    inicio_timestamp = (
+        validated_data.get("inicio_timestamp") or metadatos_nombre.get("inicio_timestamp")
+    )
+    duracion_esperada = (
+        validated_data.get("duracion_esperada_segundos")
+        or metadatos_nombre.get("duracion_esperada_segundos")
+    )
+    if duracion_esperada is None:
+        raise ValidationError(
+            "No se puede validar la completitud del video. "
+            "Use un nombre compatible o indique 'duracion_esperada_segundos'."
+        )
+    if fecha_inicio is None:
+        raise ValidationError(
+            "No se puede construir la cobertura temporal del video. "
+            "Use un nombre compatible o indique 'fecha_inicio'."
+        )
+    if timezone.is_naive(fecha_inicio):
+        fecha_inicio = timezone.make_aware(fecha_inicio, timezone.get_current_timezone())
+    inicio_timestamp = inicio_timestamp or timezone.localtime(fecha_inicio).time()
+    fecha_fin = fecha_inicio + timedelta(seconds=duracion_esperada)
+    mapa_segmentos = [
+        {
+            **_segmento_mapa(
+                ruta_origen=ruta_origen,
+                inicio_real=fecha_inicio,
+                fin_real=fecha_fin,
+                segundo_inicio_video=0,
+            ),
+            "duracion_video_segundos": duracion_esperada,
+        }
+    ]
+    fecha_material = metadatos_nombre.get("fecha_inicio", fecha_inicio)
+    if isinstance(fecha_material, datetime):
+        fecha_material = timezone.localtime(fecha_material).date()
+    elif not fecha_material:
+        fecha_material = fecha_referencia
+    return fecha_inicio, inicio_timestamp, duracion_esperada, mapa_segmentos, fecha_material
+
+
 def formatear_nombre_video(nombre_archivo: str) -> str:
     parsed = _parsear_nombre_video(nombre_archivo)
     if not parsed:
@@ -146,10 +313,22 @@ def inferir_metadatos_desde_nombre(nombre_archivo: str) -> dict:
     if not parsed:
         return {}
 
-    inicio_dt, _ = _intervalo_segmento(parsed)
+    inicio_dt, fin_dt = _intervalo_segmento(parsed)
     return {
         "fecha_inicio": inicio_dt,
         "inicio_timestamp": parsed["inicio"],
+        "fecha_material": parsed["fecha"],
+        "mapa_segmentos": [
+            {
+                **_segmento_mapa(
+                    ruta_origen=os.path.basename(nombre_archivo),
+                    inicio_real=inicio_dt,
+                    fin_real=fin_dt,
+                    segundo_inicio_video=0,
+                ),
+                "duracion_video_segundos": _duracion_esperada_segmento(parsed),
+            }
+        ],
         "duracion_esperada_segundos": _duracion_esperada_segmento(parsed),
     }
 
@@ -234,6 +413,30 @@ def _calcular_sha256_archivo(origen_real: str, firma_esperada: tuple[int, int]) 
     if firma_final != firma_esperada:
         raise ValidationError("El archivo cambió mientras se inspeccionaba; intente nuevamente.")
     return hasher.hexdigest()
+
+
+def _asegurar_espacio_disponible(ruta_base: str, bytes_necesarios: int, etiqueta: str) -> None:
+    try:
+        libre = shutil.disk_usage(ruta_base).free
+    except OSError as exc:
+        raise ValidationError(f"No se pudo verificar el espacio libre en {etiqueta}.") from exc
+    if libre < bytes_necesarios:
+        raise ValidationError(
+            f"No hay espacio suficiente en {etiqueta}: "
+            f"se requieren {bytes_necesarios} bytes libres y solo hay {libre}."
+        )
+
+
+def _asegurar_capacidad_temporal(bytes_estimados: int) -> None:
+    requerido = max(0, bytes_estimados * VIDEO_IMPORT_TEMP_SPACE_FACTOR)
+    requerido += VIDEO_IMPORT_MIN_FREE_SPACE_BYTES
+    _asegurar_espacio_disponible(tempfile.gettempdir(), requerido, "temporales")
+
+
+def _asegurar_capacidad_storage(bytes_estimados: int) -> None:
+    requerido = max(0, bytes_estimados * VIDEO_IMPORT_STORAGE_SPACE_FACTOR)
+    requerido += VIDEO_IMPORT_MIN_FREE_SPACE_BYTES
+    _asegurar_espacio_disponible(str(settings.MEDIA_ROOT), requerido, "MEDIA_ROOT")
 
 
 def inspeccionar_origen_importacion(origen_real: str) -> dict:
@@ -346,6 +549,7 @@ def _inspeccionar_segmentos_grupo(grupo: dict) -> dict:
         hash_grupo.update(inspeccion["sha256"].encode("utf-8"))
         hash_grupo.update(b"\n")
 
+    mapa_segmentos = _construir_mapa_segmentos_contiguos(segmentos)
     primer_segmento = segmentos[0]
     return {
         "grupo_origen": grupo["grupo_origen"],
@@ -356,8 +560,10 @@ def _inspeccionar_segmentos_grupo(grupo: dict) -> dict:
         "origen_tamano_bytes": total_bytes,
         "origen_modificado_en": ultima_modificacion,
         "fecha_inicio": primer_segmento["inicio_dt"],
+        "fecha_material": primer_segmento["parsed"]["fecha"],
         "inicio_timestamp": primer_segmento["parsed"]["inicio"],
         "duracion_esperada": duracion_esperada,
+        "mapa_segmentos": mapa_segmentos,
     }
 
 
@@ -371,7 +577,19 @@ def _construir_manifest_individual(
     if not nombre_archivo:
         raise ValidationError("Nombre de archivo inválido.")
 
-    metadatos_nombre = inferir_metadatos_desde_nombre(nombre_archivo)
+    fecha_referencia = _fecha_material_desde_mtime(origen_real)
+    (
+        fecha_inicio,
+        inicio_timestamp,
+        duracion_esperada,
+        mapa_segmentos,
+        fecha_material,
+    ) = _asegurar_cobertura_confiable(
+        nombre_archivo=nombre_archivo,
+        validated_data=validated_data,
+        ruta_origen=ruta_origen,
+        fecha_referencia=fecha_referencia,
+    )
     nombre_video = validated_data.get("nombre") or os.path.splitext(nombre_archivo)[0]
     extension = os.path.splitext(nombre_archivo)[1].lower()
     return {
@@ -383,11 +601,11 @@ def _construir_manifest_individual(
         "origen_sha256": inspeccion["sha256"],
         "origen_tamano_bytes": inspeccion["tamano_bytes"],
         "origen_modificado_en": inspeccion["modificado_en"],
-        "fecha_inicio": validated_data.get("fecha_inicio") or metadatos_nombre.get("fecha_inicio"),
-        "inicio_timestamp": (
-            validated_data.get("inicio_timestamp") or metadatos_nombre.get("inicio_timestamp")
-        ),
-        "duracion_esperada": metadatos_nombre.get("duracion_esperada_segundos"),
+        "fecha_inicio": fecha_inicio,
+        "fecha_material": fecha_material,
+        "inicio_timestamp": inicio_timestamp,
+        "duracion_esperada": duracion_esperada,
+        "mapa_segmentos": mapa_segmentos,
         "artifact_abs": origen_real,
         "artifact_cleanup": [],
         "firma_copia": inspeccion["firma"],
@@ -401,6 +619,7 @@ def _crear_temporal(suffix: str) -> str:
 
 def _concatenar_segmentos_binarios(segmentos: list[dict]) -> tuple[str, list[str]]:
     extension_salida = ".grec" if any(seg["extension"] == ".grec" for seg in segmentos) else ".h264"
+    _asegurar_capacidad_temporal(sum(seg["tamano_bytes"] for seg in segmentos))
     ruta_salida = _crear_temporal(extension_salida)
     try:
         with open(ruta_salida, "wb") as salida:
@@ -427,6 +646,7 @@ def _escribir_concat_list(rutas_mp4: list[str]) -> str:
 
 
 def _concatenar_mp4(rutas_mp4: list[str]) -> tuple[str, list[str]]:
+    _asegurar_capacidad_temporal(sum(os.path.getsize(ruta) for ruta in rutas_mp4 if os.path.exists(ruta)))
     ruta_lista = _escribir_concat_list(rutas_mp4)
     ruta_salida = _crear_temporal(".mp4")
     cleanup = [ruta_lista, ruta_salida]
@@ -475,6 +695,7 @@ def _concatenar_mp4(rutas_mp4: list[str]) -> tuple[str, list[str]]:
 def _normalizar_segmentos_a_mp4(segmentos: list[dict]) -> tuple[list[str], list[str]]:
     rutas_mp4 = []
     cleanup = []
+    _asegurar_capacidad_temporal(sum(seg["tamano_bytes"] for seg in segmentos))
     for segmento in segmentos:
         if segmento["extension"] == ".mp4":
             rutas_mp4.append(segmento["ruta_abs"])
@@ -498,10 +719,6 @@ def _materializar_artefacto_grupo(manifest: dict) -> tuple[str, list[str], str]:
         return segmentos[0]["ruta_abs"], [], f"{manifest['nombre_video']}{extension}"
 
     extensiones = {segmento["extension"] for segmento in segmentos}
-    if extensiones.issubset(H264_EXTENSIONS):
-        ruta_salida, cleanup = _concatenar_segmentos_binarios(segmentos)
-        return ruta_salida, cleanup, f"{manifest['nombre_video']}.h264"
-
     if extensiones == {".mp4"}:
         ruta_salida, cleanup = _concatenar_mp4([segmento["ruta_abs"] for segmento in segmentos])
         return ruta_salida, cleanup, f"{manifest['nombre_video']}.mp4"
@@ -530,10 +747,12 @@ def _construir_manifest_grupo(
         "origen_tamano_bytes": inspeccion["origen_tamano_bytes"],
         "origen_modificado_en": inspeccion["origen_modificado_en"],
         "fecha_inicio": validated_data.get("fecha_inicio") or inspeccion["fecha_inicio"],
+        "fecha_material": inspeccion["fecha_material"],
         "inicio_timestamp": (
             validated_data.get("inicio_timestamp") or inspeccion["inicio_timestamp"]
         ),
         "duracion_esperada": inspeccion["duracion_esperada"],
+        "mapa_segmentos": inspeccion["mapa_segmentos"],
         "segmentos": inspeccion["segmentos"],
     }
 
@@ -564,6 +783,7 @@ def copiar_archivo_a_storage(
     if firma_esperada is not None and _firma_stat(_stat_archivo(origen_real)) != firma_esperada:
         raise ValidationError("El archivo cambió antes de copiarse; espere a que termine la subida.")
 
+    _asegurar_capacidad_storage(_stat_archivo(origen_real).st_size)
     destino_rel = default_storage.get_available_name(os.path.join(carpeta_destino, nombre_archivo))
     with open(origen_real, "rb") as archivo_origen:
         destino_rel = default_storage.save(destino_rel, File(archivo_origen))
@@ -586,17 +806,116 @@ def eliminar_video_y_archivos(video: Video | None) -> None:
         video.delete()
 
 
+def _detalle_error_importacion(exc: Exception) -> str:
+    return validation_error_message(exc).strip()
+
+
+def _clasificar_error_importacion(exc: Exception) -> str:
+    detalle = _detalle_error_importacion(exc).lower()
+    if any(token in detalle for token in ("espacio", "media_root", "temporales")):
+        return "espacio"
+    if any(token in detalle for token in ("incompleto", "faltan tramos", "solapa", "completitud")):
+        return "completitud"
+    if any(token in detalle for token in ("reciente", "cambiando", "subirse", "copiaba")):
+        return "estabilidad"
+    if any(token in detalle for token in ("ffmpeg", "ffprobe", "convert", "mp4", "h264", "grec")):
+        return "ffmpeg"
+    if any(token in detalle for token in ("ruta", "directorio", "no existe")):
+        return "ruta"
+    return "validacion"
+
+
+def marcar_video_con_error(video: Video | None, exc: Exception) -> None:
+    if not video or not video.pk:
+        return
+    ruta_archivo = video.ruta_archivo.name or ""
+    if ruta_archivo:
+        default_storage.delete(ruta_archivo)
+    video.ruta_archivo.name = ""
+    video.estado = EstadoVideo.ERROR
+    video.error_tipo = _clasificar_error_importacion(exc)
+    video.detalle_error = _detalle_error_importacion(exc)
+    video.duracion = None
+    video.mimetype = ""
+    video.fin_timestamp = None
+    video.fecha_fin = None
+    video.mapa_segmentos = []
+    video.save(
+        update_fields=[
+            "ruta_archivo",
+            "estado",
+            "error_tipo",
+            "detalle_error",
+            "duracion",
+            "mimetype",
+            "fin_timestamp",
+            "fecha_fin",
+            "mapa_segmentos",
+        ]
+    )
+
+
+def crear_video_pendiente_desde_ruta_servidor(
+    validated_data: dict,
+    origen_real: str,
+    *,
+    ruta_origen: str,
+) -> Video:
+    nombre_archivo = get_valid_filename(os.path.basename(origen_real))
+    if not nombre_archivo:
+        raise ValidationError("Nombre de archivo inválido.")
+    metadatos_nombre = inferir_metadatos_desde_nombre(nombre_archivo)
+    fecha_inicio = validated_data.get("fecha_inicio") or metadatos_nombre.get("fecha_inicio")
+    if fecha_inicio and timezone.is_naive(fecha_inicio):
+        fecha_inicio = timezone.make_aware(fecha_inicio, timezone.get_current_timezone())
+    inicio_timestamp = (
+        validated_data.get("inicio_timestamp") or metadatos_nombre.get("inicio_timestamp")
+    )
+    fecha_subida = (
+        validated_data.get("fecha_subida")
+        or metadatos_nombre.get("fecha_material")
+        or _fecha_material_desde_mtime(origen_real)
+    )
+    nombre_video = validated_data.get("nombre") or os.path.splitext(nombre_archivo)[0]
+    return Video.objects.create(
+        nombre=nombre_video,
+        camara=validated_data["camara"],
+        ruta_archivo="",
+        ruta_origen=ruta_origen,
+        grupo_origen="",
+        segmentos_origen=[ruta_origen],
+        mapa_segmentos=[],
+        origen_sha256="",
+        origen_tamano_bytes=None,
+        origen_modificado_en=None,
+        mimetype="",
+        fecha_inicio=fecha_inicio,
+        fecha_fin=None,
+        duracion=None,
+        inicio_timestamp=inicio_timestamp,
+        fin_timestamp=None,
+        error_tipo="",
+        detalle_error="",
+        estado=EstadoVideo.PROCESANDO,
+        id_turno=validated_data["id_turno"],
+        fecha_subida=fecha_subida,
+    )
+
+
 def _buscar_video_existente(
     ruta_origen: str,
     validated_data: dict,
     *,
     grupo_origen: str = "",
     segmentos_origen: list[str] | None = None,
+    exclude_pk: int | None = None,
 ) -> Video | None:
     queryset = Video.objects.filter(
         id_turno=validated_data["id_turno"],
         camara=validated_data["camara"],
     ).order_by("-id")
+    if exclude_pk is not None:
+        queryset = queryset.exclude(pk=exclude_pk)
     if grupo_origen:
         existente = queryset.filter(grupo_origen=grupo_origen).first()
         if existente:
@@ -615,12 +934,19 @@ def _actualizar_campos_video(video: Video, validated_data: dict, manifest: dict,
     video.ruta_origen = manifest["ruta_origen"]
     video.grupo_origen = manifest["grupo_origen"]
     video.segmentos_origen = manifest["segmentos_origen"]
+    video.mapa_segmentos = list(manifest["mapa_segmentos"])
     video.origen_sha256 = manifest["origen_sha256"]
     video.origen_tamano_bytes = manifest["origen_tamano_bytes"]
     video.origen_modificado_en = manifest["origen_modificado_en"]
     video.fecha_inicio = manifest["fecha_inicio"]
-    video.fecha_subida = validated_data.get("fecha_subida") or timezone.localdate()
+    video.fecha_subida = validated_data.get("fecha_subida") or manifest["fecha_material"]
     video.inicio_timestamp = manifest["inicio_timestamp"]
+    video.fecha_fin = None
+    video.duracion = None
+    video.fin_timestamp = None
+    video.mimetype = ""
+    video.error_tipo = ""
+    video.detalle_error = ""
     video.id_turno = validated_data["id_turno"]
     video.estado = EstadoVideo.PROCESANDO
 
@@ -634,16 +960,72 @@ def _guardar_metadata_video(video: Video) -> None:
             "ruta_origen",
             "grupo_origen",
             "segmentos_origen",
+            "mapa_segmentos",
             "origen_sha256",
             "origen_tamano_bytes",
             "origen_modificado_en",
             "fecha_inicio",
+            "fecha_fin",
             "fecha_subida",
+            "duracion",
             "inicio_timestamp",
+            "fin_timestamp",
+            "mimetype",
+            "error_tipo",
+            "detalle_error",
             "id_turno",
             "estado",
         ]
     )
+
+
+def _sincronizar_con_video_existente(destino: Video, origen: Video) -> Video:
+    ruta_destino = destino.ruta_archivo.name or ""
+    if ruta_destino and ruta_destino != (origen.ruta_archivo.name or ""):
+        default_storage.delete(ruta_destino)
+    campos = [
+        "nombre",
+        "camara",
+        "ruta_origen",
+        "grupo_origen",
+        "segmentos_origen",
+        "mapa_segmentos",
+        "origen_sha256",
+        "origen_tamano_bytes",
+        "origen_modificado_en",
+        "mimetype",
+        "fecha_inicio",
+        "fecha_fin",
+        "duracion",
+        "inicio_timestamp",
+        "fin_timestamp",
+        "estado",
+        "id_turno",
+        "fecha_subida",
+        "error_tipo",
+        "detalle_error",
+    ]
+    destino.ruta_archivo.name = origen.ruta_archivo.name
+    for campo in campos:
+        setattr(destino, campo, getattr(origen, campo))
+    destino.save(update_fields=["ruta_archivo", *campos])
+    return destino
+
+
+def _validated_data_desde_video(
+    video: Video,
+    *,
+    duracion_esperada_segundos: int | None = None,
+) -> dict:
+    return {
+        "nombre": video.nombre,
+        "camara": video.camara,
+        "id_turno": video.id_turno,
+        "fecha_inicio": video.fecha_inicio,
+        "fecha_subida": video.fecha_subida,
+        "inicio_timestamp": video.inicio_timestamp,
+        "duracion_esperada_segundos": duracion_esperada_segundos,
+    }
 
 
 def crear_video_desde_serializer(serializer) -> Video:
@@ -662,6 +1044,7 @@ def crear_video_desde_ruta_servidor(
     origen_real: str,
     *,
     ruta_origen: str,
+    video_obj: Video | None = None,
 ) -> Video:
     manifest = _construir_manifest_importacion(validated_data, origen_real, ruta_origen)
     video_existente = _buscar_video_existente(
@@ -669,6 +1052,7 @@ def crear_video_desde_ruta_servidor(
         validated_data,
         grupo_origen=manifest["grupo_origen"],
         segmentos_origen=manifest["segmentos_origen"],
+        exclude_pk=getattr(video_obj, "pk", None),
     )
     if (
         video_existente
@@ -677,6 +1061,10 @@ def crear_video_desde_ruta_servidor(
         and video_existente.ruta_archivo.name
         and default_storage.exists(video_existente.ruta_archivo.name)
     ):
+        if video_obj and video_obj.pk != video_existente.pk:
+            sincronizado = _sincronizar_con_video_existente(video_obj, video_existente)
+            video_existente.delete()
+            return sincronizado
         return video_existente
 
     artifact_abs = manifest["artifact_abs"] if "artifact_abs" in manifest else None
@@ -687,53 +1075,68 @@ def crear_video_desde_ruta_servidor(
         artifact_cleanup.extend(cleanup_extra)
         manifest["nombre_destino"] = nombre_destino
     try:
+        ruta_anterior = ""
+        if video_obj is not None and video_obj.pk:
+            ruta_anterior = video_obj.ruta_archivo.name or ""
+        elif video_existente is not None and video_obj is None:
+            ruta_anterior = video_existente.ruta_archivo.name or ""
         destino_rel, _ = copiar_archivo_a_storage(
             artifact_abs,
             nombre_destino=manifest["nombre_destino"],
             firma_esperada=firma_copia,
         )
-        if video_existente:
-            ruta_anterior = video_existente.ruta_archivo.name or ""
-            _actualizar_campos_video(video_existente, validated_data, manifest, destino_rel)
-            try:
-                procesar_video_subida(
-                    video_existente,
-                    video_existente.ruta_archivo,
-                    duracion_esperada=manifest["duracion_esperada"],
+        video = video_obj
+        if video is None and video_existente is not None:
+            video = video_existente
+        if video is None:
+            with transaction.atomic():
+                video = Video.objects.create(
+                    nombre=manifest["nombre_video"],
+                    camara=validated_data["camara"],
+                    ruta_archivo=destino_rel,
+                    ruta_origen=manifest["ruta_origen"],
+                    grupo_origen=manifest["grupo_origen"],
+                    segmentos_origen=manifest["segmentos_origen"],
+                    mapa_segmentos=manifest["mapa_segmentos"],
+                    origen_sha256=manifest["origen_sha256"],
+                    origen_tamano_bytes=manifest["origen_tamano_bytes"],
+                    origen_modificado_en=manifest["origen_modificado_en"],
+                    fecha_inicio=manifest["fecha_inicio"],
+                    fecha_subida=validated_data.get("fecha_subida") or manifest["fecha_material"],
+                    inicio_timestamp=manifest["inicio_timestamp"],
+                    id_turno=validated_data["id_turno"],
+                    error_tipo="",
+                    detalle_error="",
                 )
-                _guardar_metadata_video(video_existente)
-            except Exception:
-                default_storage.delete(destino_rel)
-                raise
-            if ruta_anterior and ruta_anterior != video_existente.ruta_archivo.name:
-                default_storage.delete(ruta_anterior)
-            return video_existente
-
-        video = Video.objects.create(
-            nombre=manifest["nombre_video"],
-            camara=validated_data["camara"],
-            ruta_archivo=destino_rel,
-            ruta_origen=manifest["ruta_origen"],
-            grupo_origen=manifest["grupo_origen"],
-            segmentos_origen=manifest["segmentos_origen"],
-            origen_sha256=manifest["origen_sha256"],
-            origen_tamano_bytes=manifest["origen_tamano_bytes"],
-            origen_modificado_en=manifest["origen_modificado_en"],
-            fecha_inicio=manifest["fecha_inicio"],
-            fecha_subida=validated_data.get("fecha_subida") or timezone.localdate(),
-            inicio_timestamp=manifest["inicio_timestamp"],
-            id_turno=validated_data["id_turno"],
-        )
+        else:
+            _actualizar_campos_video(video, validated_data, manifest, destino_rel)
+            with transaction.atomic():
+                _guardar_metadata_video(video)
         try:
             procesar_video_subida(
                 video,
                 video.ruta_archivo,
                 duracion_esperada=manifest["duracion_esperada"],
             )
+            video.mapa_segmentos = _ajustar_mapa_segmentos_a_duracion(
+                manifest["mapa_segmentos"],
+                video.duracion,
+            )
             _guardar_metadata_video(video)
-        except Exception:
-            eliminar_video_y_archivos(video)
+        except Exception as exc:
+            default_storage.delete(destino_rel)
+            if video_obj is not None:
+                marcar_video_con_error(video, exc)
+            else:
+                eliminar_video_y_archivos(video)
             raise
+        if video_existente and video_obj and video_existente.pk != video.pk:
+            ruta_existente = video_existente.ruta_archivo.name or ""
+            if ruta_existente and ruta_existente != video.ruta_archivo.name:
+                default_storage.delete(ruta_existente)
+            video_existente.delete()
+        if ruta_anterior and ruta_anterior != video.ruta_archivo.name:
+            default_storage.delete(ruta_anterior)
         return video
     finally:
         for ruta in artifact_cleanup:

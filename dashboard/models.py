@@ -93,14 +93,18 @@ class Video(models.Model):
     ruta_origen = models.CharField(max_length=500, blank=True, default="")
     grupo_origen = models.CharField(max_length=255, blank=True, default="")
     segmentos_origen = models.JSONField(default=list, blank=True)
+    mapa_segmentos = models.JSONField(default=list, blank=True)
     origen_sha256 = models.CharField(max_length=64, blank=True, default="")
     origen_tamano_bytes = models.BigIntegerField(null=True, blank=True)
     origen_modificado_en = models.DateTimeField(null=True, blank=True)
     mimetype = models.CharField(max_length=100, blank=True, default="")
     fecha_inicio = models.DateTimeField(null=True, blank=True)
+    fecha_fin = models.DateTimeField(null=True, blank=True)
     duracion = models.IntegerField(null=True, blank=True)
     inicio_timestamp = models.TimeField(default=time(0, 0), null=True, blank=True)
     fin_timestamp = models.TimeField(null=True, blank=True)
+    error_tipo = models.CharField(max_length=50, blank=True, default="")
+    detalle_error = models.TextField(blank=True, default="")
     estado = models.CharField(
         max_length=20,
         choices=EstadoVideo.choices,

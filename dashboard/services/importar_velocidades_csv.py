@@ -65,6 +65,71 @@ def _detectar_dialecto(texto):
         return csv.excel_tab
 
 
+def _parsear_iso_datetime(valor):
+    if not valor:
+        return None
+    try:
+        dt = datetime.datetime.fromisoformat(str(valor))
+    except ValueError:
+        return None
+    if timezone.is_naive(dt):
+        return timezone.make_aware(dt, timezone.get_current_timezone())
+    return dt
+
+
+def _cargar_mapa_segmentos(video):
+    segmentos = []
+    for segmento in video.mapa_segmentos or []:
+        inicio_real = _parsear_iso_datetime(segmento.get("inicio_real"))
+        fin_real = _parsear_iso_datetime(segmento.get("fin_real"))
+        if not inicio_real or not fin_real or fin_real <= inicio_real:
+            continue
+        try:
+            segundo_inicio = int(segmento.get("segundo_inicio_video"))
+            segundo_fin = int(segmento.get("segundo_fin_video"))
+        except (TypeError, ValueError):
+            continue
+        if segundo_fin < segundo_inicio:
+            continue
+        segmentos.append(
+            {
+                "inicio_real": inicio_real,
+                "fin_real": fin_real,
+                "segundo_inicio_video": segundo_inicio,
+                "segundo_fin_video": segundo_fin,
+            }
+        )
+    segmentos.sort(key=lambda item: (item["segundo_inicio_video"], item["inicio_real"]))
+    return segmentos
+
+
+def _segundo_desde_timestamp(timestamp, base_ts, mapa_segmentos):
+    if mapa_segmentos:
+        for segmento in mapa_segmentos:
+            if not (segmento["inicio_real"] <= timestamp < segmento["fin_real"]):
+                continue
+            delta = int((timestamp - segmento["inicio_real"]).total_seconds())
+            segundo = segmento["segundo_inicio_video"] + delta
+            return min(segundo, segmento["segundo_fin_video"])
+        return None
+    return int((timestamp - base_ts).total_seconds())
+
+
+def _timestamp_desde_segundo(segundo, base_ts, mapa_segmentos):
+    if mapa_segmentos:
+        for segmento in mapa_segmentos:
+            if not (
+                segmento["segundo_inicio_video"]
+                <= segundo
+                <= segmento["segundo_fin_video"]
+            ):
+                continue
+            delta = segundo - segmento["segundo_inicio_video"]
+            return segmento["inicio_real"] + datetime.timedelta(seconds=delta)
+        return None
+    return base_ts + datetime.timedelta(seconds=segundo)
+
+
 def importar_velocidades_csv(video, archivo):
     duracion = video.duracion
     if duracion is None or duracion <= 0:
@@ -125,6 +190,7 @@ def importar_velocidades_csv(video, archivo):
     if not muestras_raw:
         raise ValidationError("No se encontraron filas con velocidad valida.")
 
+    mapa_segmentos = _cargar_mapa_segmentos(video)
     base_ts = video.fecha_inicio or min(timestamp for timestamp, _, _ in muestras_raw)
     if timezone.is_naive(base_ts):
         base_ts = timezone.make_aware(base_ts, timezone.get_current_timezone())
@@ -132,7 +198,10 @@ def importar_velocidades_csv(video, archivo):
     muestras_timestamp = {}
 
     for timestamp, velocidad, _ in muestras_raw:
-        segundo = int((timestamp - base_ts).total_seconds())
+        segundo = _segundo_desde_timestamp(timestamp, base_ts, mapa_segmentos)
+        if segundo is None:
+            descartadas += 1
+            continue
         if segundo < 0 or segundo > ultimo_segundo:
             descartadas += 1
             continue
@@ -153,7 +222,7 @@ def importar_velocidades_csv(video, archivo):
 
     for segundo in range(0, ultimo_segundo + 1):
         if segundo < primer_segundo:
-            timestamp = base_ts + datetime.timedelta(seconds=segundo)
+            timestamp = _timestamp_desde_segundo(segundo, base_ts, mapa_segmentos)
             registros[segundo] = VelocidadVideo(
                 video=video,
                 segundo=segundo,
@@ -177,7 +246,7 @@ def importar_velocidades_csv(video, archivo):
             continue
         if ultimo_valor is None:
             continue
-        timestamp = base_ts + datetime.timedelta(seconds=segundo)
+        timestamp = _timestamp_desde_segundo(segundo, base_ts, mapa_segmentos)
         registros[segundo] = VelocidadVideo(
             video=video,
             segundo=segundo,
