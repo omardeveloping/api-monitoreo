@@ -287,91 +287,30 @@ def _timestamp_para_segundo_mapeado(segundo, segmentos):
     return None
 
 
-def importar_velocidades_tabulares(video, fieldnames, filas_iterable):
-    turno = getattr(video, "id_turno", None)
-    if turno is None:
-        raise ValidationError("El video no tiene turno asociado.")
+def _asegurar_timezone(dt):
+    if timezone.is_naive(dt):
+        return timezone.make_aware(dt, timezone.get_current_timezone())
+    return dt
 
-    duracion = video.duracion
-    if duracion is None or duracion <= 0:
-        raise ValidationError("El video no tiene una duracion valida.")
-    ultimo_segundo = int(duracion) - 1
-    if ultimo_segundo < 0:
-        raise ValidationError("El video no tiene segundos disponibles.")
 
-    if not fieldnames:
-        raise ValidationError("El archivo no tiene encabezados.")
+def _obtener_rango_turno(turno):
+    fecha = getattr(turno, "fecha", None)
+    hora_inicio = getattr(turno, "hora_inicio", None)
+    hora_fin = getattr(turno, "hora_fin", None)
+    if fecha is None or hora_inicio is None or hora_fin is None:
+        raise ValidationError("El turno no tiene horario valido.")
 
-    columnas = _resolver_columnas(fieldnames)
-    muestras_raw, filas, descartadas = _iterar_muestras_validas(filas_iterable, columnas)
+    inicio = _asegurar_timezone(datetime.datetime.combine(fecha, hora_inicio))
+    fecha_fin = fecha
+    if hora_fin <= hora_inicio:
+        fecha_fin += datetime.timedelta(days=1)
+    fin = _asegurar_timezone(datetime.datetime.combine(fecha_fin, hora_fin))
+    if fin <= inicio:
+        raise ValidationError("El turno no tiene una duracion valida.")
+    return inicio, fin
 
-    if not muestras_raw:
-        raise ValidationError("No se encontraron filas con velocidad valida.")
 
-    base_ts = video.fecha_inicio or min(timestamp for timestamp, _, _ in muestras_raw)
-    if timezone.is_naive(base_ts):
-        base_ts = timezone.make_aware(base_ts, timezone.get_current_timezone())
-
-    muestras_raw_ordenadas = sorted(muestras_raw, key=lambda x: (x[0], x[2]))
-    mapa_segmentos = _obtener_mapa_segmentos(video)
-    usar_mapa_segmentos = bool(mapa_segmentos)
-    compactar_saltos = (
-        (not usar_mapa_segmentos)
-        and COMPACTAR_SALTOS_RELOJ_MDVR
-        and _es_video_mdvr(video)
-        and _debe_compactar_saltos_mdvr(muestras_raw_ordenadas, base_ts, ultimo_segundo)
-    )
-    paso_referencia = (
-        _calcular_paso_referencia(muestras_raw_ordenadas)
-        if compactar_saltos
-        else 0
-    )
-
-    muestras = {}
-    muestras_timestamp = {}
-    timestamp_previo = None
-    segundo_compactado = None
-    indice_segmento = 0
-
-    for timestamp, velocidad, _ in muestras_raw_ordenadas:
-        if usar_mapa_segmentos:
-            segundo, indice_segmento = _mapear_segundo_con_segmentos(
-                timestamp,
-                mapa_segmentos,
-                indice_inicio=indice_segmento,
-            )
-            if segundo is None:
-                descartadas += 1
-                continue
-        else:
-            segundo = int((timestamp - base_ts).total_seconds())
-        if compactar_saltos:
-            if segundo_compactado is None:
-                segundo_compactado = segundo
-            else:
-                delta = int((timestamp - timestamp_previo).total_seconds())
-                if delta < 0:
-                    timestamp_previo = timestamp
-                    continue
-                if delta > UMBRAL_SALTO_RELOJ_SEGUNDOS:
-                    delta = paso_referencia
-                segundo_compactado += delta
-            timestamp_previo = timestamp
-            segundo = segundo_compactado
-
-        if segundo < 0 or segundo > ultimo_segundo:
-            descartadas += 1
-            continue
-        existente_ts = muestras_timestamp.get(segundo)
-        if existente_ts is None or timestamp >= existente_ts:
-            muestras[segundo] = velocidad
-            muestras_timestamp[segundo] = timestamp
-
-    if not muestras:
-        raise ValidationError(
-            "No hay muestras dentro de la duracion del video."
-        )
-
+def _construir_registros_turno(turno, base_ts, ultimo_segundo, muestras, muestras_timestamp):
     registros = {}
     interpoladas = 0
     ultimo_valor = None
@@ -379,16 +318,8 @@ def importar_velocidades_tabulares(video, fieldnames, filas_iterable):
     primer_segundo = min(muestras.keys())
 
     for segundo in range(0, ultimo_segundo + 1):
-        timestamp_mapeado = (
-            _timestamp_para_segundo_mapeado(segundo, mapa_segmentos)
-            if usar_mapa_segmentos
-            else None
-        )
+        timestamp = base_ts + datetime.timedelta(seconds=segundo)
         if segundo < primer_segundo:
-            if usar_mapa_segmentos:
-                timestamp = timestamp_mapeado
-            else:
-                timestamp = base_ts + datetime.timedelta(seconds=segundo)
             registros[segundo] = VelocidadTurno(
                 turno=turno,
                 segundo=segundo,
@@ -413,21 +344,6 @@ def importar_velocidades_tabulares(video, fieldnames, filas_iterable):
             continue
         if ultimo_valor is None:
             continue
-        if usar_mapa_segmentos:
-            timestamp = timestamp_mapeado
-        else:
-            timestamp = base_ts + datetime.timedelta(seconds=segundo)
-        if usar_mapa_segmentos and timestamp is None:
-            registros[segundo] = VelocidadTurno(
-                turno=turno,
-                segundo=segundo,
-                velocidad_kmh=0,
-                timestamp_csv=None,
-                interpolado=True,
-                sin_datos=True,
-            )
-            interpoladas += 1
-            continue
         gap_desde_muestra = (
             segundo - ultimo_segundo_con_muestra
             if ultimo_segundo_con_muestra is not None
@@ -446,6 +362,54 @@ def importar_velocidades_tabulares(video, fieldnames, filas_iterable):
             sin_datos=sin_datos,
         )
         interpoladas += 1
+
+    return registros, interpoladas
+
+
+def importar_velocidades_tabulares(video, fieldnames, filas_iterable):
+    turno = getattr(video, "id_turno", None)
+    if turno is None:
+        raise ValidationError("El video no tiene turno asociado.")
+
+    inicio_turno, fin_turno = _obtener_rango_turno(turno)
+    ultimo_segundo = int((fin_turno - inicio_turno).total_seconds()) - 1
+    if ultimo_segundo < 0:
+        raise ValidationError("El turno no tiene segundos disponibles.")
+
+    if not fieldnames:
+        raise ValidationError("El archivo no tiene encabezados.")
+
+    columnas = _resolver_columnas(fieldnames)
+    muestras_raw, filas, descartadas = _iterar_muestras_validas(filas_iterable, columnas)
+
+    if not muestras_raw:
+        raise ValidationError("No se encontraron filas con velocidad valida.")
+
+    muestras_raw_ordenadas = sorted(muestras_raw, key=lambda x: (x[0], x[2]))
+    muestras = {}
+    muestras_timestamp = {}
+
+    for timestamp, velocidad, _ in muestras_raw_ordenadas:
+        timestamp = _asegurar_timezone(timestamp)
+        segundo = int((timestamp - inicio_turno).total_seconds())
+        if segundo < 0 or segundo > ultimo_segundo:
+            descartadas += 1
+            continue
+        existente_ts = muestras_timestamp.get(segundo)
+        if existente_ts is None or timestamp >= existente_ts:
+            muestras[segundo] = velocidad
+            muestras_timestamp[segundo] = timestamp
+
+    if not muestras:
+        raise ValidationError("No hay muestras dentro del rango del turno.")
+
+    registros, interpoladas = _construir_registros_turno(
+        turno,
+        inicio_turno,
+        ultimo_segundo,
+        muestras,
+        muestras_timestamp,
+    )
 
     VelocidadTurno.objects.filter(turno=turno).delete()
     VelocidadTurno.objects.bulk_create(list(registros.values()), batch_size=1000)
