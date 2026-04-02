@@ -90,6 +90,12 @@ class Video(models.Model):
     nombre = models.CharField(max_length=100)
     camara = models.IntegerField(choices=NumeroCamara.choices)
     ruta_archivo = models.FileField(upload_to='videos/')
+    ruta_origen = models.CharField(max_length=500, blank=True, default="")
+    grupo_origen = models.CharField(max_length=255, blank=True, default="")
+    segmentos_origen = models.JSONField(default=list, blank=True)
+    origen_sha256 = models.CharField(max_length=64, blank=True, default="")
+    origen_tamano_bytes = models.BigIntegerField(null=True, blank=True)
+    origen_modificado_en = models.DateTimeField(null=True, blank=True)
     mimetype = models.CharField(max_length=100, blank=True, default="")
     fecha_inicio = models.DateTimeField(null=True, blank=True)
     duracion = models.IntegerField(null=True, blank=True)
@@ -103,6 +109,18 @@ class Video(models.Model):
     id_turno = models.ForeignKey(Turno, on_delete=models.CASCADE)
     creado_en = models.DateTimeField(auto_now_add=True)
     fecha_subida = models.DateField(default=timezone.localdate)
+
+    class Meta:
+        indexes = [
+            models.Index(
+                fields=["ruta_origen", "id_turno", "camara"],
+                name="video_origen_turno_camara_idx",
+            ),
+            models.Index(
+                fields=["grupo_origen", "id_turno", "camara"],
+                name="video_grupo_turno_camara_idx",
+            ),
+        ]
 
     def __str__(self):
         return self.nombre

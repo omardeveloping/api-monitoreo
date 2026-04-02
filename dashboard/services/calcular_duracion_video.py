@@ -40,6 +40,7 @@ PERMISOS_ARCHIVO_VIDEO = 0o644
 _AUDIO_SAMPLE_RATE_MP4_DEFAULT = 44100
 _AUDIO_SAMPLE_RATE_MIN_DEFAULT = 22050
 _FPS_DIFF_UMBRAL_DEFAULT = 0.02
+_VIDEO_IMPORT_DURATION_TOLERANCE_DEFAULT = 2
 MP4_VIDEO_PROFILE = (os.environ.get("MP4_VIDEO_PROFILE", "baseline") or "").strip().lower()
 MP4_VIDEO_LEVEL = (os.environ.get("MP4_VIDEO_LEVEL", "") or "").strip()
 MP4_TARGET_FPS = (os.environ.get("MP4_TARGET_FPS", "") or "").strip()
@@ -59,6 +60,15 @@ try:
     FPS_DIFF_UMBRAL = float(os.environ.get("MP4_FPS_DIFF_UMBRAL", _FPS_DIFF_UMBRAL_DEFAULT))
 except ValueError:
     FPS_DIFF_UMBRAL = _FPS_DIFF_UMBRAL_DEFAULT
+try:
+    VIDEO_IMPORT_DURATION_TOLERANCE_SECONDS = int(
+        os.environ.get(
+            "VIDEO_IMPORT_DURATION_TOLERANCE_SECONDS",
+            _VIDEO_IMPORT_DURATION_TOLERANCE_DEFAULT,
+        )
+    )
+except ValueError:
+    VIDEO_IMPORT_DURATION_TOLERANCE_SECONDS = _VIDEO_IMPORT_DURATION_TOLERANCE_DEFAULT
 
 
 def _tiene_start_codes(ruta_h264):
@@ -178,6 +188,10 @@ def _obtener_streams(ruta_video):
         error_prefix="No se pudo inspeccionar los streams del video",
     )
     return data.get("streams", [])
+
+
+def _extension_video(nombre_archivo: str) -> str:
+    return os.path.splitext(nombre_archivo or "")[1].lower()
 
 
 def _seleccionar_stream_video(streams):
@@ -372,7 +386,7 @@ def asegurar_mp4_compatible(ruta_mp4):
 def validar_formato(video):
     content_type = (getattr(video, "content_type", "") or "").lower()
     nombre_archivo = getattr(video, "name", "") or ""
-    extension = os.path.splitext(nombre_archivo)[1].lower()
+    extension = _extension_video(nombre_archivo)
 
     permitido_por_content_type = content_type in FORMATO_VIDEO_VALIDO
     permitido_por_extension = extension in EXTENSIONES_VALIDAS
@@ -381,6 +395,40 @@ def validar_formato(video):
         raise ValidationError(
             "Formato de video no válido. Solo se permiten archivos MP4, H264 o GREC."
         )
+
+
+def _raw_h264_parece_valido(ruta_h264: str) -> bool:
+    if _tiene_start_codes(ruta_h264):
+        return True
+    if _buscar_offset_start_code(ruta_h264, max_bytes=MAX_BYTES_START_CODES) is not None:
+        return True
+    for longitud in LONGITUDES_NAL_H264:
+        if _buscar_offset_longitudes(ruta_h264, longitud) is not None:
+            return True
+    return False
+
+
+def prevalidar_video_origen(ruta_video: str) -> None:
+    extension = _extension_video(ruta_video)
+    if extension not in EXTENSIONES_VALIDAS:
+        raise ValidationError(
+            "Formato de video no válido. Solo se permiten archivos MP4, H264 o GREC."
+        )
+    try:
+        if os.path.getsize(ruta_video) <= 0:
+            raise ValidationError("El archivo de video está vacío o aún no terminó de subirse.")
+    except OSError as exc:
+        raise ValidationError("No se pudo acceder al archivo de video origen.") from exc
+
+    if extension == ".mp4":
+        stream_info = _seleccionar_stream_video(_obtener_streams(ruta_video))
+        if not stream_info:
+            raise ValidationError("El archivo MP4 origen no contiene pista de video.")
+        calcular_duracion_video(ruta_video)
+        return
+
+    if not _raw_h264_parece_valido(ruta_video):
+        raise ValidationError("El archivo H264/GREC origen no parece contener un stream válido.")
 
 
 def _crear_temporal(suffix: str, *, dir: str | None = None) -> str:
@@ -545,10 +593,10 @@ def calcular_duracion_video(video):
     return datetime.timedelta(seconds=seconds).total_seconds()
 
 
-def procesar_video_subida(video_obj, archivo):
+def procesar_video_subida(video_obj, archivo, *, duracion_esperada: int | None = None):
     """
     Valida, convierte H264 a MP4 si es necesario, calcula duración y persiste cambios.
-    Elimina archivos y el registro si ocurre algún error para evitar residuos.
+    Elimina residuos del filesystem si ocurre algún error para evitar basura parcial.
     """
     validar_formato(archivo)
     content_type = (getattr(archivo, "content_type", "") or "").lower()
@@ -566,7 +614,18 @@ def procesar_video_subida(video_obj, archivo):
         if ruta_final.lower().endswith(".mp4"):
             asegurar_mp4_compatible(ruta_final)
 
-        video_obj.duracion = math.floor(calcular_duracion_video(video_obj.ruta_archivo.path))
+        duracion_real = calcular_duracion_video(video_obj.ruta_archivo.path)
+        if (
+            duracion_esperada is not None
+            and duracion_real + VIDEO_IMPORT_DURATION_TOLERANCE_SECONDS < duracion_esperada
+        ):
+            raise ValidationError(
+                "El video parece incompleto: "
+                f"se esperaban al menos {duracion_esperada}s y solo se obtuvieron "
+                f"{math.floor(duracion_real)}s."
+            )
+
+        video_obj.duracion = math.floor(duracion_real)
         video_obj.estado = EstadoVideo.LISTO
 
         inicio = video_obj.inicio_timestamp or datetime.time(0, 0)
@@ -590,10 +649,9 @@ def procesar_video_subida(video_obj, archivo):
         if ruta_convertida and ruta_convertida != ruta_original:
             remove_if_exists(ruta_original)
     except Exception:
+        remove_if_exists(ruta_original)
         if ruta_convertida and ruta_convertida != ruta_original:
             remove_if_exists(ruta_convertida)
-        video_obj.estado = EstadoVideo.ERROR
-        video_obj.save(update_fields=["estado"])
         raise
 
     return video_obj
