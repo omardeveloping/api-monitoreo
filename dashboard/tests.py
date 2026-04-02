@@ -37,7 +37,12 @@ from dashboard.services.importar_videos_mdvr import (
     _puede_reprocesarse,
     _segmento_desde_archivo,
 )
-from dashboard.views import EspacioDiscoViewSet, IncidenteViewSet, _listar_montajes_disponibles
+from dashboard.views import (
+    EspacioDiscoViewSet,
+    IncidenteViewSet,
+    TurnoViewSet,
+    _listar_montajes_disponibles,
+)
 
 
 class ProcesamientoVideoTimerTests(TestCase):
@@ -137,6 +142,69 @@ class ProcesamientoVideoTimerTests(TestCase):
         data = VideoSerializer(video).data
         self.assertIsNotNone(data["ruta_archivo"])
         self.assertEqual(data["duracion"], 1504)
+
+    def test_serializer_compatibilidad_reproductor_marca_incompleto_como_listo(self):
+        camion = Camion.objects.create(patente="BKCD97", carpeta_id="4462510997")
+        turno = Turno.objects.create(
+            fecha=datetime.date(2026, 3, 4),
+            id_camion=camion,
+            tipo_turno=TipoTurnoChoices.TARDE,
+            hora_inicio=datetime.time(16, 0),
+            hora_fin=datetime.time(0, 0),
+        )
+        video = Video.objects.create(
+            nombre="video_incompleto_playable",
+            camara=2,
+            ruta_archivo="videos/video_incompleto_playable.mp4",
+            id_turno=turno,
+            estado=EstadoVideo.INCOMPLETO,
+            duracion=321,
+            inicio_timestamp=datetime.time(16, 0, 0),
+            fin_timestamp=datetime.time(16, 5, 21),
+            error_tipo="incompleto",
+            detalle_error="faltan segmentos",
+        )
+
+        data = VideoSerializer(
+            video,
+            context={"compat_playable_incomplete": True},
+        ).data
+
+        self.assertEqual(data["estado"], EstadoVideo.LISTO)
+        self.assertEqual(data["estado_real"], EstadoVideo.INCOMPLETO)
+        self.assertTrue(data["reproducible_con_advertencia"])
+        self.assertIsNotNone(data["ruta_archivo"])
+
+    def test_endpoint_videos_turno_compatibiliza_incompleto_para_reproductor(self):
+        camion = Camion.objects.create(patente="BKCD96", carpeta_id="4462510996")
+        turno = Turno.objects.create(
+            fecha=datetime.date(2026, 3, 4),
+            id_camion=camion,
+            tipo_turno=TipoTurnoChoices.TARDE,
+            hora_inicio=datetime.time(16, 0),
+            hora_fin=datetime.time(0, 0),
+        )
+        Video.objects.create(
+            nombre="video_turno_incompleto",
+            camara=3,
+            ruta_archivo="videos/video_turno_incompleto.mp4",
+            id_turno=turno,
+            estado=EstadoVideo.INCOMPLETO,
+            duracion=654,
+            inicio_timestamp=datetime.time(16, 0, 0),
+            fin_timestamp=datetime.time(16, 10, 54),
+            error_tipo="incompleto",
+            detalle_error="faltan segmentos",
+        )
+
+        request = APIRequestFactory().get(f"/dashboard/turnos/{turno.id}/videos/")
+        response = TurnoViewSet.as_view({"get": "videos"})(request, pk=turno.id)
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(len(response.data), 1)
+        self.assertEqual(response.data[0]["estado"], EstadoVideo.LISTO)
+        self.assertEqual(response.data[0]["estado_real"], EstadoVideo.INCOMPLETO)
+        self.assertTrue(response.data[0]["reproducible_con_advertencia"])
 
     def test_serializer_expone_tiempo_actual_mientras_procesa(self):
         camion = Camion.objects.create(patente="BKCE00", carpeta_id="4462511000")
@@ -308,6 +376,75 @@ class ImportarMdvrBackfillVelocidadesTests(TestCase):
             ruta_xlsx = os.path.join(
                 base_dir,
                 "4462510196 2026-02-18 00-00-00~2026-02-18 23-59-59.xlsx",
+            )
+            with open(ruta_xlsx, "wb") as fh:
+                fh.write(b"dummy-xlsx")
+
+            with patch(
+                "dashboard.services.importar_videos_mdvr.MIN_ANTIGUEDAD_ARCHIVO_SEGUNDOS",
+                0,
+            ), patch(
+                "dashboard.services.importar_videos_mdvr.importar_velocidades_xlsx",
+                return_value={"guardadas": 1},
+            ) as importar_mock, patch(
+                "dashboard.services.importar_videos_mdvr.procesar_video_subida"
+            ) as procesar_video_mock:
+                detalle = _importar_camion_mdvr(
+                    camion=camion,
+                    base_dir=base_dir,
+                    importar_velocidades=True,
+                    fecha_objetivo=datetime.date(2026, 2, 18),
+                )
+
+        self.assertEqual(detalle["videos_creados"], 0)
+        self.assertEqual(importar_mock.call_count, 1)
+        self.assertEqual(importar_mock.call_args.args[0].id, video.id)
+        procesar_video_mock.assert_not_called()
+
+        video.refresh_from_db()
+        self.assertEqual(video.estado_velocidades, EstadoVelocidadesVideo.IMPORTADA)
+        self.assertEqual(video.velocidades_error, "")
+        self.assertIsNotNone(video.velocidades_actualizadas_en)
+
+    def test_video_incompleto_pendiente_reintenta_carga_xlsx(self):
+        camion = Camion.objects.create(
+            patente="BKCD10",
+            carpeta_id="4462510195",
+        )
+        turno = Turno.objects.create(
+            fecha=datetime.date(2026, 2, 18),
+            id_camion=camion,
+            tipo_turno=TipoTurnoChoices.MANANA,
+            hora_inicio=datetime.time(8, 0),
+            hora_fin=datetime.time(16, 0),
+        )
+        video = Video.objects.create(
+            nombre="MDVR_4462510195_2026-02-18_manana_C3",
+            camara=3,
+            ruta_archivo="videos/existente_incompleto.mp4",
+            fecha_inicio=timezone.make_aware(datetime.datetime(2026, 2, 18, 8, 0, 47)),
+            fecha_subida=datetime.date(2026, 2, 19),
+            inicio_timestamp=datetime.time(8, 0, 47),
+            estado=EstadoVideo.INCOMPLETO,
+            estado_velocidades=EstadoVelocidadesVideo.PENDIENTE,
+            id_turno=turno,
+        )
+
+        with tempfile.TemporaryDirectory() as base_dir:
+            carpeta_mdvr = os.path.join(base_dir, "4462510195(4462510195)")
+            carpeta_dia = os.path.join(carpeta_mdvr, "2026-02-18")
+            os.makedirs(carpeta_dia, exist_ok=True)
+
+            segmento = os.path.join(
+                carpeta_dia,
+                "4462510195-260218-080047-080047-20010300.mp4",
+            )
+            with open(segmento, "wb") as fh:
+                fh.write(b"dummy-segment")
+
+            ruta_xlsx = os.path.join(
+                base_dir,
+                "4462510195 2026-02-18 00-00-00~2026-02-18 23-59-59.xlsx",
             )
             with open(ruta_xlsx, "wb") as fh:
                 fh.write(b"dummy-xlsx")

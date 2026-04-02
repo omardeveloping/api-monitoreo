@@ -201,7 +201,10 @@ class TurnoViewSet(viewsets.ModelViewSet):
         turno = self.get_object()
         videos = Video.objects.filter(id_turno=turno).order_by("id")
         page = self.paginate_queryset(videos)
-        serializer_context = {"request": request}
+        serializer_context = {
+            "request": request,
+            "compat_playable_incomplete": True,
+        }
         if page is not None:
             serializer = VideoSerializer(page, many=True, context=serializer_context)
             return self.get_paginated_response(serializer.data)

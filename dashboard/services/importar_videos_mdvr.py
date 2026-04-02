@@ -330,6 +330,34 @@ def _seleccionar_xlsx(xlsx_files: list[XlsxInfo], fecha_inicio: datetime.datetim
     return min(candidatos, key=lambda info: info.fin - info.inicio)
 
 
+def _programar_importacion_velocidades_turno(
+    *,
+    turno: Turno,
+    video_ref: Video,
+    xlsx_files: list[XlsxInfo],
+    fecha_inicio: datetime.datetime,
+    xlsx_por_turno: dict[int, str],
+    videos_referencia_por_turno: dict[int, Video],
+):
+    xlsx_info = _seleccionar_xlsx(xlsx_files, fecha_inicio)
+    if xlsx_info:
+        if turno.id not in xlsx_por_turno:
+            xlsx_por_turno[turno.id] = xlsx_info.ruta
+            videos_referencia_por_turno[turno.id] = video_ref
+        _actualizar_estado_velocidades_turno(
+            turno,
+            EstadoVelocidadesVideo.PENDIENTE,
+        )
+        return True
+
+    _actualizar_estado_velocidades_turno(
+        turno,
+        EstadoVelocidadesVideo.SIN_XLSX,
+        error="No se encontró XLSX que cubra la fecha/hora de inicio del video.",
+    )
+    return False
+
+
 def _normalizar_error(exc: Exception) -> str:
     mensaje = (str(exc) or exc.__class__.__name__).strip()
     if not mensaje:
@@ -1505,19 +1533,14 @@ def _importar_camion_mdvr(
                             inicio_para_xlsx = timezone.localtime(inicio_para_xlsx).replace(
                                 tzinfo=None
                             )
-                    xlsx_info = _seleccionar_xlsx(xlsx_files, inicio_para_xlsx)
-                    if xlsx_info:
-                        xlsx_por_turno[turno.id] = xlsx_info.ruta
-                        videos_referencia_por_turno[turno.id] = video_listo
-                        _actualizar_estado_velocidades_turno(
-                            turno, EstadoVelocidadesVideo.PENDIENTE
-                        )
-                    else:
-                        _actualizar_estado_velocidades_turno(
-                            turno,
-                            EstadoVelocidadesVideo.SIN_XLSX,
-                            error="No se encontró XLSX que cubra la fecha/hora de inicio del video.",
-                        )
+                    _programar_importacion_velocidades_turno(
+                        turno=turno,
+                        video_ref=video_listo,
+                        xlsx_files=xlsx_files,
+                        fecha_inicio=inicio_para_xlsx,
+                        xlsx_por_turno=xlsx_por_turno,
+                        videos_referencia_por_turno=videos_referencia_por_turno,
+                    )
                     continue
                 _registrar_omision(
                     detalles,
@@ -1559,11 +1582,25 @@ def _importar_camion_mdvr(
                     cambios_incompleto.append("origen_modificado_en")
                 if cambios_incompleto:
                     video_incompleto.save(update_fields=cambios_incompleto)
-                _actualizar_estado_velocidades(
-                    video_incompleto,
-                    EstadoVelocidadesVideo.ERROR,
-                    error="Video incompleto; no se importaron velocidades automáticamente.",
-                )
+                if (
+                    importar_velocidades
+                    and video_incompleto.estado_velocidades == EstadoVelocidadesVideo.PENDIENTE
+                ):
+                    inicio_para_xlsx = lista[0].inicio_dt
+                    if video_incompleto.fecha_inicio is not None:
+                        inicio_para_xlsx = video_incompleto.fecha_inicio
+                        if timezone.is_aware(inicio_para_xlsx):
+                            inicio_para_xlsx = timezone.localtime(
+                                inicio_para_xlsx
+                            ).replace(tzinfo=None)
+                    _programar_importacion_velocidades_turno(
+                        turno=turno,
+                        video_ref=video_incompleto,
+                        xlsx_files=xlsx_files,
+                        fecha_inicio=inicio_para_xlsx,
+                        xlsx_por_turno=xlsx_por_turno,
+                        videos_referencia_por_turno=videos_referencia_por_turno,
+                    )
                 _registrar_omision(
                     detalles,
                     motivo="ya existe video INCOMPLETO para turno y cámara con la misma huella de origen.",
@@ -1750,32 +1787,38 @@ def _importar_camion_mdvr(
                     }
                 )
                 if video.estado == EstadoVideo.INCOMPLETO:
-                    _actualizar_estado_velocidades(
-                        video,
-                        EstadoVelocidadesVideo.ERROR,
-                        error="Video incompleto; no se importaron velocidades automáticamente.",
-                    )
-                    detalles["errores"].append(
-                        f"{nombre_video}: video guardado como incompleto; no se importaron velocidades."
-                    )
+                    if importar_velocidades:
+                        inicio_para_xlsx = inicio_dt
+                        if video.fecha_inicio is not None:
+                            inicio_para_xlsx = video.fecha_inicio
+                            if timezone.is_aware(inicio_para_xlsx):
+                                inicio_para_xlsx = timezone.localtime(
+                                    inicio_para_xlsx
+                                ).replace(tzinfo=None)
+                        programado = _programar_importacion_velocidades_turno(
+                            turno=turno,
+                            video_ref=video,
+                            xlsx_files=xlsx_files,
+                            fecha_inicio=inicio_para_xlsx,
+                            xlsx_por_turno=xlsx_por_turno,
+                            videos_referencia_por_turno=videos_referencia_por_turno,
+                        )
+                        if programado:
+                            detalles["errores"].append(
+                                f"{nombre_video}: video guardado como incompleto; se intentará importar velocidades."
+                            )
                     continue
                 videos_turno.setdefault(tipo_turno, []).append(video)
 
                 if importar_velocidades:
-                    xlsx_info = _seleccionar_xlsx(xlsx_files, inicio_dt)
-                    if xlsx_info:
-                        if turno.id not in xlsx_por_turno:
-                            xlsx_por_turno[turno.id] = xlsx_info.ruta
-                            videos_referencia_por_turno[turno.id] = video
-                        _actualizar_estado_velocidades_turno(
-                            turno, EstadoVelocidadesVideo.PENDIENTE
-                        )
-                    else:
-                        _actualizar_estado_velocidades_turno(
-                            turno,
-                            EstadoVelocidadesVideo.SIN_XLSX,
-                            error="No se encontró XLSX que cubra la fecha/hora de inicio del video.",
-                        )
+                    _programar_importacion_velocidades_turno(
+                        turno=turno,
+                        video_ref=video,
+                        xlsx_files=xlsx_files,
+                        fecha_inicio=inicio_dt,
+                        xlsx_por_turno=xlsx_por_turno,
+                        videos_referencia_por_turno=videos_referencia_por_turno,
+                    )
             except SoftTimeLimitExceeded as exc:
                 if video is not None:
                     estado_error = _marcar_video_para_reintento(video, timezone.now(), exc)

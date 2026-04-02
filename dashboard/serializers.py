@@ -81,6 +81,16 @@ class VideoSerializer(serializers.ModelSerializer):
                     f"{instance.duracion or 0}-{instance.fin_timestamp or ''}"
                 )
                 data["ruta_archivo"] = _with_query_param(ruta, "v", token)
+        if (
+            self.context.get("compat_playable_incomplete")
+            and instance.estado == EstadoVideo.INCOMPLETO
+            and data.get("ruta_archivo")
+        ):
+            # Legacy frontend only treats estado="listo" as playable.
+            # Preserve the real state alongside a compatibility status.
+            data["estado_real"] = data["estado"]
+            data["estado"] = EstadoVideo.LISTO
+            data["reproducible_con_advertencia"] = True
         return data
 
     def get_tiempo_procesamiento_segundos(self, instance):
