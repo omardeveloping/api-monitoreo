@@ -218,3 +218,6 @@ staticfiles/
 output/
 scripts/
 tmp/
+
+# Local TODO notes
+TODO/
