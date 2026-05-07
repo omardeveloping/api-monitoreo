@@ -20,6 +20,12 @@ services:
       CELERY_RESULT_BACKEND: "${CELERY_RESULT_BACKEND:-redis://redis:6379/0}"
       GUNICORN_CMD_ARGS: "--timeout 600 --graceful-timeout 60"
       VIDEOS_IMPORT_DIR: "${VIDEOS_IMPORT_DIR:-/data/windows_share/videos_MDVR}"
+      VIDEOS_MDVR_DIR: "${VIDEOS_MDVR_DIR:-/data/cmsv6_output}"
+      CMSV6_OUTPUT_DIR: "${CMSV6_OUTPUT_DIR:-/data/cmsv6_output}"
+      CMSV6_BASE_URL: "${CMSV6_BASE_URL:-}"
+      CMSV6_ACCOUNT: "${CMSV6_ACCOUNT:-}"
+      CMSV6_PASSWORD: "${CMSV6_PASSWORD:-}"
+      CMSV6_DEVICE_ID: "${CMSV6_DEVICE_ID:-}"
       FORZAR_TRANSCODIFICACION_MP4: "${FORZAR_TRANSCODIFICACION_MP4:-1}"
       MP4_VIDEO_PROFILE: "${MP4_VIDEO_PROFILE:-baseline}"
       MP4_VIDEO_LEVEL: "${MP4_VIDEO_LEVEL:-4.1}"
@@ -31,6 +37,7 @@ services:
       - "${ESPACIO_DISCO_DATA_HOST:-/data}:/host-data:ro"
       - "${ESPACIO_DISCO_BACKUP_HOST:-/backup}:/host-backup:ro"
       - "${VIDEOS_IMPORT_DIR_HOST:-/data/windows_share/videos_MDVR}:/data/windows_share/videos_MDVR:ro"
+      - "${CMSV6_OUTPUT_DIR_HOST:-./cmsv6_output}:/data/cmsv6_output"
     depends_on:
       - redis
 
@@ -53,6 +60,12 @@ services:
       MDVR_IMPORT_TIME_LIMIT: "${MDVR_IMPORT_TIME_LIMIT:-23400}"
       MDVR_PROCESANDO_LEASE_SEGUNDOS: "${MDVR_PROCESANDO_LEASE_SEGUNDOS:-24300}"
       VIDEOS_IMPORT_DIR: "${VIDEOS_IMPORT_DIR:-/data/windows_share/videos_MDVR}"
+      VIDEOS_MDVR_DIR: "${VIDEOS_MDVR_DIR:-/data/cmsv6_output}"
+      CMSV6_OUTPUT_DIR: "${CMSV6_OUTPUT_DIR:-/data/cmsv6_output}"
+      CMSV6_BASE_URL: "${CMSV6_BASE_URL:-}"
+      CMSV6_ACCOUNT: "${CMSV6_ACCOUNT:-}"
+      CMSV6_PASSWORD: "${CMSV6_PASSWORD:-}"
+      CMSV6_DEVICE_ID: "${CMSV6_DEVICE_ID:-}"
       FORZAR_TRANSCODIFICACION_MP4: "${FORZAR_TRANSCODIFICACION_MP4:-1}"
       MP4_VIDEO_PROFILE: "${MP4_VIDEO_PROFILE:-baseline}"
       MP4_VIDEO_LEVEL: "${MP4_VIDEO_LEVEL:-4.1}"
@@ -62,6 +75,7 @@ services:
       - "${MEDIA_HOST_PATH:-./media}:/app/media"
       - sqlite_data:/data
       - "${VIDEOS_IMPORT_DIR_HOST:-/data/windows_share/videos_MDVR}:/data/windows_share/videos_MDVR:ro"
+      - "${CMSV6_OUTPUT_DIR_HOST:-./cmsv6_output}:/data/cmsv6_output"
     depends_on:
       - redis
 
@@ -84,6 +98,12 @@ services:
       MDVR_IMPORT_TIME_LIMIT: "${MDVR_IMPORT_TIME_LIMIT:-23400}"
       MDVR_PROCESANDO_LEASE_SEGUNDOS: "${MDVR_PROCESANDO_LEASE_SEGUNDOS:-24300}"
       VIDEOS_IMPORT_DIR: "${VIDEOS_IMPORT_DIR:-/data/windows_share/videos_MDVR}"
+      VIDEOS_MDVR_DIR: "${VIDEOS_MDVR_DIR:-/data/cmsv6_output}"
+      CMSV6_OUTPUT_DIR: "${CMSV6_OUTPUT_DIR:-/data/cmsv6_output}"
+      CMSV6_BASE_URL: "${CMSV6_BASE_URL:-}"
+      CMSV6_ACCOUNT: "${CMSV6_ACCOUNT:-}"
+      CMSV6_PASSWORD: "${CMSV6_PASSWORD:-}"
+      CMSV6_DEVICE_ID: "${CMSV6_DEVICE_ID:-}"
       FORZAR_TRANSCODIFICACION_MP4: "${FORZAR_TRANSCODIFICACION_MP4:-1}"
       MP4_VIDEO_PROFILE: "${MP4_VIDEO_PROFILE:-baseline}"
       MP4_VIDEO_LEVEL: "${MP4_VIDEO_LEVEL:-4.1}"
@@ -93,6 +113,7 @@ services:
       - "${MEDIA_HOST_PATH:-./media}:/app/media"
       - sqlite_data:/data
       - "${VIDEOS_IMPORT_DIR_HOST:-/data/windows_share/videos_MDVR}:/data/windows_share/videos_MDVR:ro"
+      - "${CMSV6_OUTPUT_DIR_HOST:-./cmsv6_output}:/data/cmsv6_output"
     depends_on:
       - redis
 
@@ -115,6 +136,12 @@ services:
       MDVR_IMPORT_TIME_LIMIT: "${MDVR_IMPORT_TIME_LIMIT:-23400}"
       MDVR_PROCESANDO_LEASE_SEGUNDOS: "${MDVR_PROCESANDO_LEASE_SEGUNDOS:-24300}"
       VIDEOS_IMPORT_DIR: "${VIDEOS_IMPORT_DIR:-/data/windows_share/videos_MDVR}"
+      VIDEOS_MDVR_DIR: "${VIDEOS_MDVR_DIR:-/data/cmsv6_output}"
+      CMSV6_OUTPUT_DIR: "${CMSV6_OUTPUT_DIR:-/data/cmsv6_output}"
+      CMSV6_BASE_URL: "${CMSV6_BASE_URL:-}"
+      CMSV6_ACCOUNT: "${CMSV6_ACCOUNT:-}"
+      CMSV6_PASSWORD: "${CMSV6_PASSWORD:-}"
+      CMSV6_DEVICE_ID: "${CMSV6_DEVICE_ID:-}"
       FORZAR_TRANSCODIFICACION_MP4: "${FORZAR_TRANSCODIFICACION_MP4:-1}"
       MP4_VIDEO_PROFILE: "${MP4_VIDEO_PROFILE:-baseline}"
       MP4_VIDEO_LEVEL: "${MP4_VIDEO_LEVEL:-4.1}"
@@ -124,6 +151,7 @@ services:
       - "${MEDIA_HOST_PATH:-./media}:/app/media"
       - sqlite_data:/data
       - "${VIDEOS_IMPORT_DIR_HOST:-/data/windows_share/videos_MDVR}:/data/windows_share/videos_MDVR:ro"
+      - "${CMSV6_OUTPUT_DIR_HOST:-./cmsv6_output}:/data/cmsv6_output"
     depends_on:
       - redis
 

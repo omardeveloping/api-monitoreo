@@ -1,6 +1,14 @@
 from celery import shared_task
+import time
 
 from .models import EstadoVideo, Turno, Video
+from dashboard.services.cmsv6_downloader import (
+    analizar_mp4_reporte,
+    ejecutar_job_cmsv6,
+    recortar_mp4_en_salida,
+    reparar_mp4_en_salida,
+    resolver_ruta_cmsv6_output,
+)
 from dashboard.services.programar_turnos import (
     crear_turnos_diarios,
 )
@@ -85,4 +93,96 @@ def importar_video_desde_servidor_task(
     if resultado.pk != video.pk:
         Video.objects.filter(pk=video.pk).exclude(estado=EstadoVideo.LISTO).delete()
     return {"video_id": resultado.pk, "estado": resultado.estado}
+
+
+class _TaskReporter:
+    def __init__(self, task, *, max_logs=300):
+        self.task = task
+        self.max_logs = max_logs
+        self.logs = []
+        self.progress = 0
+        self.message = "Iniciando..."
+        self.last_publish = 0.0
+
+    def _payload(self):
+        return {
+            "progress": self.progress,
+            "message": self.message,
+            "logs": self.logs[-self.max_logs :],
+        }
+
+    def publish(self, *, force=False):
+        now = time.monotonic()
+        if not force and now - self.last_publish < 1.5:
+            return
+        self.last_publish = now
+        self.task.update_state(state="PROGRESS", meta=self._payload())
+
+    def log(self, message):
+        timestamp = time.strftime("%H:%M:%S")
+        self.logs.append(f"[{timestamp}] {message}")
+        if len(self.logs) > self.max_logs * 2:
+            self.logs = self.logs[-self.max_logs :]
+        self.publish()
+
+    def progress_cb(self, progress, message):
+        if progress is not None:
+            self.progress = int(max(0, min(100, progress)))
+        self.message = str(message or self.message)
+        self.publish()
+
+    def final_payload(self, **extra):
+        payload = self._payload()
+        payload.update(extra)
+        return payload
+
+
+@shared_task(bind=True)
+def cmsv6_descargar_task(self, params: dict):
+    """Descarga desde CMSV6 a CMSV6_OUTPUT_DIR y opcionalmente importa a Django."""
+    reporter = _TaskReporter(self)
+    try:
+        resultado = ejecutar_job_cmsv6(params, reporter.log, reporter.progress_cb)
+    except Exception as exc:
+        reporter.log(f"ERROR: {exc}")
+        reporter.progress_cb(reporter.progress, "Error")
+        raise
+    reporter.progress_cb(100, "Completado")
+    return reporter.final_payload(resultado=resultado)
+
+
+@shared_task(bind=True)
+def cmsv6_analizar_mp4_task(self, ruta: str, output_dir: str | None = None):
+    reporter = _TaskReporter(self)
+    reporter.progress_cb(5, "Resolviendo archivo...")
+    path = resolver_ruta_cmsv6_output(ruta, output_dir=output_dir)
+    reporter.log(f"Analizando {path}")
+    reporter.progress_cb(20, "Analizando MP4...")
+    reporte = analizar_mp4_reporte(path)
+    reporter.progress_cb(100, "Completado")
+    return reporter.final_payload(reporte=reporte, archivo=str(path))
+
+
+@shared_task(bind=True)
+def cmsv6_reparar_mp4_task(self, ruta: str, output_dir: str | None = None):
+    reporter = _TaskReporter(self)
+    reporter.progress_cb(5, "Resolviendo archivo...")
+    reporter.log(f"Reparando {ruta}")
+    reporter.progress_cb(20, "Reparando MP4...")
+    resultado = reparar_mp4_en_salida(ruta, output_dir=output_dir)
+    reporter.logs.extend(resultado.get("logs") or [])
+    reporter.progress_cb(100, "Completado" if resultado.get("ok") else "Reparacion fallida")
+    return reporter.final_payload(resultado=resultado)
+
+
+@shared_task(bind=True)
+def cmsv6_recortar_mp4_task(self, ruta: str, output_dir: str | None = None):
+    reporter = _TaskReporter(self)
+    reporter.progress_cb(5, "Resolviendo archivo...")
+    reporter.log(f"Recortando {ruta}")
+    reporter.progress_cb(20, "Recortando MP4...")
+    resultado = recortar_mp4_en_salida(ruta, output_dir=output_dir)
+    reporter.logs.extend(resultado.get("logs") or [])
+    reporter.progress_cb(100, "Completado" if resultado.get("ok") else "Recorte fallido")
+    return reporter.final_payload(resultado=resultado)
 

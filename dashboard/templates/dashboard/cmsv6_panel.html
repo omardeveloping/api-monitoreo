@@ -1,0 +1,475 @@
+<!doctype html>
+<html lang="es">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>CMSV6</title>
+  <style>
+    :root {
+      color-scheme: light;
+      --bg: #f6f7f9;
+      --panel: #ffffff;
+      --panel-soft: #eef4f1;
+      --text: #17201b;
+      --muted: #647067;
+      --line: #d8ded9;
+      --accent: #2f6f5e;
+      --accent-dark: #215144;
+      --warn: #a56316;
+      --bad: #a64242;
+      --mono: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+      --sans: system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+    }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      background: var(--bg);
+      color: var(--text);
+      font-family: var(--sans);
+      font-size: 14px;
+    }
+    header {
+      border-bottom: 1px solid var(--line);
+      background: var(--panel);
+    }
+    .wrap {
+      width: min(1180px, calc(100vw - 32px));
+      margin: 0 auto;
+    }
+    header .wrap {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 16px;
+      padding: 14px 0;
+    }
+    h1, h2, h3 {
+      margin: 0;
+      letter-spacing: 0;
+    }
+    h1 { font-size: 20px; }
+    h2 { font-size: 16px; margin-bottom: 12px; }
+    h3 { font-size: 13px; color: var(--muted); margin-bottom: 8px; }
+    main.wrap {
+      display: grid;
+      grid-template-columns: minmax(0, 1fr) 420px;
+      gap: 16px;
+      padding: 16px 0 32px;
+    }
+    section {
+      background: var(--panel);
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      padding: 16px;
+    }
+    .stack { display: grid; gap: 16px; }
+    .grid {
+      display: grid;
+      grid-template-columns: repeat(4, minmax(0, 1fr));
+      gap: 12px;
+    }
+    .grid.two { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+    .grid.three { grid-template-columns: repeat(3, minmax(0, 1fr)); }
+    label {
+      display: grid;
+      gap: 6px;
+      color: var(--muted);
+      font-size: 12px;
+      font-weight: 650;
+    }
+    input, select {
+      width: 100%;
+      min-height: 36px;
+      border: 1px solid var(--line);
+      border-radius: 6px;
+      padding: 7px 9px;
+      background: #fff;
+      color: var(--text);
+      font: inherit;
+    }
+    input[type="checkbox"], input[type="radio"] {
+      width: 16px;
+      min-height: 16px;
+      margin: 0;
+    }
+    .choice-row {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 12px 18px;
+      align-items: center;
+      margin: 10px 0 12px;
+    }
+    .choice {
+      display: inline-flex;
+      align-items: center;
+      gap: 7px;
+      color: var(--text);
+      font-size: 13px;
+      font-weight: 600;
+    }
+    .subpanel {
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      padding: 12px;
+      background: var(--panel-soft);
+      margin-top: 12px;
+    }
+    .actions {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 8px;
+      margin-top: 14px;
+    }
+    button, .button {
+      border: 0;
+      border-radius: 6px;
+      padding: 9px 12px;
+      background: var(--accent);
+      color: #fff;
+      font-weight: 750;
+      cursor: pointer;
+      text-decoration: none;
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      min-height: 36px;
+    }
+    button.secondary { background: #4c5960; }
+    button.warning { background: var(--warn); }
+    button.danger { background: var(--bad); }
+    .meta {
+      color: var(--muted);
+      font-size: 12px;
+      line-height: 1.45;
+    }
+    .messages {
+      display: grid;
+      gap: 8px;
+      margin-bottom: 16px;
+    }
+    .message {
+      border-radius: 6px;
+      padding: 9px 10px;
+      background: #eaf4ee;
+      color: var(--accent-dark);
+      border: 1px solid #c5ded1;
+    }
+    .progress {
+      height: 12px;
+      border-radius: 999px;
+      background: #dce3df;
+      overflow: hidden;
+      margin: 10px 0 8px;
+    }
+    .bar {
+      width: 0%;
+      height: 100%;
+      background: var(--accent);
+      transition: width 180ms ease;
+    }
+    pre {
+      margin: 0;
+      white-space: pre-wrap;
+      word-break: break-word;
+      font-family: var(--mono);
+      font-size: 12px;
+      line-height: 1.45;
+    }
+    .log {
+      background: #101714;
+      color: #dbe9df;
+      border-radius: 8px;
+      padding: 12px;
+      min-height: 360px;
+      max-height: 680px;
+      overflow: auto;
+    }
+    .result {
+      background: #f2f4f3;
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      padding: 12px;
+      max-height: 420px;
+      overflow: auto;
+    }
+    @media (max-width: 980px) {
+      main.wrap { grid-template-columns: 1fr; }
+      .grid, .grid.two, .grid.three { grid-template-columns: 1fr; }
+      header .wrap { align-items: flex-start; flex-direction: column; }
+    }
+  </style>
+</head>
+<body>
+  <header>
+    <div class="wrap">
+      <div>
+        <h1>CMSV6</h1>
+        <div class="meta">{{ cmsv6_base_url|default:"CMSV6_BASE_URL sin configurar" }} · {{ cmsv6_device_id|default:"CMSV6_DEVICE_ID sin configurar" }}</div>
+      </div>
+      <div class="meta">Usuario: {{ request.user.username }}</div>
+    </div>
+  </header>
+
+  <main class="wrap">
+    <div class="stack">
+      {% if messages %}
+        <div class="messages">
+          {% for message in messages %}
+            <div class="message">{{ message }}</div>
+          {% endfor %}
+        </div>
+      {% endif %}
+
+      <section>
+        <h2>Descarga</h2>
+        <form method="post" action="{% url 'cmsv6-iniciar' %}">
+          {% csrf_token %}
+          <div class="grid two">
+            <label>Carpeta de salida
+              <input name="output_dir" value="{{ cmsv6_output_dir }}">
+            </label>
+            <label>Modo
+              <select name="modo" id="modo">
+                <option value="dia">Día específico</option>
+                <option value="rango">Rango de fechas</option>
+                <option value="auto">Automático</option>
+              </select>
+            </label>
+          </div>
+
+          <div class="subpanel" data-mode-panel="dia">
+            <h3>Día</h3>
+            <div class="grid two">
+              <label>Fecha
+                <input type="date" name="dia">
+              </label>
+            </div>
+          </div>
+
+          <div class="subpanel" data-mode-panel="rango">
+            <h3>Rango</h3>
+            <div class="grid">
+              <label>Inicio
+                <input type="date" name="fecha_inicio">
+              </label>
+              <label>Hora inicio
+                <input type="time" name="hora_inicio" value="00:00">
+              </label>
+              <label>Fin
+                <input type="date" name="fecha_fin">
+              </label>
+              <label>Hora fin
+                <input type="time" name="hora_fin" value="23:59">
+              </label>
+            </div>
+          </div>
+
+          <div class="subpanel" data-mode-panel="auto">
+            <h3>Automático</h3>
+            <div class="grid">
+              <label>Inicio
+                <input type="date" name="fecha_inicio_auto">
+              </label>
+              <label>Hora
+                <input type="time" name="hora_inicio_auto" value="00:00">
+              </label>
+              <label>Intervalo minutos
+                <input type="number" name="intervalo_minutos" min="1" value="15">
+              </label>
+              <label>Ciclos
+                <input type="number" name="auto_ciclos" min="0" value="1">
+              </label>
+            </div>
+          </div>
+
+          <div class="subpanel">
+            <h3>Contenido</h3>
+            <div class="choice-row">
+              <label class="choice"><input type="checkbox" name="excel_ruta" checked> Ruta GPS</label>
+              <label class="choice"><input type="checkbox" name="excel_alarmas" checked> Alarmas y eventos</label>
+              <label class="choice"><input type="checkbox" name="videos" checked> Videos MP4</label>
+              <label class="choice"><input type="checkbox" name="importar_django" checked> Importar a Django</label>
+            </div>
+          </div>
+
+          <div class="subpanel">
+            <h3>Testing</h3>
+            <div class="choice-row">
+              <label class="choice"><input type="checkbox" name="testing"> Activar</label>
+            </div>
+            <div class="grid three">
+              <label>Orden
+                <select name="test_order">
+                  <option value="size_asc">Menor peso</option>
+                  <option value="size_desc">Mayor peso</option>
+                  <option value="server">Servidor</option>
+                </select>
+              </label>
+              <label>Cantidad
+                <input type="number" name="test_limit" min="1" value="1">
+              </label>
+              <label>Max MB
+                <input type="number" name="test_max_mb" min="0" value="0">
+              </label>
+              <label>Canal
+                <select name="test_channel">
+                  <option>Todos</option>
+                  <option>CH1</option>
+                  <option>CH2</option>
+                  <option>CH3</option>
+                  <option>CH4</option>
+                </select>
+              </label>
+              <label>30 días
+                <select name="test_30d_mode">
+                  <option value="off">Desactivada</option>
+                  <option value="min">Más liviano</option>
+                  <option value="max">Más pesado</option>
+                </select>
+              </label>
+              <label>Día/rango
+                <select name="test_range_mode">
+                  <option value="off">Desactivada</option>
+                  <option value="min">Más liviano</option>
+                  <option value="max">Más pesado</option>
+                </select>
+              </label>
+            </div>
+          </div>
+
+          <div class="actions">
+            <button type="submit">Iniciar</button>
+          </div>
+        </form>
+      </section>
+
+      <section>
+        <h2>Analizar MP4</h2>
+        <form method="post" action="{% url 'cmsv6-mp4' %}">
+          {% csrf_token %}
+          <div class="grid two">
+            <label>Carpeta base
+              <input name="output_dir" value="{{ cmsv6_output_dir }}">
+            </label>
+            <label>Archivo MP4
+              <input name="ruta_mp4" placeholder="4462510196(4462510196)/2026-05-06/archivo.mp4">
+            </label>
+          </div>
+          <div class="choice-row">
+            <label class="choice"><input type="radio" name="accion_mp4" value="analizar" checked> Analizar</label>
+            <label class="choice"><input type="radio" name="accion_mp4" value="reparar"> Reparar copia</label>
+            <label class="choice"><input type="radio" name="accion_mp4" value="recortar"> Extraer 1 de 3</label>
+          </div>
+          <div class="actions">
+            <button type="submit" class="secondary">Ejecutar</button>
+          </div>
+        </form>
+      </section>
+    </div>
+
+    <aside class="stack">
+      <section>
+        <h2>Estado Descarga</h2>
+        {% if task_id %}
+          <div class="meta">Task ID: <span id="task-id">{{ task_id }}</span></div>
+          <div class="progress"><div class="bar" id="task-bar"></div></div>
+          <div class="meta" id="task-message">Consultando...</div>
+          <form method="post" action="{% url 'cmsv6-cancelar' task_id %}" class="actions">
+            {% csrf_token %}
+            <button type="submit" class="danger">Cancelar</button>
+          </form>
+        {% else %}
+          <div class="meta">Sin tarea activa.</div>
+        {% endif %}
+      </section>
+
+      <section>
+        <h2>Registro</h2>
+        <div class="log"><pre id="task-log"></pre></div>
+      </section>
+
+      <section>
+        <h2>Estado MP4</h2>
+        {% if mp4_task_id %}
+          <div class="meta">Task ID: <span id="mp4-task-id">{{ mp4_task_id }}</span></div>
+          <div class="progress"><div class="bar" id="mp4-bar"></div></div>
+          <div class="meta" id="mp4-message">Consultando...</div>
+          <div class="result"><pre id="mp4-result"></pre></div>
+        {% else %}
+          <div class="meta">Sin tarea MP4 activa.</div>
+        {% endif %}
+      </section>
+    </aside>
+  </main>
+
+  <script>
+    const today = new Date().toISOString().slice(0, 10);
+    document.querySelectorAll('input[type="date"]').forEach((input) => {
+      if (!input.value) input.value = today;
+    });
+
+    const modeSelect = document.getElementById('modo');
+    function syncMode() {
+      const mode = modeSelect.value;
+      document.querySelectorAll('[data-mode-panel]').forEach((panel) => {
+        panel.style.display = panel.dataset.modePanel === mode ? 'block' : 'none';
+      });
+      const autoDate = document.querySelector('input[name="fecha_inicio_auto"]');
+      const autoTime = document.querySelector('input[name="hora_inicio_auto"]');
+      const rangeDate = document.querySelector('input[name="fecha_inicio"]');
+      const rangeTime = document.querySelector('input[name="hora_inicio"]');
+      if (mode === 'auto' && autoDate && rangeDate) {
+        rangeDate.value = autoDate.value || today;
+        rangeTime.value = autoTime.value || '00:00';
+      }
+    }
+    modeSelect.addEventListener('change', syncMode);
+    document.querySelectorAll('input[name="fecha_inicio_auto"], input[name="hora_inicio_auto"]').forEach((input) => {
+      input.addEventListener('change', syncMode);
+    });
+    syncMode();
+
+    async function pollTask(taskId, ids, urlTemplate) {
+      if (!taskId) return;
+      const bar = document.getElementById(ids.bar);
+      const msg = document.getElementById(ids.message);
+      const log = document.getElementById(ids.log);
+      const result = document.getElementById(ids.result);
+      try {
+        const response = await fetch(urlTemplate.replace('__TASK__', encodeURIComponent(taskId)), {
+          headers: { 'Accept': 'application/json' }
+        });
+        const data = await response.json();
+        const info = data.info || data.resultado || {};
+        const progress = Number(info.progress || 0);
+        if (bar) bar.style.width = `${Math.max(0, Math.min(100, progress))}%`;
+        if (msg) msg.textContent = `${data.status}${info.message ? ' · ' + info.message : ''}`;
+        if (log && Array.isArray(info.logs)) log.textContent = info.logs.join('\n');
+        if (result) {
+          const reporte = info.reporte || (data.resultado && data.resultado.reporte);
+          const payload = reporte || data.error || '';
+          result.textContent = typeof payload === 'string' ? payload : JSON.stringify(payload, null, 2);
+        }
+        if (!['SUCCESS', 'FAILURE', 'REVOKED'].includes(data.status)) {
+          window.setTimeout(() => pollTask(taskId, ids, urlTemplate), 2500);
+        }
+      } catch (error) {
+        if (msg) msg.textContent = `Error consultando estado: ${error}`;
+        window.setTimeout(() => pollTask(taskId, ids, urlTemplate), 5000);
+      }
+    }
+
+    pollTask('{{ task_id|escapejs }}', {
+      bar: 'task-bar',
+      message: 'task-message',
+      log: 'task-log'
+    }, "{% url 'cmsv6-estado' '__TASK__' %}");
+    pollTask('{{ mp4_task_id|escapejs }}', {
+      bar: 'mp4-bar',
+      message: 'mp4-message',
+      log: 'task-log',
+      result: 'mp4-result'
+    }, "{% url 'cmsv6-estado' '__TASK__' %}");
+  </script>
+</body>
+</html>

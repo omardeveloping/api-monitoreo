@@ -213,11 +213,41 @@ STATIC_ROOT = BASE_DIR / "staticfiles"
 # Media files (user uploads)
 MEDIA_URL = '/media/'
 MEDIA_ROOT = BASE_DIR / "media"
+LOGIN_URL = "/api-auth/login/"
 
 # Directorio base para importar videos locales (sin subirlos por HTTP).
 VIDEOS_IMPORT_DIR = os.environ.get("VIDEOS_IMPORT_DIR", "")
+# Directorio donde Celery descarga directamente desde CMSV6.
+CMSV6_OUTPUT_DIR = os.environ.get(
+    "CMSV6_OUTPUT_DIR",
+    os.environ.get("VIDEOS_MDVR_DIR", os.environ.get("VIDEOS_IMPORT_DIR", str(BASE_DIR / "cmsv6_output"))),
+)
 # Directorio base para estructura MDVR (por defecto, usa VIDEOS_IMPORT_DIR).
-VIDEOS_MDVR_DIR = os.environ.get("VIDEOS_MDVR_DIR", VIDEOS_IMPORT_DIR)
+VIDEOS_MDVR_DIR = os.environ.get("VIDEOS_MDVR_DIR", CMSV6_OUTPUT_DIR or VIDEOS_IMPORT_DIR)
+
+# CMSV6 remoto. Configura credenciales en .env; no se guardan en el repo.
+CMSV6_BASE_URL = os.environ.get("CMSV6_BASE_URL", "")
+CMSV6_ACCOUNT = os.environ.get("CMSV6_ACCOUNT", "")
+CMSV6_PASSWORD = os.environ.get("CMSV6_PASSWORD", "")
+CMSV6_DEVICE_ID = os.environ.get("CMSV6_DEVICE_ID", "")
+CMSV6_CANALES = os.environ.get("CMSV6_CANALES", "-1")
+CMSV6_TIPO_VIDEO = os.environ.get("CMSV6_TIPO_VIDEO", "0")
+CMSV6_TASK_PREPARE_WAIT_SECS = os.environ.get("CMSV6_TASK_PREPARE_WAIT_SECS", "180")
+CMSV6_TASK_POLL_INTERVAL_SECS = os.environ.get("CMSV6_TASK_POLL_INTERVAL_SECS", "10")
+CMSV6_MIN_SPEED_KBPS = os.environ.get("CMSV6_MIN_SPEED_KBPS", "0")
+CMSV6_MIN_SPEED_WINDOW_SECS = os.environ.get("CMSV6_MIN_SPEED_WINDOW_SECS", "180")
+CMSV6_MAX_VIDEO_DOWNLOAD_SECS = os.environ.get("CMSV6_MAX_VIDEO_DOWNLOAD_SECS", "43200")
+CMSV6_DOWNURL_STALL_SECS = os.environ.get("CMSV6_DOWNURL_STALL_SECS", "900")
+CMSV6_PLAYBACK_STALL_SECS = os.environ.get("CMSV6_PLAYBACK_STALL_SECS", "900")
+CMSV6_URL_ROUNDS = os.environ.get("CMSV6_URL_ROUNDS", "8")
+CMSV6_URL_ROUND_WAIT_SECS = os.environ.get("CMSV6_URL_ROUND_WAIT_SECS", "300")
+CMSV6_URL_EXHAUST_WAIT_SECS = os.environ.get("CMSV6_URL_EXHAUST_WAIT_SECS", "1800")
+CMSV6_URL_EXHAUST_MAX_WAITS = os.environ.get("CMSV6_URL_EXHAUST_MAX_WAITS", "0")
+CMSV6_VIDEO_SEARCH_WAIT_SECS = os.environ.get("CMSV6_VIDEO_SEARCH_WAIT_SECS", "300")
+CMSV6_TEST_30D_DAY_RETRIES = os.environ.get("CMSV6_TEST_30D_DAY_RETRIES", "0")
+CMSV6_TEST_30D_DAY_RETRY_WAIT_SECS = os.environ.get("CMSV6_TEST_30D_DAY_RETRY_WAIT_SECS", "10")
+CMSV6_TEST_30D_SCAN_NEWEST_FIRST = os.environ.get("CMSV6_TEST_30D_SCAN_NEWEST_FIRST", "1")
+CMSV6_SMALL_RESPONSE_BYTES = os.environ.get("CMSV6_SMALL_RESPONSE_BYTES", "4096")
 
 # Ruta a monitorear para uso de disco. Cambia con la variable de entorno ESPACIO_DISCO_RUTA.
 ESPACIO_DISCO_RUTA = os.environ.get("ESPACIO_DISCO_RUTA", "/")
@@ -232,12 +262,21 @@ CELERY_TASK_TRACK_STARTED = True
 CELERY_WORKER_PREFETCH_MULTIPLIER = 1
 CELERY_TASK_ROUTES = {
     "dashboard.tasks.importar_videos_mdvr_task": {"queue": "mdvr"},
+    "dashboard.tasks.cmsv6_descargar_task": {"queue": "mdvr"},
+    "dashboard.tasks.cmsv6_analizar_mp4_task": {"queue": "mdvr"},
+    "dashboard.tasks.cmsv6_reparar_mp4_task": {"queue": "mdvr"},
+    "dashboard.tasks.cmsv6_recortar_mp4_task": {"queue": "mdvr"},
 }
 CELERY_TASK_ANNOTATIONS = {
     "dashboard.tasks.importar_videos_mdvr_task": {
         "soft_time_limit": int(os.environ.get("MDVR_IMPORT_SOFT_TIME_LIMIT", "21600")),
         "time_limit": int(os.environ.get("MDVR_IMPORT_TIME_LIMIT", "23400")),
         "rate_limit": os.environ.get("MDVR_IMPORT_RATE_LIMIT", "1/m"),
+    },
+    "dashboard.tasks.cmsv6_descargar_task": {
+        "soft_time_limit": int(os.environ.get("CMSV6_TASK_SOFT_TIME_LIMIT", "43200")),
+        "time_limit": int(os.environ.get("CMSV6_TASK_TIME_LIMIT", "45000")),
+        "rate_limit": os.environ.get("CMSV6_TASK_RATE_LIMIT", "1/m"),
     }
 }
 CELERY_BEAT_SCHEDULE = {

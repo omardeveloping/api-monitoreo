@@ -20,9 +20,15 @@ from django.conf import settings
 from django.conf.urls.static import static
 from rest_framework_simplejwt.views import TokenRefreshView, TokenVerifyView
 from usuarios.views import CustomRegisterAPIView, CustomLoginView, CustomTokenObtainPairView
+from dashboard import cmsv6_views
 
 urlpatterns = [
     path('admin/', admin.site.urls),
+    path('cmsv6/', cmsv6_views.cmsv6_panel, name='cmsv6-panel'),
+    path('cmsv6/iniciar/', cmsv6_views.cmsv6_iniciar, name='cmsv6-iniciar'),
+    path('cmsv6/estado/<str:task_id>/', cmsv6_views.cmsv6_estado, name='cmsv6-estado'),
+    path('cmsv6/cancelar/<str:task_id>/', cmsv6_views.cmsv6_cancelar, name='cmsv6-cancelar'),
+    path('cmsv6/mp4/', cmsv6_views.cmsv6_mp4, name='cmsv6-mp4'),
     path('api/admin/', admin.site.urls),
     path('api/dashboard/admin/', admin.site.urls),
     path('api-auth/', include('rest_framework.urls')),

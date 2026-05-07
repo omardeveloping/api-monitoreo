@@ -1,0 +1,2291 @@
+import base64
+import datetime
+import json
+import mmap
+import os
+import re
+import shutil
+import socket
+import struct
+import subprocess
+import time
+import urllib.error
+import urllib.parse
+import urllib.request
+import http.cookiejar
+from dataclasses import dataclass
+from pathlib import Path
+
+import openpyxl
+from django.conf import settings
+from openpyxl.styles import Font
+from rest_framework.exceptions import ValidationError
+
+
+TIPOS_ALARMA = {
+    "1": "Exceso velocidad",
+    "2": "Fatiga conductor",
+    "3": "Emergencia SOS",
+    "4": "Falla antena GNSS",
+    "5": "Cortocircuito GNSS",
+    "6": "Voltaje bajo",
+    "7": "Apagado",
+    "8": "Falla LCD",
+    "9": "Alarma TTS",
+    "10": "Falla camara",
+    "11": "Falla IC",
+    "12": "Vel. en zona",
+    "13": "Entrada zona",
+    "14": "Salida zona",
+    "15": "Accidente",
+    "16": "Impacto",
+    "17": "Freno brusco",
+    "18": "Giro brusco",
+    "19": "Aceleracion brusca",
+    "20": "Colision frontal",
+    "21": "Somnolencia",
+    "22": "Distraccion",
+    "23": "Uso telefono",
+    "24": "Fumando",
+    "25": "Sin cinturon",
+    "26": "Cambio carril",
+    "27": "Seguimiento cercano",
+    "28": "Zona escolar",
+    "29": "Salida ruta",
+    "30": "Conduccion nocturna",
+}
+
+_NET_MAP = {
+    0: "Sin red",
+    1: "GPRS",
+    2: "3G",
+    3: "4G",
+    4: "WiFi",
+    5: "5G",
+    6: "4G+",
+    7: "4G+",
+    8: "LTE",
+    9: "5G",
+}
+_AES_PARTS = ["A", "B", "c", "D", "e", "F", "g", "H", "I", "J", "k", "L", "m", "n", "O", "P", "Q", "R", "s", "T"]
+AES_KEY = ("ttx123456" + _AES_PARTS[0] + _AES_PARTS[4] + _AES_PARTS[18] + "1234").encode()
+
+
+def _setting(name: str, default=None):
+    return getattr(settings, name, os.environ.get(name, default))
+
+
+def _setting_int(name: str, default: int, *, minimum: int | None = None) -> int:
+    try:
+        value = int(_setting(name, default))
+    except (TypeError, ValueError):
+        value = default
+    if minimum is not None:
+        value = max(minimum, value)
+    return value
+
+
+def _setting_float(name: str, default: float, *, minimum: float | None = None) -> float:
+    try:
+        value = float(_setting(name, default))
+    except (TypeError, ValueError):
+        value = default
+    if minimum is not None:
+        value = max(minimum, value)
+    return value
+
+
+@dataclass(frozen=True)
+class CMSV6Config:
+    base_url: str
+    account: str
+    password: str
+    device_id: str
+    output_dir: str
+    canales: int = -1
+    tipo_video: int = 0
+    task_prepare_wait_secs: int = 180
+    task_poll_interval_secs: int = 10
+    min_speed_kbps: float = 0.0
+    min_speed_window_secs: int = 180
+    max_video_download_secs: int = 43200
+    downurl_stall_secs: int = 900
+    playback_stall_secs: int = 900
+    url_rounds: int = 8
+    url_round_wait_secs: int = 300
+    url_exhaust_wait_secs: int = 1800
+    url_exhaust_max_waits: int = 0
+    video_search_wait_secs: int = 300
+    test_30d_day_retries: int = 0
+    test_30d_day_retry_wait_secs: int = 10
+    test_30d_scan_newest_first: bool = True
+    small_response_bytes: int = 4096
+
+    @classmethod
+    def from_settings(cls, output_dir: str | None = None):
+        default_output = (
+            output_dir
+            or _setting("CMSV6_OUTPUT_DIR", "")
+            or _setting("VIDEOS_MDVR_DIR", "")
+            or _setting("VIDEOS_IMPORT_DIR", "")
+            or str(Path(settings.BASE_DIR) / "cmsv6_output")
+        )
+        return cls(
+            base_url=str(_setting("CMSV6_BASE_URL", "") or "").rstrip("/"),
+            account=str(_setting("CMSV6_ACCOUNT", "") or ""),
+            password=str(_setting("CMSV6_PASSWORD", "") or ""),
+            device_id=str(_setting("CMSV6_DEVICE_ID", "") or ""),
+            output_dir=str(default_output),
+            canales=_setting_int("CMSV6_CANALES", -1),
+            tipo_video=_setting_int("CMSV6_TIPO_VIDEO", 0),
+            task_prepare_wait_secs=_setting_int("CMSV6_TASK_PREPARE_WAIT_SECS", 180, minimum=0),
+            task_poll_interval_secs=_setting_int("CMSV6_TASK_POLL_INTERVAL_SECS", 10, minimum=1),
+            min_speed_kbps=_setting_float("CMSV6_MIN_SPEED_KBPS", 0.0, minimum=0.0),
+            min_speed_window_secs=_setting_int("CMSV6_MIN_SPEED_WINDOW_SECS", 180, minimum=1),
+            max_video_download_secs=_setting_int("CMSV6_MAX_VIDEO_DOWNLOAD_SECS", 43200, minimum=1),
+            downurl_stall_secs=_setting_int("CMSV6_DOWNURL_STALL_SECS", 900, minimum=1),
+            playback_stall_secs=_setting_int("CMSV6_PLAYBACK_STALL_SECS", 900, minimum=1),
+            url_rounds=_setting_int("CMSV6_URL_ROUNDS", 8, minimum=1),
+            url_round_wait_secs=_setting_int("CMSV6_URL_ROUND_WAIT_SECS", 300, minimum=0),
+            url_exhaust_wait_secs=_setting_int("CMSV6_URL_EXHAUST_WAIT_SECS", 1800, minimum=0),
+            url_exhaust_max_waits=_setting_int("CMSV6_URL_EXHAUST_MAX_WAITS", 0, minimum=0),
+            video_search_wait_secs=_setting_int("CMSV6_VIDEO_SEARCH_WAIT_SECS", 300, minimum=1),
+            test_30d_day_retries=_setting_int("CMSV6_TEST_30D_DAY_RETRIES", 0, minimum=0),
+            test_30d_day_retry_wait_secs=_setting_int(
+                "CMSV6_TEST_30D_DAY_RETRY_WAIT_SECS", 10, minimum=0
+            ),
+            test_30d_scan_newest_first=_setting_int("CMSV6_TEST_30D_SCAN_NEWEST_FIRST", 1) != 0,
+            small_response_bytes=_setting_int("CMSV6_SMALL_RESPONSE_BYTES", 4096, minimum=1),
+        )
+
+    def validate(self):
+        faltantes = []
+        if not self.base_url:
+            faltantes.append("CMSV6_BASE_URL")
+        if not self.account:
+            faltantes.append("CMSV6_ACCOUNT")
+        if not self.password:
+            faltantes.append("CMSV6_PASSWORD")
+        if not self.device_id:
+            faltantes.append("CMSV6_DEVICE_ID")
+        if not self.output_dir:
+            faltantes.append("CMSV6_OUTPUT_DIR")
+        if faltantes:
+            raise ValidationError(f"Faltan variables CMSV6: {', '.join(faltantes)}.")
+
+
+class StalledDownloadError(Exception):
+    pass
+
+
+class SlowDownloadError(Exception):
+    pass
+
+
+class DownloadTimeLimitError(Exception):
+    pass
+
+
+class CMSV6AuthError(Exception):
+    pass
+
+
+def _crypto_imports():
+    try:
+        from Crypto.Cipher import AES
+        from Crypto.Util.Padding import pad, unpad
+    except ImportError as exc:
+        raise RuntimeError("Instala pycryptodome para usar CMSV6.") from exc
+    return AES, pad, unpad
+
+
+def _enc(value: str) -> str:
+    AES, pad, _unpad = _crypto_imports()
+    cipher = AES.new(AES_KEY, AES.MODE_ECB)
+    return base64.b64encode(cipher.encrypt(pad(value.encode("utf-8"), AES.block_size))).decode()
+
+
+def _dec(value: str) -> str:
+    AES, _pad, unpad = _crypto_imports()
+    data = base64.b64decode(value.replace(" ", "+"))
+    return unpad(AES.new(AES_KEY, AES.MODE_ECB).decrypt(data), AES.block_size).decode("utf-8")
+
+
+def _parse_response(response):
+    if isinstance(response, dict) and response.get("encry") == 1 and "data" in response:
+        try:
+            return json.loads(_dec(response["data"]))
+        except Exception:
+            pass
+    return response
+
+
+def _ffmpeg_exe() -> str:
+    return shutil.which("ffmpeg") or "ffmpeg"
+
+
+def _ffprobe_exe() -> str:
+    return shutil.which("ffprobe") or "ffprobe"
+
+
+def is_mp4(path: Path) -> bool:
+    try:
+        with open(path, "rb") as archivo:
+            data = archivo.read(12)
+        return len(data) >= 8 and data[4:8] == b"ftyp"
+    except OSError:
+        return False
+
+
+def is_flv(path: Path) -> bool:
+    try:
+        with open(path, "rb") as archivo:
+            return archivo.read(3) == b"FLV"
+    except OSError:
+        return False
+
+
+def is_h264(path: Path) -> bool:
+    try:
+        with open(path, "rb") as archivo:
+            header = archivo.read(4)
+        return header[:4] == b"\x00\x00\x00\x01" or header[:3] == b"\x00\x00\x01"
+    except OSError:
+        return False
+
+
+def is_ssy_dvr(path: Path) -> bool:
+    try:
+        with open(path, "rb") as archivo:
+            data = archivo.read(4096)
+        return b"SSY_DVR" in data
+    except OSError:
+        return False
+
+
+def ssy_dvr_has_h264(path: Path) -> bool:
+    try:
+        with open(path, "rb") as archivo:
+            while True:
+                chunk = archivo.read(1024 * 1024)
+                if not chunk:
+                    return False
+                if b"iph264" in chunk:
+                    return True
+    except OSError:
+        return False
+
+
+def extract_ssy_dvr_h264(src: Path, dst: Path, log_fn) -> bool:
+    if dst.exists():
+        dst.unlink()
+    try:
+        records = []
+        marker = b"\x1b\x00\x00\x00"
+        with open(src, "rb") as archivo:
+            if archivo.seek(0, os.SEEK_END) == 0:
+                return False
+            archivo.seek(0)
+            mm = mmap.mmap(archivo.fileno(), 0, access=mmap.ACCESS_READ)
+            try:
+                pos = 0
+                while True:
+                    idx = mm.find(marker, pos)
+                    if idx < 0:
+                        break
+                    magic = mm[idx + 4 : idx + 12]
+                    if len(magic) == 8 and magic[2:] == b"iph264" and idx + 28 <= len(mm):
+                        pkt_len = struct.unpack_from("<I", mm, idx + 12)[0]
+                        extra_len = struct.unpack_from("<I", mm, idx + 16)[0]
+                        start = idx + 28 + extra_len
+                        end = idx + 28 + pkt_len
+                        if 0 <= extra_len <= pkt_len and end <= len(mm):
+                            if mm[start : start + 4] == b"\x00\x00\x00\x01":
+                                records.append((start, end, mm[start + 4] & 0x1F))
+                            elif mm[start : start + 3] == b"\x00\x00\x01":
+                                records.append((start, end, mm[start + 3] & 0x1F))
+                    pos = idx + 1
+
+                if not records:
+                    return False
+                first = next((i for i, (_, _, nal) in enumerate(records) if nal == 7), 0)
+                with open(dst, "wb") as salida:
+                    for start, end, _nal in records[first:]:
+                        salida.write(mm[start:end])
+            finally:
+                mm.close()
+        ok = dst.exists() and dst.stat().st_size > 4096
+        if ok:
+            log_fn(f"    SSY_DVR extraido a H264 ({dst.stat().st_size / 1048576:.2f} MB)")
+        return ok
+    except Exception as exc:
+        log_fn(f"    No se pudo extraer SSY_DVR: {exc}")
+        return False
+
+
+def _mp4_duration_secs(path: Path):
+    try:
+        result = subprocess.run(
+            [
+                _ffprobe_exe(),
+                "-v",
+                "error",
+                "-show_entries",
+                "format=duration",
+                "-of",
+                "default=noprint_wrappers=1:nokey=1",
+                str(path),
+            ],
+            capture_output=True,
+            timeout=20,
+            check=False,
+        )
+        if result.returncode != 0:
+            return None
+        value = result.stdout.decode("utf-8", "replace").strip()
+        return float(value) if value else None
+    except Exception:
+        return None
+
+
+def _expected_secs_from_name(path: Path):
+    try:
+        match = re.search(r"-(\d{6})-(\d{6})-", Path(path).name)
+        if not match:
+            return None
+
+        def _to_secs(value):
+            return int(value[:2]) * 3600 + int(value[2:4]) * 60 + int(value[4:6])
+
+        start = _to_secs(match.group(1))
+        end = _to_secs(match.group(2))
+        if end < start:
+            end += 24 * 3600
+        return max(0, end - start)
+    except Exception:
+        return None
+
+
+def _mp4_duration_ok(path: Path, expected_secs, log_fn) -> bool:
+    if not expected_secs or expected_secs < 60:
+        return True
+    duration = _mp4_duration_secs(path)
+    if duration is None:
+        return True
+    minimum = max(10.0, float(expected_secs) * 0.50)
+    if duration < minimum:
+        log_fn(
+            f"    Duracion sospechosa: {duration:.1f}s para clip esperado "
+            f"de ~{int(expected_secs)}s; probando otro metodo..."
+        )
+        return False
+    return True
+
+
+def repair_mp4_timestamps(src: Path, dst: Path, log_fn, expected_secs=None, fps=25) -> bool:
+    src = Path(src)
+    dst = Path(dst)
+    tmp_h264 = dst.with_suffix(".retime.h264")
+    if dst.exists():
+        dst.unlink()
+    if tmp_h264.exists():
+        tmp_h264.unlink()
+    try:
+        log_fn("    Reparacion: extrayendo H264 del MP4...")
+        result = subprocess.run(
+            [
+                _ffmpeg_exe(),
+                "-y",
+                "-i",
+                str(src),
+                "-map",
+                "0:v:0",
+                "-c:v",
+                "copy",
+                "-bsf:v",
+                "h264_mp4toannexb",
+                "-f",
+                "h264",
+                str(tmp_h264),
+            ],
+            capture_output=True,
+            timeout=900,
+            check=False,
+        )
+        if result.returncode != 0 or not tmp_h264.exists() or tmp_h264.stat().st_size <= 4096:
+            return False
+
+        log_fn(f"    Reparacion: rearmando MP4 a {fps} FPS...")
+        result = subprocess.run(
+            [
+                _ffmpeg_exe(),
+                "-y",
+                "-fflags",
+                "+genpts",
+                "-f",
+                "h264",
+                "-framerate",
+                str(fps),
+                "-i",
+                str(tmp_h264),
+                "-c:v",
+                "copy",
+                "-movflags",
+                "+faststart",
+                str(dst),
+            ],
+            capture_output=True,
+            timeout=900,
+            check=False,
+        )
+        if result.returncode == 0 and dst.exists() and dst.stat().st_size > 4096:
+            if _mp4_duration_ok(dst, expected_secs, log_fn):
+                return True
+
+        log_fn("    Reparacion: probando reencode con tiempos nuevos...")
+        if dst.exists():
+            dst.unlink()
+        result = subprocess.run(
+            [
+                _ffmpeg_exe(),
+                "-y",
+                "-fflags",
+                "+genpts",
+                "-i",
+                str(src),
+                "-map",
+                "0:v:0",
+                "-vf",
+                f"setpts=N/({fps}*TB)",
+                "-r",
+                str(fps),
+                "-c:v",
+                "libx264",
+                "-preset",
+                "fast",
+                "-crf",
+                "22",
+                "-an",
+                "-movflags",
+                "+faststart",
+                str(dst),
+            ],
+            capture_output=True,
+            timeout=1800,
+            check=False,
+        )
+        return result.returncode == 0 and dst.exists() and dst.stat().st_size > 4096
+    except (subprocess.TimeoutExpired, FileNotFoundError) as exc:
+        log_fn(f"    Reparacion fallo: {exc}")
+        return False
+    finally:
+        if tmp_h264.exists():
+            try:
+                tmp_h264.unlink()
+            except OSError:
+                pass
+
+
+def cut_mp4_first_fraction(src: Path, dst: Path, log_fn, denominator=3) -> bool:
+    src = Path(src)
+    dst = Path(dst)
+    if dst.exists():
+        dst.unlink()
+    try:
+        duration = _mp4_duration_secs(src)
+        if not duration or duration <= 0:
+            log_fn("    No se pudo leer duracion del MP4.")
+            return False
+        keep = duration / max(2, int(denominator))
+        result = subprocess.run(
+            [
+                _ffmpeg_exe(),
+                "-y",
+                "-i",
+                str(src),
+                "-t",
+                f"{keep:.3f}",
+                "-map",
+                "0:v:0",
+                "-c",
+                "copy",
+                "-movflags",
+                "+faststart",
+                str(dst),
+            ],
+            capture_output=True,
+            timeout=900,
+            check=False,
+        )
+        return result.returncode == 0 and dst.exists() and dst.stat().st_size > 4096
+    except (subprocess.TimeoutExpired, FileNotFoundError) as exc:
+        log_fn(f"    Recorte fallo: {exc}")
+        return False
+
+
+def convert_to_mp4(src: Path, dst: Path, log_fn, expected_secs=None) -> bool:
+    if dst.exists():
+        dst.unlink()
+
+    cleanup_src = None
+    h264_input = False
+    src = Path(src)
+    if is_ssy_dvr(src):
+        extracted = src.with_suffix(".h264")
+        log_fn("    Formato SSY_DVR: extrayendo H264 interno...")
+        if not extract_ssy_dvr_h264(src, extracted, log_fn):
+            return False
+        src_str = str(extracted)
+        cleanup_src = extracted
+        h264_input = True
+    else:
+        src_str = str(src)
+
+    dst_str = str(dst)
+    ffmpeg = _ffmpeg_exe()
+    if is_flv(src):
+        commands = [
+            [
+                ffmpeg,
+                "-y",
+                "-fflags",
+                "+genpts",
+                "-i",
+                src_str,
+                "-vf",
+                "setpts=N/(25*TB)",
+                "-r",
+                "25",
+                "-c:v",
+                "libx264",
+                "-preset",
+                "fast",
+                "-crf",
+                "22",
+                "-an",
+                "-movflags",
+                "+faststart",
+                dst_str,
+            ],
+            [ffmpeg, "-y", "-i", src_str, "-c", "copy", "-movflags", "+faststart", dst_str],
+        ]
+    elif h264_input or is_h264(src):
+        commands = [
+            [
+                ffmpeg,
+                "-y",
+                "-fflags",
+                "+genpts",
+                "-f",
+                "h264",
+                "-framerate",
+                "25",
+                "-i",
+                src_str,
+                "-c:v",
+                "copy",
+                "-vsync",
+                "0",
+                dst_str,
+            ],
+            [
+                ffmpeg,
+                "-y",
+                "-f",
+                "h264",
+                "-framerate",
+                "25",
+                "-i",
+                src_str,
+                "-c:v",
+                "libx264",
+                "-preset",
+                "fast",
+                "-crf",
+                "18",
+                "-r",
+                "25",
+                "-movflags",
+                "+faststart",
+                dst_str,
+            ],
+        ]
+    else:
+        commands = [
+            [
+                ffmpeg,
+                "-y",
+                "-fflags",
+                "+genpts",
+                "-i",
+                src_str,
+                "-vf",
+                "setpts=N/(25*TB)",
+                "-r",
+                "25",
+                "-c:v",
+                "libx264",
+                "-preset",
+                "fast",
+                "-crf",
+                "22",
+                "-an",
+                "-movflags",
+                "+faststart",
+                dst_str,
+            ],
+            [ffmpeg, "-y", "-i", src_str, "-c", "copy", "-movflags", "+faststart", dst_str],
+        ]
+
+    for index, command in enumerate(commands, start=1):
+        if dst.exists():
+            dst.unlink()
+        try:
+            result = subprocess.run(command, capture_output=True, timeout=1800, check=False)
+            if result.returncode == 0 and dst.exists() and dst.stat().st_size > 4096:
+                if _mp4_duration_ok(dst, expected_secs, log_fn):
+                    if cleanup_src and cleanup_src.exists():
+                        cleanup_src.unlink()
+                    return True
+            if index < len(commands):
+                log_fn(f"    Intento ffmpeg {index} fallo; probando metodo {index + 1}...")
+        except subprocess.TimeoutExpired:
+            log_fn(f"    Timeout en intento ffmpeg {index}.")
+        except FileNotFoundError:
+            log_fn("    ffmpeg no encontrado.")
+            return False
+    return False
+
+
+def _clean_excel(value):
+    if value is None:
+        return ""
+    if isinstance(value, (dict, list)):
+        return json.dumps(value, ensure_ascii=False)[:300]
+    return value
+
+
+def _pick(data, *keys, default=""):
+    for key in keys:
+        if key in data:
+            value = data[key]
+            if value not in (None, "", "null"):
+                return value
+    return default
+
+
+def _parse_gps_time(value):
+    if not value:
+        return None
+    for fmt in ("%Y-%m-%d %H:%M:%S", "%Y-%m-%dT%H:%M:%S", "%Y/%m/%d %H:%M:%S"):
+        try:
+            return datetime.datetime.strptime(str(value).strip(), fmt)
+        except ValueError:
+            continue
+    return None
+
+
+def _normalizar_coord(raw):
+    if raw in (None, "", "null"):
+        return ""
+    try:
+        value = float(raw)
+    except (TypeError, ValueError):
+        return ""
+    if value == 0:
+        return ""
+    if abs(value) > 1000:
+        value = value / 1_000_000.0
+    return f"{value:.6f}"
+
+
+def _normalizar_vel(raw):
+    if raw in (None, "", "null"):
+        return 0
+    try:
+        value = float(raw)
+    except (TypeError, ValueError):
+        return 0
+    if value > 300:
+        value = value / 10.0
+    return round(value, 1)
+
+
+def _grados_a_direccion(deg):
+    try:
+        deg = float(deg)
+        nombres = ["Norte", "Noreste", "Este", "Sureste", "Sur", "Suroeste", "Oeste", "Noroeste"]
+        return f"{nombres[round(deg / 45) % 8]}({int(deg)})"
+    except Exception:
+        return str(deg)
+
+
+def _extraer_red_acc(source):
+    red = ""
+    acc = None
+    signal = ""
+    if isinstance(source, dict):
+        net = source.get("net")
+        if net is not None:
+            try:
+                net_int = int(net)
+            except (TypeError, ValueError):
+                net_int = None
+            red = _NET_MAP.get(net_int, f"Red{net}") if net_int is not None else str(net)
+            if net_int == 0:
+                signal = "Sin señal"
+            elif net_int is not None and net_int >= 3:
+                signal = "Excelente"
+            elif net_int is not None:
+                signal = "Buena"
+        ac = source.get("ac")
+        if ac == 1:
+            acc = True
+        elif ac == 0:
+            acc = False
+        status = source.get("status", source.get("statusInfo", ""))
+        if status:
+            red2, acc2, signal2 = _extraer_red_acc(str(status))
+            red = red2 or red
+            acc = acc2 if acc2 is not None else acc
+            signal = signal2 or signal
+        return red, acc, signal
+
+    text = str(source) if source else ""
+    for part in text.replace(";", ",").split(","):
+        value = part.strip()
+        lower = value.lower()
+        if value in ("4G", "3G", "2G", "WiFi", "WIFI", "EDGE", "GPRS", "LTE", "5G", "4G+"):
+            red = value
+        elif "sin señal" in lower or "no signal" in lower:
+            red = "Sin señal"
+        elif "excelente" in lower:
+            signal = "Excelente"
+        elif "buena" in lower and "señal" in lower:
+            signal = "Buena"
+        elif ("debil" in lower or "débil" in lower or "weak" in lower) and "señal" in lower:
+            signal = "Debil"
+        elif "acc activado" in lower or "acc on" in lower:
+            acc = True
+        elif "acc desactivado" in lower or "acc off" in lower:
+            acc = False
+    return red, acc, signal
+
+
+def _construir_status(track):
+    parts = []
+    net = track.get("net")
+    if net is not None:
+        try:
+            net_int = int(net)
+        except (TypeError, ValueError):
+            net_int = None
+        parts.append(_NET_MAP.get(net_int, f"Red{net}") if net_int is not None else str(net))
+    ac = track.get("ac")
+    if ac == 1:
+        parts.append("ACC activado")
+    elif ac == 0:
+        parts.append("ACC desactivado")
+    status = track.get("status", track.get("statusInfo", ""))
+    if status and str(status).strip():
+        parts.append(str(status).strip())
+    return ",".join(parts)
+
+
+def detectar_eventos_ruta(tracks, device_id):
+    eventos = []
+    prev_red = None
+    prev_signal = None
+    prev_acc = None
+    stop_start_dt = None
+    stop_start_time = ""
+    stop_start_loc = ""
+    stop_start_lat = ""
+    stop_start_lng = ""
+
+    for track in tracks or []:
+        gps_time = track.get("gpsTime", track.get("gt", ""))
+        server_time = track.get("serverTime", track.get("rt", ""))
+        speed = float(track.get("speed", track.get("sp", track.get("gpsSpeed", 0))) or 0)
+        lat = track.get("mlat", track.get("latitude", ""))
+        lng = track.get("mlng", track.get("longitude", ""))
+        if not lat and track.get("lat"):
+            lat = str(round(float(track["lat"]) / 1_000_000, 6))
+        if not lng and track.get("lng"):
+            lng = str(round(float(track["lng"]) / 1_000_000, 6))
+        location = track.get("location", track.get("address", track.get("addr", track.get("ls", ""))))
+        dt = _parse_gps_time(gps_time)
+        red, acc, signal = _extraer_red_acc(track)
+
+        if red and prev_red is not None and red != prev_red:
+            eventos.append(
+                {
+                    "alarmType": "RED",
+                    "gpsTime": gps_time,
+                    "serverTime": server_time,
+                    "alarmName": f"Cambio de red: {prev_red} -> {red}",
+                    "speed": speed,
+                    "lat": lat,
+                    "lng": lng,
+                    "location": location,
+                    "status": _construir_status(track),
+                    "detalle": f"La red cambio de {prev_red} a {red}",
+                }
+            )
+        if red:
+            prev_red = red
+
+        if signal and prev_signal is not None and signal != prev_signal:
+            eventos.append(
+                {
+                    "alarmType": "SEÑAL",
+                    "gpsTime": gps_time,
+                    "serverTime": server_time,
+                    "alarmName": f"Señal: {prev_signal} -> {signal}",
+                    "speed": speed,
+                    "lat": lat,
+                    "lng": lng,
+                    "location": location,
+                    "status": _construir_status(track),
+                    "detalle": f"Calidad de señal cambio de {prev_signal} a {signal}",
+                }
+            )
+        if signal:
+            prev_signal = signal
+
+        if acc is not None and prev_acc is not None and acc != prev_acc:
+            eventos.append(
+                {
+                    "alarmType": "ACC_ON" if acc else "ACC_OFF",
+                    "gpsTime": gps_time,
+                    "serverTime": server_time,
+                    "alarmName": "MDVR Encendido (ACC ON)" if acc else "MDVR Apagado (ACC OFF)",
+                    "speed": speed,
+                    "lat": lat,
+                    "lng": lng,
+                    "location": location,
+                    "status": _construir_status(track),
+                    "detalle": "Ignicion activada" if acc else "Ignicion desactivada",
+                }
+            )
+        if acc is not None:
+            prev_acc = acc
+
+        if speed <= 5:
+            if stop_start_dt is None:
+                stop_start_dt = dt
+                stop_start_time = gps_time
+                stop_start_loc = location
+                stop_start_lat = lat
+                stop_start_lng = lng
+        elif stop_start_dt is not None and dt is not None:
+            duration = (dt - stop_start_dt).total_seconds()
+            if duration >= 60:
+                minutes, seconds = divmod(int(duration), 60)
+                hours, minutes = divmod(minutes, 60)
+                duration_txt = f"{hours}h {minutes}m {seconds}s" if hours else f"{minutes}m {seconds}s"
+                eventos.append(
+                    {
+                        "alarmType": "DETENCION",
+                        "gpsTime": stop_start_time,
+                        "serverTime": "",
+                        "alarmName": f"Detencion {duration_txt}",
+                        "speed": 0,
+                        "lat": stop_start_lat,
+                        "lng": stop_start_lng,
+                        "location": stop_start_loc,
+                        "status": "",
+                        "detalle": f"Detenido {stop_start_time} -> {gps_time} ({duration_txt})",
+                    }
+                )
+            stop_start_dt = None
+
+    if stop_start_dt is not None and tracks:
+        last = tracks[-1]
+        last_time = last.get("gpsTime", last.get("gt", ""))
+        last_dt = _parse_gps_time(last_time)
+        if last_dt:
+            duration = (last_dt - stop_start_dt).total_seconds()
+            if duration >= 60:
+                minutes, seconds = divmod(int(duration), 60)
+                hours, minutes = divmod(minutes, 60)
+                duration_txt = f"{hours}h {minutes}m {seconds}s" if hours else f"{minutes}m {seconds}s"
+                eventos.append(
+                    {
+                        "alarmType": "DETENCION",
+                        "gpsTime": stop_start_time,
+                        "serverTime": "",
+                        "alarmName": f"Detencion {duration_txt}",
+                        "speed": 0,
+                        "lat": stop_start_lat,
+                        "lng": stop_start_lng,
+                        "location": stop_start_loc,
+                        "status": "",
+                        "detalle": f"Detenido {stop_start_time} -> {last_time} ({duration_txt})",
+                    }
+                )
+    return eventos
+
+
+COLUMNAS_TRACK = [
+    "Número de serie",
+    "Hora",
+    "Recibir Tiempo",
+    "Velocidad(km / h)",
+    "Velocidad de la grabadora de unidades(km / h)",
+    "Driving direction",
+    "Valor límite de velocidad actual del vehículo(km / h)",
+    "Tipo de carretera actual",
+    "Límite actual de velocidad en carretera(km / h)",
+    "Millas(km)",
+    "Total vehicle mileage(km)",
+    "Longitud y Latitud",
+    "Ubicación",
+    "Estado",
+    "Alarma",
+    "Información del controlador",
+    "Estado de avance y retroceso",
+    "Estado de carga y vacío",
+    "Estado sobrecargado vacío",
+    "Suplemento",
+    "Imagenes descargadas",
+]
+COLUMNAS_ALARMA = [
+    "Número de serie",
+    "Hora",
+    "Recibir Tiempo",
+    "Tipo de alarma",
+    "Nombre alarma",
+    "Velocidad(km / h)",
+    "Longitud y Latitud",
+    "Ubicación",
+    "Estado",
+    "Información adicional",
+]
+COLUMNAS_EVENTOS = [
+    "Número de serie",
+    "Hora GPS",
+    "Tipo de evento",
+    "Descripcion",
+    "Velocidad(km / h)",
+    "Longitud y Latitud",
+    "Ubicacion",
+    "Detalle",
+]
+NOMBRE_EVENTO = {
+    "RED": "Cambio de red",
+    "SEÑAL": "Cambio de señal",
+    "ACC_ON": "MDVR Encendido",
+    "ACC_OFF": "MDVR Apagado",
+    "DETENCION": "Detencion",
+}
+
+
+def _track_a_fila(index, track, device_id):
+    lat = _normalizar_coord(_pick(track, "mlat", "latitude", "lat", "mapLat", "blat"))
+    lng = _normalizar_coord(_pick(track, "mlng", "longitude", "lng", "mapLng", "blng"))
+    direction = _pick(track, "direction", "hx", "heading", "hd")
+    supplement = track.get("supplement", track.get("suplemento", track.get("ifSupplement", 0)))
+    return [
+        f"{index} {device_id}({device_id})",
+        track.get("gpsTime", track.get("gt", track.get("gps_time", ""))),
+        track.get("serverTime", track.get("rt", track.get("receive_time", ""))),
+        _normalizar_vel(_pick(track, "speed", "sp", "gpsSpeed", "gs")),
+        _normalizar_vel(_pick(track, "driverSpeed", "dspeed", "recorderSpeed", "rs", "ds")),
+        _grados_a_direccion(direction) if direction != "" else "",
+        track.get("speedLimit", track.get("vehicleSpeedLimit", None)),
+        track.get("roadType", None),
+        track.get("roadSpeedLimit", None),
+        _pick(track, "mileage", "mile", "pk", default=0) or 0,
+        _pick(track, "totalMileage", "totalMile", "tm", "pk", default=0) or 0,
+        f"{lat},{lng}" if lat and lng else "",
+        track.get("location", track.get("address", track.get("addr", track.get("ls", "")))),
+        _construir_status(track),
+        track.get("alarm", track.get("alarmInfo", track.get("alarmType", None))),
+        track.get("driverInfo", None),
+        track.get("forwardReverseStatus", None),
+        track.get("loadEmptyStatus", None),
+        track.get("overloadStatus", None),
+        "Si" if supplement and str(supplement) not in ("0", "", "None", "False") else "No",
+        track.get("downloadedImages", None),
+    ]
+
+
+def _escribir_hoja(wb, title, columns, rows):
+    font_std = Font(name="Calibri", size=12)
+    ws = wb.create_sheet(title=title)
+    for col_idx, column in enumerate(columns, 1):
+        cell = ws.cell(1, col_idx, str(column))
+        cell.font = font_std
+        ws.column_dimensions[ws.cell(1, col_idx).column_letter].width = max(16, len(str(column)) + 3)
+    for row_idx, row in enumerate(rows, 2):
+        for col_idx, value in enumerate(row, 1):
+            cell = ws.cell(row_idx, col_idx, _clean_excel(value))
+            cell.font = font_std
+    ws.freeze_panes = "A2"
+    return ws
+
+
+def exportar_excel(
+    carpeta_base: Path,
+    device_id: str,
+    fecha_ini: datetime.datetime,
+    fecha_fin: datetime.datetime,
+    gps_actual: dict,
+    tracks: list,
+    alarmas: list,
+    eventos: list,
+    log_fn,
+    *,
+    hacer_ruta=True,
+    hacer_alarmas=True,
+):
+    carpeta_base.mkdir(parents=True, exist_ok=True)
+    filename_base = (
+        f"{device_id} {fecha_ini.strftime('%Y-%m-%d %H-%M-%S')}"
+        f"~{fecha_fin.strftime('%Y-%m-%d %H-%M-%S')}"
+    )
+    route_path = None
+
+    if hacer_ruta:
+        wb = openpyxl.Workbook()
+        if "Sheet" in wb.sheetnames:
+            del wb["Sheet"]
+        rows = [_track_a_fila(index + 1, track, device_id) for index, track in enumerate(tracks or [])]
+        _escribir_hoja(wb, "Track point", COLUMNAS_TRACK, rows)
+        route_path = carpeta_base / f"{filename_base}.xlsx"
+        wb.save(route_path)
+        log_fn(f"  [OK] Ruta GPS guardada: {route_path.name} ({len(rows)} puntos)")
+
+    if hacer_alarmas:
+        wb = openpyxl.Workbook()
+        if "Sheet" in wb.sheetnames:
+            del wb["Sheet"]
+        alarm_rows = []
+        for index, alarm in enumerate(alarmas or [], 1):
+            alarm_type = str(_pick(alarm, "alarmType", "type", "atype", "alarm", "at", default="?"))
+            lat = _normalizar_coord(_pick(alarm, "mlat", "lat", "latitude", "mapLat"))
+            lng = _normalizar_coord(_pick(alarm, "mlng", "lng", "longitude", "mapLng"))
+            alarm_rows.append(
+                [
+                    f"{index} {device_id}({device_id})",
+                    _pick(alarm, "gpsTime", "gt", "alarmTime", "alarm_time", "bt"),
+                    _pick(alarm, "serverTime", "rt", "receive_time", "et"),
+                    alarm_type,
+                    TIPOS_ALARMA.get(alarm_type, f"Tipo {alarm_type}"),
+                    _normalizar_vel(_pick(alarm, "speed", "sp", "gpsSpeed")),
+                    f"{lat},{lng}" if lat and lng else "",
+                    _pick(alarm, "location", "address", "addr", "ls"),
+                    _pick(alarm, "status", "stl", "state"),
+                    _clean_excel(alarm),
+                ]
+            )
+        _escribir_hoja(wb, "Alarmas", COLUMNAS_ALARMA, alarm_rows)
+
+        event_rows = []
+        for index, event in enumerate(eventos or [], 1):
+            lat = event.get("lat", "")
+            lng = event.get("lng", "")
+            event_rows.append(
+                [
+                    f"{index} {device_id}({device_id})",
+                    event.get("gpsTime", ""),
+                    NOMBRE_EVENTO.get(event.get("alarmType", ""), event.get("alarmType", "")),
+                    event.get("alarmName", ""),
+                    event.get("speed", 0),
+                    f"{lat},{lng}" if lat and lng else "",
+                    event.get("location", ""),
+                    event.get("detalle", ""),
+                ]
+            )
+        _escribir_hoja(wb, "Eventos", COLUMNAS_EVENTOS, event_rows)
+
+        summary_alarm = {}
+        for alarm in alarmas or []:
+            alarm_type = str(alarm.get("alarmType", alarm.get("type", alarm.get("atype", "?"))))
+            summary_alarm[alarm_type] = summary_alarm.get(alarm_type, 0) + 1
+        summary_alarm_rows = [
+            (alarm_type, TIPOS_ALARMA.get(alarm_type, f"Tipo {alarm_type}"), count)
+            for alarm_type, count in sorted(summary_alarm.items(), key=lambda item: -item[1])
+        ] or [("-", "Sin alarmas registradas", 0)]
+        _escribir_hoja(wb, "Resumen Alarmas", ["Tipo", "Nombre", "Cantidad"], summary_alarm_rows)
+
+        summary_events = {}
+        for event in eventos or []:
+            event_type = NOMBRE_EVENTO.get(event.get("alarmType", ""), event.get("alarmType", ""))
+            summary_events[event_type] = summary_events.get(event_type, 0) + 1
+        summary_event_rows = [
+            (event_type, count) for event_type, count in sorted(summary_events.items(), key=lambda item: -item[1])
+        ] or [("Sin eventos detectados", 0)]
+        _escribir_hoja(wb, "Resumen Eventos", ["Tipo de evento", "Cantidad"], summary_event_rows)
+
+        alarm_path = carpeta_base / f"{device_id} {fecha_ini.strftime('%Y-%m-%d')}_Alarmas.xlsx"
+        wb.save(alarm_path)
+        log_fn(
+            f"  [OK] Alarmas+Eventos guardados: {alarm_path.name} "
+            f"({len(alarmas or [])} alarmas, {len(eventos or [])} eventos)"
+        )
+    return route_path
+
+
+class CMSV6Session:
+    def __init__(self, config: CMSV6Config):
+        self.config = config
+        self._reset_opener()
+        self.jsession = None
+        self.sid = None
+
+    def _reset_opener(self):
+        self.cookie_jar = http.cookiejar.CookieJar()
+        self.opener = urllib.request.build_opener(urllib.request.HTTPCookieProcessor(self.cookie_jar))
+
+    def login(self):
+        data = urllib.parse.urlencode(
+            {
+                "account": self.config.account,
+                "password": self.config.password,
+                "lang": "0",
+                "clientType": "web",
+            }
+        ).encode()
+        request = urllib.request.Request(
+            f"{self.config.base_url}/808gps/StandardApiAction_login.action",
+            data=data,
+            method="POST",
+        )
+        with self.opener.open(request, timeout=30) as response:
+            api_response = json.loads(response.read())
+        self.jsession = api_response.get("jsession")
+        if not self.jsession:
+            raise Exception(f"Login API sin jsession: {api_response}")
+
+        self.opener.open(f"{self.config.base_url}/808gps/login.html", timeout=30)
+        request = urllib.request.Request(
+            f"{self.config.base_url}/808gps/StandardLoginAction_initLoginSession.action?{_enc('{}')}",
+            data=b"",
+            method="POST",
+            headers={"Newv": "1"},
+        )
+        with self.opener.open(request, timeout=30) as response:
+            self.sid = json.loads(_dec(json.loads(response.read())["data"]))["jsessionId"]
+
+        password = _enc(base64.b64encode(urllib.parse.quote(self.config.password, safe="").encode()).decode())
+        login_payload = {
+            "account": self.config.account,
+            "ipson": password,
+            "language": "es",
+            "verificationCode": "",
+            "v9OldStyle": "",
+        }
+        request = urllib.request.Request(
+            f"{self.config.base_url}/808gps/StandardLoginAction_login.action?{_enc(json.dumps(login_payload))}",
+            data=b"",
+            method="POST",
+            headers={"Newv": "1", "jsessionId": self.sid},
+        )
+        with self.opener.open(request, timeout=30) as response:
+            result = _parse_response(json.loads(response.read()))
+        if result.get("result") != 0:
+            raise Exception(f"Login CMSV6 fallido: {result}")
+
+    def _post_web(self, endpoint, url_params, body_params, timeout=30):
+        url = f"{self.config.base_url}/808gps/{endpoint}?{_enc(json.dumps(url_params))}"
+        request = urllib.request.Request(
+            url,
+            data=_enc(json.dumps(body_params)).encode(),
+            method="POST",
+            headers={
+                "Newv": "1",
+                "jsessionId": self.sid,
+                "csrfToken": "",
+                "Content-Type": "text/plain;charset=UTF-8",
+            },
+        )
+        with self.opener.open(request, timeout=timeout) as response:
+            return _parse_response(json.loads(response.read().decode("utf-8")))
+
+    def _post_api(self, endpoint, params, timeout=30):
+        params = dict(params)
+        params["jsession"] = self.jsession
+        data = urllib.parse.urlencode(params).encode()
+        request = urllib.request.Request(f"{self.config.base_url}/808gps/{endpoint}", data=data, method="POST")
+        with self.opener.open(request, timeout=timeout) as response:
+            return _parse_response(json.loads(response.read()))
+
+    def get_gps(self):
+        result = self._post_web(
+            "StandardPositionAction_statusEx.action",
+            {"toMap": "1", "newv": "1"},
+            {"devIdnos": self.config.device_id},
+        )
+        return result.get("status", [])
+
+    def get_track(self, fecha):
+        begin = fecha.strftime("%Y-%m-%d") + " 00:00:00"
+        end = fecha.strftime("%Y-%m-%d") + " 23:59:59"
+        attempts = [
+            (
+                "StandardApiAction_queryTrackDetail.action",
+                {
+                    "devIdno": self.config.device_id,
+                    "begintime": begin,
+                    "endtime": end,
+                    "currentPage": 1,
+                    "pageRecords": 5000,
+                },
+            ),
+            (
+                "StandardApiAction_queryTrackInfo.action",
+                {
+                    "devIdno": self.config.device_id,
+                    "begintime": begin,
+                    "endtime": end,
+                    "currentPage": 1,
+                    "pageRecords": 5000,
+                },
+            ),
+        ]
+        for endpoint, params in attempts:
+            try:
+                result = self._post_api(endpoint, params)
+                rows = result.get("trackDetails") or result.get("tracks") or result.get("rows") or []
+                if rows:
+                    return rows
+            except Exception:
+                pass
+        return []
+
+    def get_alarms(self, fecha):
+        begin = fecha.strftime("%Y-%m-%d") + " 00:00:00"
+        end = fecha.strftime("%Y-%m-%d") + " 23:59:59"
+        attempts = [
+            (
+                "web",
+                "StandardAlarmAction_queryAlarmInfo.action",
+                {"newv": "1"},
+                {
+                    "devIdno": self.config.device_id,
+                    "begintime": begin,
+                    "endtime": end,
+                    "alarmType": -1,
+                    "currentPage": 1,
+                    "pageRecords": 5000,
+                },
+            ),
+            (
+                "api",
+                "StandardApiAction_queryAlarmInfo.action",
+                {
+                    "devIdno": self.config.device_id,
+                    "begintime": begin,
+                    "endtime": end,
+                    "alarmType": -1,
+                    "currentPage": 1,
+                    "pageRecords": 5000,
+                },
+            ),
+        ]
+        for kind, endpoint, *args in attempts:
+            try:
+                result = self._post_web(endpoint, args[0], args[1]) if kind == "web" else self._post_api(endpoint, args[0])
+                rows = result.get("alarmDetails") or result.get("alarms") or result.get("rows") or result.get("list") or []
+                if isinstance(rows, list) and rows:
+                    return rows
+            except Exception:
+                pass
+        return []
+
+    def relogin_api(self):
+        data = urllib.parse.urlencode(
+            {
+                "account": self.config.account,
+                "password": self.config.password,
+                "lang": "0",
+                "clientType": "web",
+            }
+        ).encode()
+        request = urllib.request.Request(
+            f"{self.config.base_url}/808gps/StandardApiAction_login.action",
+            data=data,
+            method="POST",
+        )
+        with self.opener.open(request, timeout=30) as response:
+            result = json.loads(response.read())
+        self.jsession = result.get("jsession")
+        if not self.jsession:
+            raise Exception(f"Re-login API sin jsession: {result}")
+
+    def full_relogin(self):
+        self._reset_opener()
+        self.jsession = None
+        self.sid = None
+        self.login()
+
+    def get_video_files(self, fecha, log_fn=None):
+        log = log_fn or (lambda _msg: None)
+        user_agent = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) CMSV6Client/4.0"
+
+        def _query(endpoint, down_type=2, fileattr=0, rectype=0, timeout=20):
+            params = {
+                "DevIDNO": self.config.device_id,
+                "LOC": 1,
+                "CHN": self.config.canales,
+                "YEAR": fecha.year,
+                "MON": fecha.month,
+                "DAY": fecha.day,
+                "RECTYPE": rectype,
+                "FILEATTR": fileattr,
+                "BEG": "00:00:00",
+                "END": "23:59:59",
+                "jsession": self.jsession,
+                "DownType": down_type,
+                "ARM1": 0,
+                "ARM2": 0,
+                "RES": 0,
+                "STREAM": -1,
+                "STORE": 0,
+            }
+            data = urllib.parse.urlencode(params).encode()
+            request = urllib.request.Request(
+                f"{self.config.base_url}/808gps/{endpoint}", data=data, method="POST"
+            )
+            request.add_header("User-Agent", user_agent)
+            with self.opener.open(request, timeout=timeout) as response:
+                return _parse_response(json.loads(response.read()))
+
+        def _extract_files(result):
+            for key in ("files", "fileList", "list", "data", "rows", "result_data"):
+                value = result.get(key)
+                if isinstance(value, list) and value:
+                    return value
+                if isinstance(value, dict):
+                    for subkey in ("files", "fileList", "list"):
+                        subvalue = value.get(subkey)
+                        if isinstance(subvalue, list) and subvalue:
+                            return subvalue
+            return []
+
+        auth_results = (32, 3)
+
+        def _query_valid(endpoint, down_type=2, fileattr=0, rectype=0, timeout=20):
+            result = _query(endpoint, down_type, fileattr, rectype, timeout)
+            if result.get("result") not in auth_results:
+                return result
+            last_auth = f"result={result.get('result')}"
+            log(f"  Sesion expirada/rechazada ({last_auth}), renovando...")
+            for attempt in range(1, 4):
+                try:
+                    self.relogin_api() if attempt == 1 else self.full_relogin()
+                    result = _query(endpoint, down_type, fileattr, rectype, timeout)
+                    if result.get("result") not in auth_results:
+                        log("  Sesion renovada correctamente.")
+                        return result
+                    last_auth = f"result={result.get('result')}"
+                except Exception as exc:
+                    last_auth = str(exc)
+                    log(f"  Re-login intento {attempt}/3 fallo: {exc}")
+                time.sleep(1)
+            raise CMSV6AuthError(f"sesion CMSV6 rechazada ({last_auth})")
+
+        ep1 = "StandardApiAction_getVideoFileInfo.action"
+        ep2 = "StandardApiAction_queryVideoFile.action"
+        combos = [
+            (ep1, 2, 0, 0),
+            (ep1, 1, 0, 0),
+            (ep1, 0, 0, 0),
+            (ep2, 2, 0, 0),
+            (ep1, 2, 15, 0),
+            (ep1, 3, 0, 0),
+            (ep1, 2, 0, 1),
+            (ep1, 2, 0, 2),
+        ]
+        result0_count = 0
+        ep2_available = True
+        for endpoint, down_type, fileattr, rectype in combos:
+            if endpoint == ep2 and not ep2_available:
+                continue
+            combo = f"{'EP1' if endpoint == ep1 else 'EP2'} DT={down_type} FA={fileattr} RT={rectype}"
+            try:
+                log(f"  Probando {combo}...")
+                result = _query_valid(endpoint, down_type, fileattr, rectype, timeout=25)
+                if result.get("result") == 0:
+                    files = _extract_files(result)
+                    if files:
+                        log(f"  OK: {len(files)} archivos ({combo})")
+                        return files
+                    result0_count += 1
+                    log(f"  Sin grabaciones ({combo})")
+                    if endpoint == ep1 and result0_count >= 3:
+                        return []
+                else:
+                    log(f"  result={result.get('result')} ({combo})")
+            except urllib.error.HTTPError as exc:
+                if exc.code == 404 and endpoint == ep2:
+                    ep2_available = False
+                    log("  EP2 no disponible (404); se omite.")
+                else:
+                    log(f"  Error HTTP {exc.code} ({combo})")
+            except CMSV6AuthError:
+                raise
+            except Exception as exc:
+                log(f"  Error consultando {combo}: {exc}")
+        return []
+
+    def refresh_url(self, url):
+        if not url or not self.jsession:
+            return url
+        if url.startswith("/"):
+            parsed_base = urllib.parse.urlparse(self.config.base_url)
+            url = f"{parsed_base.scheme}://{parsed_base.netloc}{url}"
+        elif not url.startswith("http"):
+            url = f"{self.config.base_url}/{url.lstrip('/')}"
+        if "jsession=" in url:
+            return re.sub(r"(jsession=)[^&]+", rf"\g<1>{self.jsession}", url)
+        separator = "&" if "?" in url else "?"
+        return f"{url}{separator}jsession={self.jsession}"
+
+    def download_file(
+        self,
+        url,
+        dest_path,
+        *,
+        progress_cb=None,
+        log_fn=None,
+        max_retries=10,
+        dl_timeout=120,
+        stall_secs=45,
+        min_speed_kbps=None,
+        min_speed_secs=None,
+        max_total_secs=None,
+    ):
+        log = log_fn or (lambda _msg: None)
+        dest_path = Path(dest_path)
+        last_exc = None
+        min_speed_kbps = self.config.min_speed_kbps if min_speed_kbps is None else float(min_speed_kbps)
+        min_speed_secs = self.config.min_speed_window_secs if min_speed_secs is None else int(min_speed_secs)
+        max_total_secs = self.config.max_video_download_secs if max_total_secs is None else int(max_total_secs)
+        call_start = time.monotonic()
+
+        for attempt in range(1, max_retries + 1):
+            try:
+                current_url = self.refresh_url(url)
+                offset = 0
+                if dest_path.exists() and dest_path.stat().st_size >= self.config.small_response_bytes:
+                    offset = dest_path.stat().st_size
+                    log(f"    Reanudando desde {offset / 1048576:.1f} MB")
+
+                if offset > 0 and "FOFFSET=" in current_url:
+                    current_url = re.sub(r"FOFFSET=\d+", f"FOFFSET={offset}", current_url)
+                    match = re.search(r"FLENGTH=(\d+)", current_url)
+                    if match:
+                        total_length = int(match.group(1))
+                        current_url = re.sub(r"FLENGTH=\d+", f"FLENGTH={max(total_length - offset, 0)}", current_url)
+
+                request = urllib.request.Request(current_url)
+                request.add_header("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) CMSV6Client/4.0")
+                if offset > 0 and "FOFFSET=" not in current_url:
+                    request.add_header("Range", f"bytes={offset}-")
+
+                socket_timeout = min(stall_secs, dl_timeout)
+                with self.opener.open(request, timeout=socket_timeout) as response:
+                    status_code = getattr(response, "status", 200)
+                    if status_code in (401, 403):
+                        raise Exception(f"HTTP {status_code}: sesion expirada")
+                    resumed = status_code == 206 or (offset > 0 and "FOFFSET=" in current_url)
+                    if offset > 0 and not resumed:
+                        raise Exception("Servidor no acepto reanudacion; parcial conservado")
+                    if not resumed:
+                        offset = 0
+
+                    total = int(response.headers.get("Content-Length", 0) or 0)
+                    if resumed and total > 0:
+                        total += offset
+                    downloaded = offset
+                    mode = "ab" if resumed else "wb"
+                    last_byte_t = time.monotonic()
+                    speed_t = last_byte_t
+                    speed_bytes = downloaded
+                    last_log_t = last_byte_t
+                    with open(dest_path, mode) as output:
+                        while True:
+                            now = time.monotonic()
+                            if max_total_secs and now - call_start > max_total_secs:
+                                raise DownloadTimeLimitError(
+                                    f"Tiempo maximo {max_total_secs // 60} min superado "
+                                    f"({downloaded / 1048576:.1f} MB descargados)"
+                                )
+                            try:
+                                chunk = response.read(65536)
+                            except socket.timeout:
+                                if time.monotonic() - last_byte_t >= stall_secs:
+                                    raise StalledDownloadError(f"Sin datos por {stall_secs}s")
+                                continue
+                            if not chunk:
+                                break
+                            output.write(chunk)
+                            downloaded += len(chunk)
+                            last_byte_t = time.monotonic()
+                            elapsed_speed = last_byte_t - speed_t
+                            if elapsed_speed >= min_speed_secs:
+                                delta = downloaded - speed_bytes
+                                kbps = (delta / 1024) / elapsed_speed if elapsed_speed > 0 else 0
+                                if min_speed_kbps > 0 and kbps < min_speed_kbps:
+                                    raise SlowDownloadError(
+                                        f"Velocidad baja {kbps:.1f} KB/s por {int(elapsed_speed)}s"
+                                    )
+                                speed_t = last_byte_t
+                                speed_bytes = downloaded
+                            if last_byte_t - last_log_t >= 30:
+                                log(f"    {downloaded / 1048576:.1f} MB descargados")
+                                last_log_t = last_byte_t
+                            if progress_cb:
+                                progress_cb(downloaded, total)
+                if downloaded <= offset:
+                    raise Exception("El servidor devolvio 0 bytes")
+                return downloaded
+            except (StalledDownloadError, SlowDownloadError, DownloadTimeLimitError):
+                raise
+            except urllib.error.HTTPError as exc:
+                last_exc = exc
+                if exc.code in (400, 404, 405):
+                    log(f"    HTTP {exc.code}: URL no valida")
+                    break
+                if exc.code in (401, 403):
+                    try:
+                        self.full_relogin()
+                    except Exception:
+                        pass
+                if attempt < max_retries:
+                    time.sleep(min(3 * attempt, 15))
+            except Exception as exc:
+                last_exc = exc
+                if attempt < max_retries:
+                    log(f"    Reintento {attempt}/{max_retries}: {exc}")
+                    try:
+                        self.full_relogin()
+                    except Exception:
+                        pass
+                    time.sleep(min(3 * attempt, 15))
+        raise last_exc or Exception("Descarga fallida")
+
+
+def nombre_video_cmsv6(archivo: dict, device_id: str) -> str:
+    file_path = str(archivo.get("file", "") or "")
+    if file_path:
+        return Path(os.path.basename(file_path)).stem + ".mp4"
+    channel = int(archivo.get("chn", 0) or 0)
+    begin = int(archivo.get("beg", 0) or 0)
+    end = int(archivo.get("end", 0) or 0)
+    attr = int(archivo.get("fileAttr", archivo.get("FILEATTR", 0)) or 0)
+    flags = f"{channel:02d}{attr:06d}"
+    return f"{device_id}-{datetime.datetime.now().strftime('%y%m%d')}-{begin:06d}-{end:06d}-{flags}.mp4"
+
+
+def _video_size_bytes(archivo: dict) -> int:
+    try:
+        return int(archivo.get("len", 0) or 0)
+    except (TypeError, ValueError):
+        return 0
+
+
+def _video_channel_idx(archivo: dict) -> int:
+    try:
+        return int(archivo.get("chn", 0) or 0)
+    except (TypeError, ValueError):
+        return 0
+
+
+def _filtrar_videos_testing(archivos, opts, require_downloadable=False):
+    channel = str(opts.get("test_channel", "Todos"))
+    max_mb = float(opts.get("test_max_mb", 0) or 0)
+    result = list(archivos or [])
+    if channel.startswith("CH"):
+        try:
+            channel_idx = int(channel[2:]) - 1
+            result = [item for item in result if _video_channel_idx(item) == channel_idx]
+        except ValueError:
+            pass
+    if max_mb > 0:
+        max_bytes = max_mb * 1048576
+        result = [item for item in result if _video_size_bytes(item) <= max_bytes]
+    if require_downloadable:
+        result = [
+            item
+            for item in result
+            if str(item.get("file", "") or "").strip()
+            or str(item.get("DownUrl", "") or "").strip()
+            or str(item.get("PlaybackUrl", "") or "").strip()
+        ]
+    return result
+
+
+def _ordenar_videos_testing(archivos, test_order):
+    if test_order == "size_asc":
+        return sorted(archivos, key=_video_size_bytes)
+    if test_order == "size_desc":
+        return sorted(archivos, key=_video_size_bytes, reverse=True)
+    return list(archivos)
+
+
+def _dias_en_rango(fecha_ini: datetime.datetime, fecha_fin: datetime.datetime):
+    dias = []
+    day = fecha_ini.date()
+    while day <= fecha_fin.date():
+        dias.append(day)
+        day += datetime.timedelta(days=1)
+    return dias
+
+
+def _seleccionar_video_extremo(session, dias, mode, opts, config, log_fn, set_progress, label):
+    best_arch = None
+    best_day = None
+    scan_days = list(reversed(dias)) if config.test_30d_scan_newest_first else list(dias)
+    for index, day in enumerate(scan_days, start=1):
+        pct = min(5 + int((index / max(1, len(scan_days))) * 13), 18)
+        set_progress(pct, f"[{pct}%] {label}: revisando {day.isoformat()}...")
+        log_fn(f"  [{label}] {index}/{len(scan_days)} {day.isoformat()}: consultando...")
+        files = []
+        for attempt in range(1, config.test_30d_day_retries + 2):
+            try:
+                files = session.get_video_files(datetime.datetime.combine(day, datetime.time.min), log_fn=log_fn)
+            except Exception as exc:
+                log_fn(f"    [{label}] consulta fallo: {exc}")
+                files = []
+            candidates = _filtrar_videos_testing(files, opts, require_downloadable=True)
+            candidates = [
+                item for item in candidates if _video_size_bytes(item) >= config.small_response_bytes
+            ]
+            if candidates or attempt > config.test_30d_day_retries:
+                break
+            if config.test_30d_day_retry_wait_secs:
+                time.sleep(config.test_30d_day_retry_wait_secs)
+        if not candidates:
+            log_fn(f"    [{label}] 0 candidatos utiles")
+            continue
+        candidate = min(candidates, key=_video_size_bytes) if mode == "min" else max(candidates, key=_video_size_bytes)
+        better = best_arch is None or (
+            _video_size_bytes(candidate) < _video_size_bytes(best_arch)
+            if mode == "min"
+            else _video_size_bytes(candidate) > _video_size_bytes(best_arch)
+        )
+        log_fn(
+            f"    [{label}] mejor del dia: CH{_video_channel_idx(candidate) + 1} | "
+            f"{_video_size_bytes(candidate) / 1048576:.1f} MB | "
+            f"{nombre_video_cmsv6(candidate, config.device_id)}"
+        )
+        if better:
+            best_arch = dict(candidate)
+            best_arch["_test_scan_date"] = day.isoformat()
+            best_day = day
+    if best_arch and best_day:
+        log_fn(
+            f"[{label}] Seleccion final: {best_day.isoformat()} | "
+            f"CH{_video_channel_idx(best_arch) + 1} | "
+            f"{_video_size_bytes(best_arch) / 1048576:.1f} MB | "
+            f"{nombre_video_cmsv6(best_arch, config.device_id)}"
+        )
+        return {best_day: [best_arch]}, [best_day]
+    log_fn(f"[{label}] No se encontro un video descargable con esos filtros.")
+    return {}, []
+
+
+def _descarga_suficiente(path: Path, file_len: int, config: CMSV6Config) -> bool:
+    size = path.stat().st_size if path.exists() else 0
+    if file_len > config.small_response_bytes:
+        return size >= int(file_len * 0.95)
+    return size >= config.small_response_bytes
+
+
+def _descargar_videos_dia(session, archivos, fecha, carpeta_videos_base, log_fn, set_progress, config, base_pct, end_pct):
+    resumen = {"descargados": 0, "omitidos": 0, "errores": 0, "total": len(archivos or [])}
+    if not archivos:
+        log_fn("  Sin videos para este dia.")
+        return resumen
+
+    carpeta_dia = carpeta_videos_base / fecha.strftime("%Y-%m-%d")
+    carpeta_dia.mkdir(parents=True, exist_ok=True)
+    total = len(archivos)
+    log_fn(f"  Encontrados: {total} archivos en CMSV6")
+
+    for index, archivo in enumerate(archivos, start=1):
+        nombre_mp4 = nombre_video_cmsv6(archivo, config.device_id)
+        dest_mp4 = carpeta_dia / nombre_mp4
+        dest_tmp = carpeta_dia / (Path(nombre_mp4).stem + ".tmp")
+        channel = _video_channel_idx(archivo)
+        size_mb = _video_size_bytes(archivo) / 1048576
+        expected_secs = None
+        try:
+            expected_secs = int(archivo.get("end", 0) or 0) - int(archivo.get("beg", 0) or 0)
+            if expected_secs <= 0:
+                expected_secs = None
+        except Exception:
+            expected_secs = None
+
+        v_pct_base = base_pct + 18
+        v_pct_span = max(1, end_pct - base_pct - 18)
+        v_global = min(v_pct_base + int(((index - 1) / total) * v_pct_span), 99)
+
+        if dest_mp4.exists() and dest_mp4.stat().st_size > 4096 and is_mp4(dest_mp4):
+            if _mp4_duration_ok(dest_mp4, expected_secs, log_fn):
+                log_fn(f"  [{index}/{total}] EXISTE CH{channel + 1}: {nombre_mp4}")
+                resumen["omitidos"] += 1
+                continue
+            dest_mp4.unlink()
+
+        fpath = str(archivo.get("file", "") or "").strip()
+        down_task_url = str(archivo.get("DownTaskUrl", "") or "").strip()
+        raw_down_url = str(archivo.get("DownUrl", "") or "").strip()
+        raw_play_url = str(archivo.get("PlaybackUrl", "") or "").strip()
+        file_len = int(archivo.get("len", 0) or 0)
+        if not (fpath or raw_down_url or raw_play_url):
+            log_fn(f"  [{index}/{total}] SIN datos de descarga: {nombre_mp4}")
+            resumen["errores"] += 1
+            continue
+
+        log_fn(f"\n  [{index}/{total}] CH{channel + 1} | {nombre_mp4} | {size_mb:.1f} MB")
+        set_progress(v_global, f"[{v_global}%] Video {index}/{total} CH{channel + 1}: preparando...")
+
+        if down_task_url:
+            try:
+                task_url = session.refresh_url(down_task_url).replace(" ", "%20")
+                request = urllib.request.Request(task_url, method="GET")
+                request.add_header("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64)")
+                with session.opener.open(request, timeout=20) as response:
+                    task_response = json.loads(response.read())
+                log_fn(
+                    f"    Tarea CMSV6: result={task_response.get('result', '?')} "
+                    f"id={task_response.get('taskId', task_response.get('id', '?'))}"
+                )
+                if config.task_prepare_wait_secs:
+                    log_fn(f"    Esperando preparacion ({config.task_prepare_wait_secs}s max)...")
+                    waited = 0
+                    while waited < config.task_prepare_wait_secs:
+                        step = min(config.task_poll_interval_secs, config.task_prepare_wait_secs - waited)
+                        time.sleep(step)
+                        waited += step
+                        log_fn(f"    Preparando... {waited}/{config.task_prepare_wait_secs}s")
+            except Exception as exc:
+                log_fn(f"    Tarea CMSV6 ignorada por error: {exc}")
+
+        dispositivo_online = None
+        try:
+            gps = session.get_gps()
+            if gps:
+                dispositivo_online = gps[0].get("ol") in (1, "1", True)
+        except Exception:
+            pass
+
+        candidates = []
+        if dispositivo_online is False:
+            if raw_play_url:
+                candidates.append(("PlaybackUrl", raw_play_url, config.playback_stall_secs))
+            if raw_down_url:
+                candidates.append(("DownUrl", raw_down_url, config.downurl_stall_secs))
+            log_fn("    Dispositivo OFFLINE: usando PlaybackUrl primero")
+        else:
+            if raw_down_url:
+                candidates.append(("DownUrl", raw_down_url, config.downurl_stall_secs))
+            if raw_play_url:
+                candidates.append(("PlaybackUrl", raw_play_url, config.playback_stall_secs))
+            if dispositivo_online:
+                log_fn("    Dispositivo ONLINE: usando DownUrl primero")
+
+        download_ok = False
+        last_error = "sin intento"
+
+        def progress(downloaded, total_bytes):
+            pct_file = downloaded * 100 // total_bytes if total_bytes else 0
+            global_pct = min(v_pct_base + int(((index - 1 + pct_file / 100) / total) * v_pct_span), 99)
+            set_progress(
+                global_pct,
+                f"[{global_pct}%] Video {index}/{total} CH{channel + 1}: "
+                f"{pct_file}% | {downloaded / 1048576:.1f}/{max(size_mb, 0):.1f} MB",
+            )
+
+        for round_idx in range(1, config.url_rounds + 1):
+            if download_ok:
+                break
+            if round_idx > 1:
+                try:
+                    session.full_relogin()
+                except Exception as exc:
+                    log_fn(f"    Re-login para ronda {round_idx} fallo: {exc}")
+            for label, raw_url, stall_secs in candidates:
+                try:
+                    if dest_tmp.exists() and dest_tmp.stat().st_size < config.small_response_bytes:
+                        dest_tmp.unlink()
+                    log_fn(f"    [{label}] descargando...")
+                    session.download_file(
+                        raw_url,
+                        dest_tmp,
+                        progress_cb=progress,
+                        log_fn=log_fn,
+                        max_retries=3,
+                        dl_timeout=max(120, min(int(file_len / (100 * 1024)) if file_len else 120, 1800)),
+                        stall_secs=stall_secs,
+                    )
+                    if dest_tmp.exists() and _descarga_suficiente(dest_tmp, file_len, config):
+                        if is_ssy_dvr(dest_tmp) and not ssy_dvr_has_h264(dest_tmp):
+                            last_error = "SSY_DVR sin paquetes H264"
+                            log_fn(f"    [{label}] sin video util; probando otra URL...")
+                            continue
+                        download_ok = True
+                        break
+                    last_error = "descarga incompleta o vacia"
+                    log_fn(f"    [{label}] {last_error}; probando otra URL...")
+                except (StalledDownloadError, SlowDownloadError, DownloadTimeLimitError) as exc:
+                    last_error = str(exc)
+                    log_fn(f"    [{label}] {exc}; probando otra URL...")
+                except Exception as exc:
+                    last_error = str(exc)
+                    log_fn(f"    Error [{label}]: {exc}")
+            if not download_ok and round_idx < config.url_rounds and config.url_round_wait_secs:
+                log_fn(f"    Sin exito en ronda {round_idx}; esperando {config.url_round_wait_secs}s...")
+                time.sleep(config.url_round_wait_secs)
+
+        try:
+            if not download_ok:
+                raise Exception(f"Ninguna URL funciono. Ultimo error: {last_error}")
+
+            raw4 = b""
+            if dest_tmp.exists() and dest_tmp.stat().st_size >= 4:
+                with open(dest_tmp, "rb") as archivo_tmp:
+                    raw4 = archivo_tmp.read(8)
+            fmt_hex = raw4[:4].hex() if raw4 else "????"
+            log_fn(f"    Header: {fmt_hex} | Tamaño: {dest_tmp.stat().st_size / 1048576:.2f} MB")
+
+            if is_mp4(dest_tmp):
+                if _mp4_duration_ok(dest_tmp, expected_secs, log_fn):
+                    if dest_mp4.exists():
+                        dest_mp4.unlink()
+                    dest_tmp.rename(dest_mp4)
+                    log_fn(f"    MP4 nativo: {nombre_mp4}")
+                    resumen["descargados"] += 1
+                    continue
+                log_fn("    MP4 nativo con timestamps sospechosos; reparando...")
+                if repair_mp4_timestamps(dest_tmp, dest_mp4, log_fn, expected_secs=expected_secs):
+                    dest_tmp.unlink(missing_ok=True)
+                    resumen["descargados"] += 1
+                    continue
+
+            set_progress(min(v_global + 1, 99), f"[{min(v_global + 1, 99)}%] Video {index}/{total}: convirtiendo...")
+            if convert_to_mp4(dest_tmp, dest_mp4, log_fn, expected_secs=expected_secs):
+                dest_tmp.unlink(missing_ok=True)
+                log_fn(f"    MP4 OK: {nombre_mp4} ({dest_mp4.stat().st_size / 1048576:.1f} MB)")
+                resumen["descargados"] += 1
+            else:
+                raw_dest = carpeta_dia / (Path(nombre_mp4).stem + f"_{fmt_hex}.raw")
+                if dest_tmp.exists():
+                    dest_tmp.rename(raw_dest)
+                log_fn(f"    Conversion fallo; crudo guardado: {raw_dest.name}")
+                resumen["errores"] += 1
+        except Exception as exc:
+            log_fn(f"    ERROR: {exc}")
+            resumen["errores"] += 1
+            if dest_mp4.exists() and not is_mp4(dest_mp4):
+                dest_mp4.unlink()
+
+    log_fn(
+        f"\n  VIDEOS COMPLETADOS: {resumen['descargados']} descargados | "
+        f"{resumen['omitidos']} ya existian | {resumen['errores']} errores"
+    )
+    return resumen
+
+
+def ejecutar_rango(carpeta_base, fecha_ini, fecha_fin, log_fn, set_progress, opts=None, config=None):
+    config = config or CMSV6Config.from_settings(carpeta_base)
+    config.validate()
+    opts = opts or {}
+    carpeta_base = Path(carpeta_base or config.output_dir)
+    carpeta_base.mkdir(parents=True, exist_ok=True)
+    carpeta_videos_base = carpeta_base / f"{config.device_id}({config.device_id})"
+
+    hacer_ruta = bool(opts.get("excel_ruta", True))
+    hacer_alarmas = bool(opts.get("excel_alarmas", True))
+    hacer_excel = hacer_ruta or hacer_alarmas
+    hacer_videos = bool(opts.get("videos", True))
+    test_30d_mode = str(opts.get("test_30d_mode", "off") or "off")
+    test_range_mode = str(opts.get("test_range_mode", "off") or "off")
+    if test_30d_mode not in ("off", "min", "max"):
+        test_30d_mode = "off"
+    if test_range_mode not in ("off", "min", "max"):
+        test_range_mode = "off"
+    if test_30d_mode in ("min", "max"):
+        test_range_mode = "off"
+
+    dias = _dias_en_rango(fecha_ini, fecha_fin)
+    if opts.get("testing") and test_30d_mode in ("min", "max"):
+        end_day = fecha_fin.date()
+        start_day = end_day - datetime.timedelta(days=29)
+        dias = [start_day + datetime.timedelta(days=index) for index in range(30)]
+        fecha_ini = datetime.datetime.combine(start_day, datetime.time.min)
+        fecha_fin = datetime.datetime.combine(end_day, datetime.time.max.replace(microsecond=0))
+
+    log_fn("\n" + "=" * 56)
+    log_fn(f"  {fecha_ini.strftime('%Y-%m-%d %H:%M')} -> {fecha_fin.strftime('%Y-%m-%d %H:%M')}")
+    log_fn(f"  Dias: {len(dias)}")
+    log_fn(f"  Salida: {carpeta_base}")
+    log_fn("=" * 56)
+
+    set_progress(2, "[2%] Conectando al servidor CMSV6...")
+    session = CMSV6Session(config)
+    session.login()
+    log_fn("Login CMSV6 exitoso.")
+    set_progress(5, "[5%] Login OK")
+
+    test_target_by_day = None
+    if hacer_videos and opts.get("testing") and test_30d_mode in ("min", "max"):
+        test_target_by_day, dias = _seleccionar_video_extremo(
+            session, dias, test_30d_mode, opts, config, log_fn, set_progress, "TEST 30D"
+        )
+    elif hacer_videos and opts.get("testing") and test_range_mode in ("min", "max"):
+        test_target_by_day, dias = _seleccionar_video_extremo(
+            session, dias, test_range_mode, opts, config, log_fn, set_progress, "TEST RANGO"
+        )
+
+    resumen_total = {
+        "dias": len(dias),
+        "videos_descargados": 0,
+        "videos_omitidos": 0,
+        "videos_errores": 0,
+        "salida": str(carpeta_base),
+    }
+
+    for day_index, day in enumerate(dias, start=1):
+        fecha = datetime.datetime.combine(day, datetime.time.min)
+        base_pct = 5 + int(((day_index - 1) / max(1, len(dias))) * 90)
+        end_pct = 5 + int((day_index / max(1, len(dias))) * 90)
+        day_label = fecha.strftime("%Y-%m-%d")
+        log_fn("\n" + "=" * 56)
+        log_fn(f"  Dia {day_index}/{len(dias)}: {day_label}")
+        log_fn("=" * 56)
+
+        gps_data = {}
+        if day == datetime.datetime.now().date() or day_index == len(dias):
+            set_progress(base_pct + 2, f"[{base_pct + 2}%] {day_label}: GPS...")
+            try:
+                gps_list = session.get_gps()
+                if gps_list:
+                    gps = gps_list[0]
+                    gps_data = {
+                        "Fecha/Hora": datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                        "ID Dispositivo": gps.get("id", ""),
+                        "Latitud": float(gps.get("mlat", 0)),
+                        "Longitud": float(gps.get("mlng", 0)),
+                        "Velocidad km/h": gps.get("sp", 0),
+                        "Direccion °": gps.get("hx", 0),
+                        "En linea": "Si" if gps.get("ol") else "No",
+                        "Hora GPS": gps.get("gt", ""),
+                        "Hora servidor": gps.get("rt", ""),
+                        "Señal red": gps.get("net", ""),
+                        "Kilometraje": gps.get("mileage", ""),
+                        "Estado": gps.get("status", ""),
+                        "raw": gps,
+                    }
+                    log_fn(
+                        f"  GPS OK: Lat={gps_data['Latitud']:.5f} | "
+                        f"Lng={gps_data['Longitud']:.5f} | Online={gps_data['En linea']}"
+                    )
+                else:
+                    log_fn("  Sin datos GPS.")
+            except Exception as exc:
+                log_fn(f"  ERROR GPS: {exc}")
+
+        set_progress(base_pct + 7, f"[{base_pct + 7}%] {day_label}: ruta GPS...")
+        try:
+            tracks = session.get_track(fecha)
+            log_fn(f"  Ruta: {len(tracks)} puntos obtenidos")
+        except Exception as exc:
+            tracks = []
+            log_fn(f"  ERROR ruta: {exc}")
+
+        set_progress(base_pct + 12, f"[{base_pct + 12}%] {day_label}: alarmas...")
+        try:
+            alarmas = session.get_alarms(fecha)
+            log_fn(f"  Alarmas: {len(alarmas)} obtenidas")
+        except Exception as exc:
+            alarmas = []
+            log_fn(f"  ERROR alarmas: {exc}")
+
+        eventos = []
+        if hacer_excel and tracks:
+            set_progress(base_pct + 15, f"[{base_pct + 15}%] {day_label}: eventos...")
+            try:
+                eventos = detectar_eventos_ruta(tracks, config.device_id)
+                log_fn(f"  Eventos detectados: {len(eventos)}")
+            except Exception as exc:
+                log_fn(f"  ERROR eventos: {exc}")
+
+        if hacer_excel and (gps_data or tracks or alarmas or eventos):
+            set_progress(base_pct + 18, f"[{base_pct + 18}%] {day_label}: generando Excel...")
+            try:
+                exportar_excel(
+                    carpeta_base,
+                    config.device_id,
+                    datetime.datetime.combine(day, datetime.time.min),
+                    datetime.datetime.combine(day, datetime.time.max.replace(microsecond=0)),
+                    gps_data,
+                    tracks,
+                    alarmas,
+                    eventos,
+                    log_fn,
+                    hacer_ruta=hacer_ruta,
+                    hacer_alarmas=hacer_alarmas,
+                )
+            except Exception as exc:
+                log_fn(f"  ERROR Excel: {exc}")
+        elif not hacer_excel:
+            log_fn("  Excel omitido por opciones.")
+
+        if not hacer_videos:
+            log_fn("  Videos omitidos por opciones.")
+            continue
+
+        set_progress(base_pct + 18, f"[{base_pct + 18}%] {day_label}: buscando videos...")
+        if test_target_by_day is not None:
+            archivos = test_target_by_day.get(day, [])
+        else:
+            archivos = session.get_video_files(fecha, log_fn=log_fn)
+            if archivos and opts.get("testing"):
+                total_servidor = len(archivos)
+                archivos = _filtrar_videos_testing(archivos, opts)
+                archivos = _ordenar_videos_testing(archivos, str(opts.get("test_order", "size_asc")))
+                archivos = archivos[: max(1, int(opts.get("test_limit", 1) or 1))]
+                log_fn(f"  [TEST] Seleccionados: {len(archivos)}/{total_servidor} clips")
+
+        resumen_dia = _descargar_videos_dia(
+            session,
+            archivos,
+            fecha,
+            carpeta_videos_base,
+            log_fn,
+            set_progress,
+            config,
+            base_pct,
+            end_pct,
+        )
+        resumen_total["videos_descargados"] += resumen_dia["descargados"]
+        resumen_total["videos_omitidos"] += resumen_dia["omitidos"]
+        resumen_total["videos_errores"] += resumen_dia["errores"]
+
+    set_progress(100, "Completado")
+    log_fn(f"\n[OK] Todo en: {carpeta_base}\n")
+    return resumen_total
+
+
+def _parse_datetime(value: str, *, end_of_day=False):
+    value = str(value or "").strip()
+    if not value:
+        raise ValidationError("Fecha/hora requerida.")
+    if len(value) == 10:
+        suffix = "23:59" if end_of_day else "00:00"
+        value = f"{value} {suffix}"
+    for fmt in ("%Y-%m-%d %H:%M", "%Y-%m-%d %H:%M:%S"):
+        try:
+            return datetime.datetime.strptime(value, fmt)
+        except ValueError:
+            continue
+    raise ValidationError("Formato de fecha/hora inválido. Use YYYY-MM-DD HH:MM.")
+
+
+def ejecutar_job_cmsv6(params, log_fn, set_progress):
+    params = dict(params or {})
+    config = CMSV6Config.from_settings(params.get("output_dir"))
+    config.validate()
+    output_dir = params.get("output_dir") or config.output_dir
+    mode = str(params.get("modo", "dia") or "dia")
+    opts = {
+        "excel_ruta": bool(params.get("excel_ruta", True)),
+        "excel_alarmas": bool(params.get("excel_alarmas", True)),
+        "videos": bool(params.get("videos", True)),
+        "testing": bool(params.get("testing", False)),
+        "test_order": params.get("test_order", "size_asc"),
+        "test_limit": int(params.get("test_limit", 1) or 1),
+        "test_max_mb": float(params.get("test_max_mb", 0) or 0),
+        "test_channel": params.get("test_channel", "Todos"),
+        "test_30d_mode": params.get("test_30d_mode", "off"),
+        "test_range_mode": params.get("test_range_mode", "off"),
+    }
+
+    results = []
+    if mode == "dia":
+        day = _parse_datetime(str(params.get("dia") or datetime.datetime.now().strftime("%Y-%m-%d")))
+        fecha_ini = day.replace(hour=0, minute=0, second=0, microsecond=0)
+        fecha_fin = day.replace(hour=23, minute=59, second=59, microsecond=0)
+        results.append(ejecutar_rango(output_dir, fecha_ini, fecha_fin, log_fn, set_progress, opts, config))
+    elif mode == "rango":
+        fecha_ini = _parse_datetime(params.get("fecha_inicio"))
+        fecha_fin = _parse_datetime(params.get("fecha_fin"), end_of_day=True)
+        if fecha_ini > fecha_fin:
+            fecha_ini, fecha_fin = fecha_fin, fecha_ini
+        results.append(ejecutar_rango(output_dir, fecha_ini, fecha_fin, log_fn, set_progress, opts, config))
+    elif mode == "auto":
+        start_at = _parse_datetime(params.get("fecha_inicio") or datetime.datetime.now().strftime("%Y-%m-%d %H:%M"))
+        interval_minutes = max(1, int(params.get("intervalo_minutos", 15) or 15))
+        max_cycles = max(0, int(params.get("auto_ciclos", 1) or 0))
+        cycle = 0
+        while max_cycles == 0 or cycle < max_cycles:
+            cycle += 1
+            now = datetime.datetime.now()
+            if cycle == 1 and start_at > now:
+                wait_seconds = int((start_at - now).total_seconds())
+                log_fn(f"Esperando inicio automatico: {start_at.strftime('%Y-%m-%d %H:%M')}")
+                for _ in range(wait_seconds):
+                    time.sleep(1)
+            now = datetime.datetime.now()
+            log_fn(f"\n[AUTO] Ciclo {cycle}: {now.strftime('%Y-%m-%d %H:%M')}")
+            results.append(ejecutar_rango(output_dir, now, now, log_fn, set_progress, opts, config))
+            if max_cycles and cycle >= max_cycles:
+                break
+            log_fn(f"[AUTO] Proxima ejecucion en {interval_minutes} minutos.")
+            for _ in range(interval_minutes * 60):
+                time.sleep(1)
+    else:
+        raise ValidationError("Modo CMSV6 inválido.")
+
+    import_result = None
+    if params.get("importar_django", True):
+        from dashboard.services.importar_videos_mdvr import importar_videos_mdvr
+
+        log_fn("Importando archivos descargados a modelos Django...")
+        import_result = importar_videos_mdvr(base_dir=output_dir, importar_velocidades=True)
+        log_fn(
+            "Importacion Django finalizada: "
+            f"{import_result.get('videos_creados', 0)} videos procesados."
+        )
+
+    return {"resultados_descarga": results, "importacion_django": import_result, "salida": output_dir}
+
+
+def resolver_ruta_cmsv6_output(path_value: str, *, output_dir: str | None = None, must_exist=True) -> Path:
+    config = CMSV6Config.from_settings(output_dir)
+    base = Path(config.output_dir).resolve()
+    value = str(path_value or "").strip().strip('"')
+    if not value:
+        raise ValidationError("Debe indicar una ruta de archivo.")
+    path = Path(value)
+    if not path.is_absolute():
+        path = base / path
+    path = path.resolve()
+    if not (path == base or str(path).startswith(str(base) + os.sep)):
+        raise ValidationError("La ruta indicada debe estar dentro de CMSV6_OUTPUT_DIR.")
+    if must_exist and not path.is_file():
+        raise ValidationError("El archivo indicado no existe.")
+    return path
+
+
+def _ffprobe_json(path: Path, args, timeout=60):
+    command = [_ffprobe_exe(), "-v", "error", "-print_format", "json", *list(args), str(path)]
+    try:
+        result = subprocess.run(command, capture_output=True, timeout=timeout, check=False)
+    except FileNotFoundError:
+        return None, "ffprobe no encontrado"
+    except subprocess.TimeoutExpired:
+        return None, f"ffprobe timeout ({timeout}s)"
+    if result.returncode != 0:
+        error = result.stderr.decode("utf-8", "replace").strip()
+        return None, error or f"ffprobe retorno {result.returncode}"
+    try:
+        return json.loads(result.stdout.decode("utf-8", "replace") or "{}"), None
+    except ValueError as exc:
+        return None, f"JSON ffprobe invalido: {exc}"
+
+
+def _fmt_duration(seconds):
+    try:
+        seconds = float(seconds)
+    except (TypeError, ValueError):
+        return "-"
+    hours, rem = divmod(int(round(seconds)), 3600)
+    minutes, secs = divmod(rem, 60)
+    if hours:
+        return f"{hours}h {minutes:02d}m {secs:02d}s"
+    if minutes:
+        return f"{minutes}m {secs:02d}s"
+    return f"{secs}s"
+
+
+def analizar_mp4_reporte(path_like):
+    path = Path(path_like)
+    lines = ["=== Archivo ===", f"Ruta: {path}"]
+    if not path.exists():
+        lines.append("ERROR: archivo no existe.")
+        return "\n".join(lines)
+    stat = path.stat()
+    lines.append(f"Tamano: {stat.st_size} bytes ({stat.st_size / 1048576:.2f} MB)")
+    lines.append(f"Modificado: {datetime.datetime.fromtimestamp(stat.st_mtime).strftime('%Y-%m-%d %H:%M:%S')}")
+    expected = _expected_secs_from_name(path)
+    if expected:
+        lines.append(f"Duracion esperada por nombre: {expected}s ({_fmt_duration(expected)})")
+    try:
+        with open(path, "rb") as archivo:
+            lines.append(f"Primeros 16 bytes: {archivo.read(16).hex(' ')}")
+    except OSError as exc:
+        lines.append(f"No se pudo leer header: {exc}")
+
+    lines.extend(["", "=== ffprobe format/streams ==="])
+    probe, error = _ffprobe_json(path, ["-show_format", "-show_streams"], timeout=60)
+    if error:
+        lines.append(f"ERROR ffprobe: {error}")
+    else:
+        fmt = probe.get("format", {})
+        duration = fmt.get("duration")
+        lines.append(
+            f"format={fmt.get('format_name', '?')} duration={duration} "
+            f"({_fmt_duration(duration)}) bit_rate={fmt.get('bit_rate', '?')}"
+        )
+        for index, stream in enumerate(probe.get("streams", [])):
+            lines.append(
+                f"stream#{index} type={stream.get('codec_type')} codec={stream.get('codec_name')} "
+                f"duration={stream.get('duration')} ({_fmt_duration(stream.get('duration'))}) "
+                f"avg_fps={stream.get('avg_frame_rate')} r_fps={stream.get('r_frame_rate')} "
+                f"frames={stream.get('nb_frames', '?')}"
+            )
+
+    lines.extend(["", "=== ffprobe count_frames video ==="])
+    frames, error = _ffprobe_json(
+        path,
+        [
+            "-count_frames",
+            "-select_streams",
+            "v:0",
+            "-show_entries",
+            "stream=nb_read_frames,nb_read_packets,avg_frame_rate,r_frame_rate,duration,time_base",
+        ],
+        timeout=120,
+    )
+    if error:
+        lines.append(f"ERROR count_frames: {error}")
+    else:
+        for stream in frames.get("streams", []):
+            lines.append(
+                f"video frames_leidos={stream.get('nb_read_frames', '?')} "
+                f"packets={stream.get('nb_read_packets', '?')} "
+                f"duration={stream.get('duration')} avg={stream.get('avg_frame_rate')} "
+                f"r={stream.get('r_frame_rate')}"
+            )
+    return "\n".join(lines)
+
+
+def reparar_mp4_en_salida(path_value: str, *, output_dir: str | None = None) -> dict:
+    src = resolver_ruta_cmsv6_output(path_value, output_dir=output_dir)
+    out = src.with_name(src.stem + "_reparado.mp4")
+    index = 2
+    while out.exists():
+        out = src.with_name(f"{src.stem}_reparado_{index}.mp4")
+        index += 1
+    logs = []
+    ok = repair_mp4_timestamps(src, out, logs.append, expected_secs=_expected_secs_from_name(src))
+    return {"ok": ok, "origen": str(src), "salida": str(out), "logs": logs}
+
+
+def recortar_mp4_en_salida(path_value: str, *, output_dir: str | None = None, denominator=3) -> dict:
+    src = resolver_ruta_cmsv6_output(path_value, output_dir=output_dir)
+    out = src.with_name(src.stem + "_primer_tercio.mp4")
+    index = 2
+    while out.exists():
+        out = src.with_name(f"{src.stem}_primer_tercio_{index}.mp4")
+        index += 1
+    logs = []
+    ok = cut_mp4_first_fraction(src, out, logs.append, denominator=denominator)
+    return {"ok": ok, "origen": str(src), "salida": str(out), "logs": logs}
