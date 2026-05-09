@@ -67,3 +67,18 @@ class CMSV6AsyncPipelineTests(SimpleTestCase):
             importar_velocidades=False,
             fecha_objetivo="2026-05-04",
         )
+
+    def test_importar_videos_mdvr_periodica_se_omite_si_monitor_activo(self):
+        monitor = {"id": "cmsv6-monitor-mdvr-semanal", "origen": "active"}
+        with patch(
+            "dashboard.tasks._monitor_mdvr_activo_en_workers",
+            return_value=monitor,
+        ), patch("dashboard.tasks.importar_videos_mdvr") as importar:
+            resultado = importar_videos_mdvr_task.run(
+                omitir_si_monitor_activo=True,
+            )
+
+        self.assertTrue(resultado["skipped"])
+        self.assertEqual(resultado["reason"], "monitor_mdvr_semanal_activo")
+        self.assertEqual(resultado["worker_task"], monitor)
+        importar.assert_not_called()

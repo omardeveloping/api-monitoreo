@@ -68,8 +68,18 @@ def importar_videos_mdvr_task(
     importar_velocidades: bool = True,
     fecha_objetivo: str | None = None,
     base_dir: str | None = None,
+    omitir_si_monitor_activo: bool = False,
 ):
     """Importa videos MDVR desde el servidor y los asocia a turnos."""
+    if omitir_si_monitor_activo:
+        monitor_activo = _monitor_mdvr_activo_en_workers()
+        if monitor_activo:
+            return {
+                "skipped": True,
+                "reason": "monitor_mdvr_semanal_activo",
+                "worker_task": monitor_activo,
+            }
+
     return importar_videos_mdvr(
         base_dir=base_dir,
         importar_velocidades=importar_velocidades,

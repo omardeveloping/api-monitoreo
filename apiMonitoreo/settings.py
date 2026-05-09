@@ -303,6 +303,7 @@ CELERY_BEAT_SCHEDULE = {
     "importar-videos-mdvr": {
         "task": "dashboard.tasks.importar_videos_mdvr_task",
         "schedule": 60.0 * 15,  # cada 15 minutos
+        "kwargs": {"omitir_si_monitor_activo": True},
     },
     "asegurar-monitor-mdvr-semanal": {
         "task": "dashboard.tasks.asegurar_monitor_mdvr_semanal_task",
