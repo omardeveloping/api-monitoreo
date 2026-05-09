@@ -190,6 +190,34 @@ class CMSV6AuthError(Exception):
     pass
 
 
+def _cmsv6_url_int_param(url: str, name: str) -> int | None:
+    try:
+        query = urllib.parse.urlparse(url).query
+        for key, value in urllib.parse.parse_qsl(query, keep_blank_values=True):
+            if key.upper() == name.upper():
+                return int(value)
+    except (TypeError, ValueError):
+        return None
+    return None
+
+
+def _cmsv6_url_reset_foffset(url: str) -> str:
+    parsed = urllib.parse.urlparse(url)
+    if not parsed.query:
+        return url
+    pairs = urllib.parse.parse_qsl(parsed.query, keep_blank_values=True)
+    changed = False
+    updated = []
+    for key, value in pairs:
+        if key.upper() == "FOFFSET":
+            value = "0"
+            changed = True
+        updated.append((key, value))
+    if not changed:
+        return url
+    return urllib.parse.urlunparse(parsed._replace(query=urllib.parse.urlencode(updated)))
+
+
 def _crypto_imports():
     try:
         from Crypto.Cipher import AES
@@ -1444,6 +1472,30 @@ class CMSV6Session:
         separator = "&" if "?" in url else "?"
         return f"{url}{separator}jsession={self.jsession}"
 
+    def _partial_matches_server(self, current_url, dest_path: Path, offset: int, timeout: int, log) -> bool:
+        probe_len = min(64 * 1024, offset)
+        if probe_len <= 0:
+            return True
+        probe_start = offset - probe_len
+        request = urllib.request.Request(current_url)
+        request.add_header("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) CMSV6Client/4.0")
+        request.add_header("Range", f"bytes={probe_start}-")
+        with self.opener.open(request, timeout=timeout) as response:
+            status_code = getattr(response, "status", response.getcode())
+            if probe_start > 0 and status_code != 206:
+                raise Exception("Servidor no acepto validacion HTTP Range del parcial")
+            remote_probe = response.read(probe_len)
+        if len(remote_probe) != probe_len:
+            raise Exception("Servidor devolvio probe incompleto para validar parcial")
+        with open(dest_path, "rb") as local_file:
+            local_file.seek(probe_start)
+            local_probe = local_file.read(probe_len)
+        if local_probe == remote_probe:
+            log(f"    Parcial validado con HTTP Range ({offset / 1048576:.1f} MB)")
+            return True
+        log("    Parcial no coincide con servidor; reiniciando ese archivo para evitar duplicados")
+        return False
+
     def download_file(
         self,
         url,
@@ -1468,22 +1520,33 @@ class CMSV6Session:
 
         for attempt in range(1, max_retries + 1):
             try:
-                current_url = self.refresh_url(url)
+                current_url = _cmsv6_url_reset_foffset(self.refresh_url(url))
+                expected_total = _cmsv6_url_int_param(current_url, "FLENGTH")
                 offset = 0
                 if dest_path.exists() and dest_path.stat().st_size >= self.config.small_response_bytes:
                     offset = dest_path.stat().st_size
                     log(f"    Reanudando desde {offset / 1048576:.1f} MB")
 
-                if offset > 0 and "FOFFSET=" in current_url:
-                    current_url = re.sub(r"FOFFSET=\d+", f"FOFFSET={offset}", current_url)
-                    match = re.search(r"FLENGTH=(\d+)", current_url)
-                    if match:
-                        total_length = int(match.group(1))
-                        current_url = re.sub(r"FLENGTH=\d+", f"FLENGTH={max(total_length - offset, 0)}", current_url)
+                if expected_total and offset > expected_total:
+                    log(
+                        f"    Parcial excede tamano esperado "
+                        f"({offset / 1048576:.1f}/{expected_total / 1048576:.1f} MB); reiniciando"
+                    )
+                    dest_path.unlink()
+                    offset = 0
+
+                if offset > 0:
+                    if self._partial_matches_server(current_url, dest_path, offset, min(stall_secs, dl_timeout), log):
+                        if expected_total and offset == expected_total:
+                            log("    Archivo temporal ya esta completo; no se re-descarga")
+                            return offset
+                    else:
+                        dest_path.unlink()
+                        offset = 0
 
                 request = urllib.request.Request(current_url)
                 request.add_header("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) CMSV6Client/4.0")
-                if offset > 0 and "FOFFSET=" not in current_url:
+                if offset > 0:
                     request.add_header("Range", f"bytes={offset}-")
 
                 socket_timeout = min(stall_secs, dl_timeout)
@@ -1491,15 +1554,14 @@ class CMSV6Session:
                     status_code = getattr(response, "status", 200)
                     if status_code in (401, 403):
                         raise Exception(f"HTTP {status_code}: sesion expirada")
-                    resumed = status_code == 206 or (offset > 0 and "FOFFSET=" in current_url)
-                    if offset > 0 and not resumed:
-                        raise Exception("Servidor no acepto reanudacion; parcial conservado")
-                    if not resumed:
-                        offset = 0
+                    resumed = offset > 0
+                    if resumed and status_code != 206:
+                        raise Exception("Servidor no acepto reanudacion HTTP Range; parcial conservado")
 
-                    total = int(response.headers.get("Content-Length", 0) or 0)
-                    if resumed and total > 0:
-                        total += offset
+                    content_length = int(response.headers.get("Content-Length", 0) or 0)
+                    total = expected_total or content_length
+                    if resumed and content_length > 0 and not expected_total:
+                        total = content_length + offset
                     downloaded = offset
                     mode = "ab" if resumed else "wb"
                     last_byte_t = time.monotonic()
@@ -1522,6 +1584,15 @@ class CMSV6Session:
                                 continue
                             if not chunk:
                                 break
+                            if expected_total and downloaded >= expected_total:
+                                break
+                            reached_expected_total = False
+                            if expected_total and downloaded + len(chunk) > expected_total:
+                                allowed = expected_total - downloaded
+                                if allowed <= 0:
+                                    break
+                                chunk = chunk[:allowed]
+                                reached_expected_total = True
                             output.write(chunk)
                             downloaded += len(chunk)
                             last_byte_t = time.monotonic()
@@ -1540,8 +1611,12 @@ class CMSV6Session:
                                 last_log_t = last_byte_t
                             if progress_cb:
                                 progress_cb(downloaded, total)
+                            if reached_expected_total:
+                                break
                 if downloaded <= offset:
                     raise Exception("El servidor devolvio 0 bytes")
+                if expected_total and downloaded > expected_total:
+                    raise Exception("Descarga excedio el tamano esperado")
                 return downloaded
             except (StalledDownloadError, SlowDownloadError, DownloadTimeLimitError):
                 raise
@@ -1743,7 +1818,9 @@ def _seleccionar_video_extremo(session, dias, mode, opts, config, log_fn, set_pr
 def _descarga_suficiente(path: Path, file_len: int, config: CMSV6Config) -> bool:
     size = path.stat().st_size if path.exists() else 0
     if file_len > config.small_response_bytes:
-        return size >= int(file_len * 0.95)
+        min_size = int(file_len * 0.95)
+        max_size = max(file_len + config.small_response_bytes, int(file_len * 1.05))
+        return min_size <= size <= max_size
     return size >= config.small_response_bytes
 
 
