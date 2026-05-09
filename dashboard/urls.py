@@ -3,6 +3,7 @@ from rest_framework import routers
 from .views import (
     CamionViewSet,
     TurnoViewSet,
+    MonitoreoMDVRSemanalViewSet,
     VideoViewSet,
     IncidenteViewSet,
     EspacioDiscoViewSet,
@@ -11,6 +12,7 @@ from .views import (
 router = routers.DefaultRouter()
 router.register(r'camiones', CamionViewSet)
 router.register(r'turnos', TurnoViewSet)
+router.register(r'monitoreo-mdvr-semanal', MonitoreoMDVRSemanalViewSet, basename='monitoreo-mdvr-semanal')
 router.register(r'videos', VideoViewSet)
 # router.register(r'operadores', OperadorViewSet)
 # router.register(r'mantenimientos', MantenimientoViewSet)

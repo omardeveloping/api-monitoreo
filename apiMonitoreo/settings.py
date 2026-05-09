@@ -248,6 +248,15 @@ CMSV6_TEST_30D_DAY_RETRIES = os.environ.get("CMSV6_TEST_30D_DAY_RETRIES", "0")
 CMSV6_TEST_30D_DAY_RETRY_WAIT_SECS = os.environ.get("CMSV6_TEST_30D_DAY_RETRY_WAIT_SECS", "10")
 CMSV6_TEST_30D_SCAN_NEWEST_FIRST = os.environ.get("CMSV6_TEST_30D_SCAN_NEWEST_FIRST", "1")
 CMSV6_SMALL_RESPONSE_BYTES = os.environ.get("CMSV6_SMALL_RESPONSE_BYTES", "4096")
+CMSV6_MONITOR_SEMANAL_INTERVAL_MINUTES = os.environ.get(
+    "CMSV6_MONITOR_SEMANAL_INTERVAL_MINUTES", "60"
+)
+CMSV6_MONITOR_SEMANAL_BEAT_INTERVAL_SECONDS = os.environ.get(
+    "CMSV6_MONITOR_SEMANAL_BEAT_INTERVAL_SECONDS", "60"
+)
+CMSV6_MONITOR_SEMANAL_STALE_MINUTES = os.environ.get(
+    "CMSV6_MONITOR_SEMANAL_STALE_MINUTES", "120"
+)
 
 # Ruta a monitorear para uso de disco. Cambia con la variable de entorno ESPACIO_DISCO_RUTA.
 ESPACIO_DISCO_RUTA = os.environ.get("ESPACIO_DISCO_RUTA", "/")
@@ -262,6 +271,8 @@ CELERY_TASK_TRACK_STARTED = True
 CELERY_WORKER_PREFETCH_MULTIPLIER = 1
 CELERY_TASK_ROUTES = {
     "dashboard.tasks.importar_videos_mdvr_task": {"queue": "mdvr"},
+    "dashboard.tasks.asegurar_monitor_mdvr_semanal_task": {"queue": "mdvr"},
+    "dashboard.tasks.cmsv6_monitor_mdvr_semanal_task": {"queue": "mdvr"},
     "dashboard.tasks.cmsv6_descargar_task": {"queue": "mdvr"},
     "dashboard.tasks.cmsv6_analizar_mp4_task": {"queue": "mdvr"},
     "dashboard.tasks.cmsv6_reparar_mp4_task": {"queue": "mdvr"},
@@ -292,6 +303,10 @@ CELERY_BEAT_SCHEDULE = {
     "importar-videos-mdvr": {
         "task": "dashboard.tasks.importar_videos_mdvr_task",
         "schedule": 60.0 * 15,  # cada 15 minutos
+    },
+    "asegurar-monitor-mdvr-semanal": {
+        "task": "dashboard.tasks.asegurar_monitor_mdvr_semanal_task",
+        "schedule": float(CMSV6_MONITOR_SEMANAL_BEAT_INTERVAL_SECONDS),
     },
 }
 

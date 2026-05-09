@@ -23,6 +23,7 @@ from dashboard.models import (
     Video,
 )
 from dashboard.serializers import VideoSerializer
+from dashboard.services.cmsv6_downloader import nombre_video_cmsv6
 from dashboard.services.importar_velocidades_csv import importar_velocidades_tabulares
 from dashboard.services.importar_videos_mdvr import (
     SegmentoVideo,
@@ -239,6 +240,23 @@ class ProcesamientoVideoTimerTests(TestCase):
 
 
 class SegmentoDesdeArchivoTests(SimpleTestCase):
+    def test_nombre_cmsv6_sintetico_es_compatible_con_parser_mdvr(self):
+        nombre = nombre_video_cmsv6(
+            {
+                "file": "/mnt/mdvr/4462510196-260202-041706-051706-00000000.grec",
+                "chn": 2,
+                "beg": 41706,
+                "end": 51706,
+            },
+            "4462510196",
+            datetime.date(2026, 2, 2),
+        )
+
+        self.assertEqual(nombre, "4462510196-260202-041706-051706-20010300.mp4")
+        segmento = _segmento_desde_archivo(f"/tmp/{nombre}", datetime.date(2026, 2, 2))
+        self.assertIsNotNone(segmento)
+        self.assertEqual(segmento.camara, 3)
+
     def test_soporta_formato_mdvr_legacy(self):
         segmento = _segmento_desde_archivo(
             "/tmp/201-01-114614-120114-10p000.h264",

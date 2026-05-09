@@ -1569,16 +1569,67 @@ class CMSV6Session:
         raise last_exc or Exception("Descarga fallida")
 
 
-def nombre_video_cmsv6(archivo: dict, device_id: str) -> str:
+_CMSV6_MDVR_LEGACY_NAME_RE = re.compile(
+    r"^\d+-(?P<camara>\d{2})-\d{6}-\d{6}-.+\.(?:h264|grec|mp4)$",
+    re.IGNORECASE,
+)
+_CMSV6_MDVR_NEW_NAME_RE = re.compile(
+    r"^\d+-\d{6}-\d{6}-\d{6}-(?P<codigo>\d+)\.(?:grec|mp4)$",
+    re.IGNORECASE,
+)
+
+
+def _fecha_nombre_video(fecha: datetime.date | datetime.datetime | None) -> datetime.date:
+    if isinstance(fecha, datetime.datetime):
+        return fecha.date()
+    if isinstance(fecha, datetime.date):
+        return fecha
+    return datetime.datetime.now().date()
+
+
+def _codigo_video_compatible_mdvr(channel: int) -> str:
+    camara = channel + 1 if 0 <= channel <= 3 else channel
+    if camara not in {1, 2, 3, 4}:
+        camara = 1
+    return f"2001{camara:02d}00"
+
+
+def _nombre_compatible_mdvr(nombre: str) -> bool:
+    match_legacy = _CMSV6_MDVR_LEGACY_NAME_RE.match(nombre or "")
+    if match_legacy:
+        try:
+            return int(match_legacy.group("camara")) in {1, 2, 3, 4}
+        except (TypeError, ValueError):
+            return False
+
+    match_nuevo = _CMSV6_MDVR_NEW_NAME_RE.match(nombre or "")
+    if not match_nuevo:
+        return False
+    codigo = match_nuevo.group("codigo")
+    if not codigo or len(codigo) < 6:
+        return False
+    try:
+        return int(codigo[4:6]) in {1, 2, 3, 4}
+    except ValueError:
+        return False
+
+
+def nombre_video_cmsv6(
+    archivo: dict,
+    device_id: str,
+    fecha: datetime.date | datetime.datetime | None = None,
+) -> str:
     file_path = str(archivo.get("file", "") or "")
     if file_path:
-        return Path(os.path.basename(file_path)).stem + ".mp4"
+        nombre_original = Path(os.path.basename(file_path)).stem + ".mp4"
+        if _nombre_compatible_mdvr(nombre_original):
+            return nombre_original
     channel = int(archivo.get("chn", 0) or 0)
     begin = int(archivo.get("beg", 0) or 0)
     end = int(archivo.get("end", 0) or 0)
-    attr = int(archivo.get("fileAttr", archivo.get("FILEATTR", 0)) or 0)
-    flags = f"{channel:02d}{attr:06d}"
-    return f"{device_id}-{datetime.datetime.now().strftime('%y%m%d')}-{begin:06d}-{end:06d}-{flags}.mp4"
+    fecha_nombre = _fecha_nombre_video(fecha)
+    codigo = _codigo_video_compatible_mdvr(channel)
+    return f"{device_id}-{fecha_nombre.strftime('%y%m%d')}-{begin:06d}-{end:06d}-{codigo}.mp4"
 
 
 def _video_size_bytes(archivo: dict) -> int:
@@ -1671,7 +1722,7 @@ def _seleccionar_video_extremo(session, dias, mode, opts, config, log_fn, set_pr
         log_fn(
             f"    [{label}] mejor del dia: CH{_video_channel_idx(candidate) + 1} | "
             f"{_video_size_bytes(candidate) / 1048576:.1f} MB | "
-            f"{nombre_video_cmsv6(candidate, config.device_id)}"
+            f"{nombre_video_cmsv6(candidate, config.device_id, day)}"
         )
         if better:
             best_arch = dict(candidate)
@@ -1682,7 +1733,7 @@ def _seleccionar_video_extremo(session, dias, mode, opts, config, log_fn, set_pr
             f"[{label}] Seleccion final: {best_day.isoformat()} | "
             f"CH{_video_channel_idx(best_arch) + 1} | "
             f"{_video_size_bytes(best_arch) / 1048576:.1f} MB | "
-            f"{nombre_video_cmsv6(best_arch, config.device_id)}"
+            f"{nombre_video_cmsv6(best_arch, config.device_id, best_day)}"
         )
         return {best_day: [best_arch]}, [best_day]
     log_fn(f"[{label}] No se encontro un video descargable con esos filtros.")
@@ -1708,7 +1759,7 @@ def _descargar_videos_dia(session, archivos, fecha, carpeta_videos_base, log_fn,
     log_fn(f"  Encontrados: {total} archivos en CMSV6")
 
     for index, archivo in enumerate(archivos, start=1):
-        nombre_mp4 = nombre_video_cmsv6(archivo, config.device_id)
+        nombre_mp4 = nombre_video_cmsv6(archivo, config.device_id, fecha)
         dest_mp4 = carpeta_dia / nombre_mp4
         dest_tmp = carpeta_dia / (Path(nombre_mp4).stem + ".tmp")
         channel = _video_channel_idx(archivo)

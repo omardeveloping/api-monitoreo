@@ -1,6 +1,7 @@
 import os
 import re
 import shutil
+from celery import current_app
 from celery.result import AsyncResult
 from datetime import datetime, timedelta
 from rest_framework import viewsets, status
@@ -43,7 +44,12 @@ from dashboard.services.video_importacion import (
     obtener_base_importacion,
     resolver_ruta_importacion,
 )
-from dashboard.tasks import importar_video_desde_servidor_task, importar_videos_mdvr_task
+from dashboard.tasks import (
+    CMSV6_MONITOR_MDVR_SEMANAL_TASK_ID,
+    cmsv6_monitor_mdvr_semanal_task,
+    importar_video_desde_servidor_task,
+    importar_videos_mdvr_task,
+)
 
 _PATRON_NOMBRE_VIDEO = re.compile(
     r"^(?P<equipo>\d+)-(?P<fecha>\d{6})-(?P<inicio>\d{6})-(?P<fin>\d{6})-(?P<codigo>\d+)$"
@@ -164,6 +170,162 @@ def _formatear_nombre_archivo(nombre_archivo: str) -> str:
         f"{match.group('equipo')} | {fecha_formateada} | {inicio}-{fin} | "
         f"{match.group('codigo')}"
     )
+
+
+def _valor_request(request, nombre: str, default=None):
+    if request.method in {"POST", "PUT", "PATCH"} and hasattr(request, "data"):
+        if nombre in request.data:
+            return request.data.get(nombre)
+    return request.query_params.get(nombre, default)
+
+
+def _bool_request(request, nombre: str, default=False) -> bool:
+    valor = _valor_request(request, nombre, None)
+    if valor is None:
+        return default
+    return str(valor).lower() in {"1", "true", "yes", "on"}
+
+
+def _int_request(request, nombre: str, default: int, *, minimum: int = 0) -> int:
+    valor = _valor_request(request, nombre, None)
+    if valor in (None, ""):
+        return default
+    try:
+        return max(minimum, int(valor))
+    except (TypeError, ValueError) as exc:
+        raise ValidationError(f"Parametro '{nombre}' invalido.") from exc
+
+
+def _float_request(request, nombre: str, default: float, *, minimum: float = 0.0) -> float:
+    valor = _valor_request(request, nombre, None)
+    if valor in (None, ""):
+        return default
+    try:
+        return max(minimum, float(valor))
+    except (TypeError, ValueError) as exc:
+        raise ValidationError(f"Parametro '{nombre}' invalido.") from exc
+
+
+def _task_payload(task_id: str):
+    task = AsyncResult(task_id)
+    payload = {"task_id": task_id, "status": task.status}
+    info = task.info
+    if isinstance(info, dict):
+        payload["info"] = info
+    elif info:
+        payload["info"] = {"message": str(info)}
+
+    if task.ready():
+        if task.successful():
+            payload["resultado"] = task.result
+        else:
+            payload["error"] = str(task.result)
+    return payload
+
+
+def _normalizar_tarea_inspect(worker: str, origen: str, tarea: dict):
+    request_info = tarea.get("request") if isinstance(tarea, dict) else None
+    data = request_info if isinstance(request_info, dict) else tarea
+    if not isinstance(data, dict):
+        return None
+    return {
+        "worker": worker,
+        "origen": origen,
+        "id": data.get("id"),
+        "name": data.get("name") or data.get("type"),
+    }
+
+
+def _buscar_monitor_mdvr_activo():
+    task_name = "dashboard.tasks.cmsv6_monitor_mdvr_semanal_task"
+    try:
+        inspector = current_app.control.inspect(timeout=1.0)
+        for origen, metodo in (
+            ("active", inspector.active),
+            ("reserved", inspector.reserved),
+            ("scheduled", inspector.scheduled),
+        ):
+            data = metodo() or {}
+            for worker, tareas in data.items():
+                for tarea in tareas or []:
+                    normalizada = _normalizar_tarea_inspect(worker, origen, tarea)
+                    if not normalizada:
+                        continue
+                    if normalizada["id"] == CMSV6_MONITOR_MDVR_SEMANAL_TASK_ID:
+                        return normalizada
+                    if normalizada["name"] == task_name:
+                        return normalizada
+    except Exception:
+        return None
+    return None
+
+
+def _monitor_info_reciente(status: str, info: dict) -> bool:
+    if status not in {"STARTED", "PROGRESS", "RETRY"}:
+        return False
+    actualizado_raw = info.get("actualizado_en") if isinstance(info, dict) else None
+    if not actualizado_raw:
+        return False
+    try:
+        actualizado = datetime.fromisoformat(str(actualizado_raw))
+        if timezone.is_naive(actualizado):
+            actualizado = timezone.make_aware(actualizado, timezone.get_current_timezone())
+    except (TypeError, ValueError):
+        return False
+    try:
+        stale_minutos = max(
+            1,
+            int(getattr(settings, "CMSV6_MONITOR_SEMANAL_STALE_MINUTES", 120)),
+        )
+    except (TypeError, ValueError):
+        stale_minutos = 120
+    return actualizado >= timezone.now() - timedelta(minutes=stale_minutos)
+
+
+def _estado_monitor_mdvr():
+    payload = _task_payload(CMSV6_MONITOR_MDVR_SEMANAL_TASK_ID)
+    activo = _buscar_monitor_mdvr_activo()
+    info = payload.get("info") if isinstance(payload.get("info"), dict) else {}
+    payload["running"] = activo is not None or _monitor_info_reciente(
+        payload["status"],
+        info,
+    )
+    if activo:
+        payload["worker_task"] = activo
+    return payload
+
+
+def _params_monitor_mdvr(request):
+    try:
+        intervalo_default = max(
+            1,
+            int(getattr(settings, "CMSV6_MONITOR_SEMANAL_INTERVAL_MINUTES", 60)),
+        )
+    except (TypeError, ValueError):
+        intervalo_default = 60
+    params = {
+        "output_dir": (_valor_request(request, "output_dir", "") or "").strip(),
+        "intervalo_minutos": _int_request(
+            request,
+            "intervalo_minutos",
+            intervalo_default,
+            minimum=1,
+        ),
+        "incluir_futuro": _bool_request(request, "incluir_futuro", False),
+        "excel_alarmas": _bool_request(request, "excel_alarmas", False),
+        "testing": _bool_request(request, "testing", False),
+        "test_order": _valor_request(request, "test_order", "size_asc") or "size_asc",
+        "test_limit": _int_request(request, "test_limit", 1, minimum=1),
+        "test_max_mb": _float_request(request, "test_max_mb", 0, minimum=0),
+        "test_channel": _valor_request(request, "test_channel", "Todos") or "Todos",
+        "test_30d_mode": _valor_request(request, "test_30d_mode", "off") or "off",
+        "test_range_mode": _valor_request(request, "test_range_mode", "off") or "off",
+        "max_logs": _int_request(request, "max_logs", 500, minimum=50),
+    }
+    ciclos = _valor_request(request, "ciclos", None)
+    if ciclos not in (None, ""):
+        params["ciclos"] = _int_request(request, "ciclos", 0, minimum=0)
+    return params
 
 
 class CamionViewSet(viewsets.ModelViewSet):
@@ -311,6 +473,50 @@ class TurnoViewSet(viewsets.ModelViewSet):
                 "hasta": hasta,
                 "total": len(serializer.data),
                 "resultados": agrupados,
+            }
+        )
+
+
+class MonitoreoMDVRSemanalViewSet(viewsets.ViewSet):
+    permission_classes = [IsAuthenticated]
+
+    def list(self, request):
+        return Response(_estado_monitor_mdvr())
+
+    def create(self, request):
+        estado = _estado_monitor_mdvr()
+        if estado.get("running"):
+            estado["celery_status"] = estado.get("status")
+            estado["status"] = "running"
+            return Response(estado, status=status.HTTP_200_OK)
+
+        params = _params_monitor_mdvr(request)
+        task = cmsv6_monitor_mdvr_semanal_task.apply_async(
+            args=[params],
+            task_id=CMSV6_MONITOR_MDVR_SEMANAL_TASK_ID,
+        )
+        return Response(
+            {
+                "task_id": task.id,
+                "status": "queued",
+                "running": True,
+                "params": params,
+            },
+            status=status.HTTP_202_ACCEPTED,
+        )
+
+    @action(detail=False, methods=["delete"], url_path="detener")
+    def detener(self, request):
+        current_app.control.revoke(
+            CMSV6_MONITOR_MDVR_SEMANAL_TASK_ID,
+            terminate=True,
+            signal="SIGTERM",
+        )
+        return Response(
+            {
+                "task_id": CMSV6_MONITOR_MDVR_SEMANAL_TASK_ID,
+                "status": "revoked",
+                "running": False,
             }
         )
 
