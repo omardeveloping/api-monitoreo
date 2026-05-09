@@ -21,6 +21,11 @@ from dashboard.services.programar_turnos import (
     crear_turnos_diarios,
 )
 from dashboard.services.importar_videos_mdvr import importar_videos_mdvr
+from dashboard.services.monitor_mdvr_state import (
+    MONITOR_MDVR_SEMANAL_ID_LOGICO,
+    guardar_task_id_monitor_mdvr,
+    obtener_task_id_monitor_mdvr,
+)
 from dashboard.services.turnos_tiempo import esta_activo, esta_completado
 from dashboard.services.video_importacion import (
     _validated_data_desde_video,
@@ -31,7 +36,7 @@ from dashboard.services.video_importacion import (
 )
 
 
-CMSV6_MONITOR_MDVR_SEMANAL_TASK_ID = "cmsv6-monitor-mdvr-semanal"
+CMSV6_MONITOR_MDVR_SEMANAL_TASK_ID = MONITOR_MDVR_SEMANAL_ID_LOGICO
 
 
 @shared_task
@@ -216,7 +221,15 @@ def _normalizar_tarea_inspect(worker: str, origen: str, tarea: dict):
     }
 
 
-def _monitor_backend_reciente(task: AsyncResult):
+def _monitor_backend_reciente(task: AsyncResult, task_id: str):
+    if task.status == "PENDING" and task_id:
+        return {
+            "origen": "backend",
+            "id": task_id,
+            "name": "dashboard.tasks.cmsv6_monitor_mdvr_semanal_task",
+            "status": task.status,
+        }
+
     running_states = {"STARTED", "PROGRESS", "RETRY"}
     if task.status not in running_states:
         return None
@@ -246,7 +259,7 @@ def _monitor_backend_reciente(task: AsyncResult):
 
     return {
         "origen": "backend",
-        "id": CMSV6_MONITOR_MDVR_SEMANAL_TASK_ID,
+        "id": task_id,
         "name": "dashboard.tasks.cmsv6_monitor_mdvr_semanal_task",
         "status": task.status,
         "actualizado_en": actualizado.isoformat(),
@@ -275,8 +288,9 @@ def _monitor_mdvr_activo_en_workers():
     except Exception:
         pass
 
-    task = AsyncResult(CMSV6_MONITOR_MDVR_SEMANAL_TASK_ID, app=current_app)
-    return _monitor_backend_reciente(task)
+    task_id = obtener_task_id_monitor_mdvr() or CMSV6_MONITOR_MDVR_SEMANAL_TASK_ID
+    task = AsyncResult(task_id, app=current_app)
+    return _monitor_backend_reciente(task, task_id)
 
 
 def _rango_semanal_mdvr(*, incluir_futuro: bool = False):
@@ -525,18 +539,18 @@ def asegurar_monitor_mdvr_semanal_task(params: dict | None = None):
         return {
             "running": True,
             "queued": False,
-            "task_id": CMSV6_MONITOR_MDVR_SEMANAL_TASK_ID,
+            "task_id": activo.get("id") or obtener_task_id_monitor_mdvr(),
+            "monitor_id": CMSV6_MONITOR_MDVR_SEMANAL_TASK_ID,
             "worker_task": activo,
         }
 
-    task = cmsv6_monitor_mdvr_semanal_task.apply_async(
-        args=[dict(params or {})],
-        task_id=CMSV6_MONITOR_MDVR_SEMANAL_TASK_ID,
-    )
+    task = cmsv6_monitor_mdvr_semanal_task.apply_async(args=[dict(params or {})])
+    guardar_task_id_monitor_mdvr(task.id)
     return {
         "running": True,
         "queued": True,
         "task_id": task.id,
+        "monitor_id": CMSV6_MONITOR_MDVR_SEMANAL_TASK_ID,
     }
 
 

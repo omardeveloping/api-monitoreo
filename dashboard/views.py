@@ -36,6 +36,11 @@ from dashboard.services.calcular_duracion_video import (
 )
 from dashboard.services.importar_velocidades_csv import importar_velocidades_csv
 from dashboard.services.importar_velocidades_xlsx import importar_velocidades_xlsx
+from dashboard.services.monitor_mdvr_state import (
+    guardar_task_id_monitor_mdvr,
+    limpiar_task_id_monitor_mdvr,
+    obtener_task_id_monitor_mdvr,
+)
 from dashboard.services.preview_video import obtener_preview_video
 from dashboard.services.video_importacion import (
     crear_video_desde_serializer,
@@ -283,12 +288,23 @@ def _monitor_info_reciente(status: str, info: dict) -> bool:
 
 
 def _estado_monitor_mdvr():
-    payload = _task_payload(CMSV6_MONITOR_MDVR_SEMANAL_TASK_ID)
     activo = _buscar_monitor_mdvr_activo()
+    task_id_guardado = obtener_task_id_monitor_mdvr()
+    task_id = (
+        (activo or {}).get("id")
+        or task_id_guardado
+        or CMSV6_MONITOR_MDVR_SEMANAL_TASK_ID
+    )
+    payload = _task_payload(task_id)
+    payload["monitor_id"] = CMSV6_MONITOR_MDVR_SEMANAL_TASK_ID
     info = payload.get("info") if isinstance(payload.get("info"), dict) else {}
-    payload["running"] = activo is not None or _monitor_info_reciente(
+    payload["running"] = (
+        activo is not None
+        or bool(task_id_guardado and payload["status"] == "PENDING")
+        or _monitor_info_reciente(
         payload["status"],
         info,
+        )
     )
     if activo:
         payload["worker_task"] = activo
@@ -493,11 +509,12 @@ class MonitoreoMDVRSemanalViewSet(viewsets.ViewSet):
         params = _params_monitor_mdvr(request)
         task = cmsv6_monitor_mdvr_semanal_task.apply_async(
             args=[params],
-            task_id=CMSV6_MONITOR_MDVR_SEMANAL_TASK_ID,
         )
+        guardar_task_id_monitor_mdvr(task.id)
         return Response(
             {
                 "task_id": task.id,
+                "monitor_id": CMSV6_MONITOR_MDVR_SEMANAL_TASK_ID,
                 "status": "queued",
                 "running": True,
                 "params": params,
@@ -507,15 +524,23 @@ class MonitoreoMDVRSemanalViewSet(viewsets.ViewSet):
 
     @action(detail=False, methods=["delete"], url_path="detener")
     def detener(self, request):
-        current_app.control.revoke(
+        task_ids = {
             CMSV6_MONITOR_MDVR_SEMANAL_TASK_ID,
-            terminate=True,
-            signal="SIGTERM",
-        )
-        AsyncResult(CMSV6_MONITOR_MDVR_SEMANAL_TASK_ID).forget()
+            obtener_task_id_monitor_mdvr(),
+        }
+        activo = _buscar_monitor_mdvr_activo()
+        if activo and activo.get("id"):
+            task_ids.add(activo["id"])
+        task_ids.discard("")
+
+        for task_id in task_ids:
+            current_app.control.revoke(task_id, terminate=True, signal="SIGTERM")
+            AsyncResult(task_id).forget()
+        limpiar_task_id_monitor_mdvr()
         return Response(
             {
                 "task_id": CMSV6_MONITOR_MDVR_SEMANAL_TASK_ID,
+                "revoked_task_ids": sorted(task_ids),
                 "status": "revoked",
                 "running": False,
                 "state_cleared": True,
