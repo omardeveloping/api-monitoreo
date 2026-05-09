@@ -1943,7 +1943,16 @@ def _descargar_videos_dia(session, archivos, fecha, carpeta_videos_base, log_fn,
     return resumen
 
 
-def ejecutar_rango(carpeta_base, fecha_ini, fecha_fin, log_fn, set_progress, opts=None, config=None):
+def ejecutar_rango(
+    carpeta_base,
+    fecha_ini,
+    fecha_fin,
+    log_fn,
+    set_progress,
+    opts=None,
+    config=None,
+    on_day_complete=None,
+):
     config = config or CMSV6Config.from_settings(carpeta_base)
     config.validate()
     opts = opts or {}
@@ -2090,6 +2099,19 @@ def ejecutar_rango(carpeta_base, fecha_ini, fecha_fin, log_fn, set_progress, opt
 
         if not hacer_videos:
             log_fn("  Videos omitidos por opciones.")
+            if on_day_complete:
+                try:
+                    on_day_complete(
+                        day,
+                        {
+                            "descargados": 0,
+                            "omitidos": 0,
+                            "errores": 0,
+                            "total": 0,
+                        },
+                    )
+                except Exception as exc:
+                    log_fn(f"  ERROR notificando cierre de dia {day_label}: {exc}")
             continue
 
         set_progress(base_pct + 18, f"[{base_pct + 18}%] {day_label}: buscando videos...")
@@ -2118,6 +2140,11 @@ def ejecutar_rango(carpeta_base, fecha_ini, fecha_fin, log_fn, set_progress, opt
         resumen_total["videos_descargados"] += resumen_dia["descargados"]
         resumen_total["videos_omitidos"] += resumen_dia["omitidos"]
         resumen_total["videos_errores"] += resumen_dia["errores"]
+        if on_day_complete:
+            try:
+                on_day_complete(day, resumen_dia)
+            except Exception as exc:
+                log_fn(f"  ERROR notificando cierre de dia {day_label}: {exc}")
 
     set_progress(100, "Completado")
     log_fn(f"\n[OK] Todo en: {carpeta_base}\n")

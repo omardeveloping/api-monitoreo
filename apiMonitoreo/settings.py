@@ -271,12 +271,12 @@ CELERY_TASK_TRACK_STARTED = True
 CELERY_WORKER_PREFETCH_MULTIPLIER = 1
 CELERY_TASK_ROUTES = {
     "dashboard.tasks.importar_videos_mdvr_task": {"queue": "mdvr"},
-    "dashboard.tasks.asegurar_monitor_mdvr_semanal_task": {"queue": "mdvr"},
-    "dashboard.tasks.cmsv6_monitor_mdvr_semanal_task": {"queue": "mdvr"},
-    "dashboard.tasks.cmsv6_descargar_task": {"queue": "mdvr"},
-    "dashboard.tasks.cmsv6_analizar_mp4_task": {"queue": "mdvr"},
-    "dashboard.tasks.cmsv6_reparar_mp4_task": {"queue": "mdvr"},
-    "dashboard.tasks.cmsv6_recortar_mp4_task": {"queue": "mdvr"},
+    "dashboard.tasks.asegurar_monitor_mdvr_semanal_task": {"queue": "cmsv6"},
+    "dashboard.tasks.cmsv6_monitor_mdvr_semanal_task": {"queue": "cmsv6"},
+    "dashboard.tasks.cmsv6_descargar_task": {"queue": "cmsv6"},
+    "dashboard.tasks.cmsv6_analizar_mp4_task": {"queue": "cmsv6"},
+    "dashboard.tasks.cmsv6_reparar_mp4_task": {"queue": "cmsv6"},
+    "dashboard.tasks.cmsv6_recortar_mp4_task": {"queue": "cmsv6"},
 }
 CELERY_TASK_ANNOTATIONS = {
     "dashboard.tasks.importar_videos_mdvr_task": {

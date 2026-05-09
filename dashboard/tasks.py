@@ -65,10 +65,13 @@ def generar_turnos_diarios():
 
 @shared_task
 def importar_videos_mdvr_task(
-    importar_velocidades: bool = True, fecha_objetivo: str | None = None
+    importar_velocidades: bool = True,
+    fecha_objetivo: str | None = None,
+    base_dir: str | None = None,
 ):
     """Importa videos MDVR desde el servidor y los asocia a turnos."""
     return importar_videos_mdvr(
+        base_dir=base_dir,
         importar_velocidades=importar_velocidades,
         fecha_objetivo=fecha_objetivo,
     )
@@ -414,6 +417,34 @@ def cmsv6_monitor_mdvr_semanal_task(self, params: dict | None = None):
             f"{ciclo}: {fecha_inicio.isoformat()} -> {fecha_fin.isoformat()}"
         )
 
+        importaciones_encoladas = []
+
+        def encolar_importacion_dia(fecha_dia, resumen_dia):
+            fecha_iso = fecha_dia.isoformat()
+            resumen = dict(resumen_dia or {})
+            task = importar_videos_mdvr_task.apply_async(
+                kwargs={
+                    "base_dir": output_dir,
+                    "importar_velocidades": True,
+                    "fecha_objetivo": fecha_iso,
+                },
+                queue="mdvr",
+            )
+            registro = {
+                "fecha": fecha_iso,
+                "task_id": task.id,
+                "videos_descargados": resumen.get("descargados", 0),
+                "videos_omitidos": resumen.get("omitidos", 0),
+                "videos_errores": resumen.get("errores", 0),
+                "videos_total": resumen.get("total", 0),
+            }
+            importaciones_encoladas.append(registro)
+            reporter.log(f"Importación MDVR encolada para {fecha_iso}: {task.id}")
+
+            monitor_actual = dict(monitor_base)
+            monitor_actual["importaciones_encoladas"] = importaciones_encoladas[-50:]
+            reporter.set_extra(monitor=monitor_actual)
+
         resultado_ciclo = {
             "ciclo": ciclo,
             "rango": monitor_base["rango"],
@@ -430,24 +461,23 @@ def cmsv6_monitor_mdvr_semanal_task(self, params: dict | None = None):
                 reporter.progress_cb,
                 opts,
                 config,
+                on_day_complete=encolar_importacion_dia,
             )
             resultado_ciclo["descarga"] = descarga
-            reporter.log("Descarga semanal finalizada; importando a Django...")
-            importacion = _importar_mdvr_por_rango(
-                output_dir,
-                fecha_inicio,
-                fecha_fin,
-                reporter,
-            )
-            resultado_ciclo["importacion_django"] = importacion
+            resultado_ciclo["importacion_django"] = {
+                "modo": "asincronico_por_dia",
+                "total_tareas": len(importaciones_encoladas),
+                "tareas": list(importaciones_encoladas),
+            }
             reporter.log(
-                "Importación Django finalizada: "
-                f"{importacion.get('videos_creados', 0)} videos procesados."
+                "Descarga semanal finalizada; "
+                f"{len(importaciones_encoladas)} importaciones por dia encoladas."
             )
             monitor_base.update(
                 {
                     "estado": "completado",
                     "finalizado_en": timezone.now().isoformat(),
+                    "importaciones_encoladas": list(importaciones_encoladas),
                     "ultimo_resultado": resultado_ciclo,
                 }
             )

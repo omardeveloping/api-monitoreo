@@ -44,7 +44,7 @@ services:
   celery:
     build: .
     restart: unless-stopped
-    command: celery -A apiMonitoreo worker -l info -Q celery -c 2 --prefetch-multiplier=1
+    command: celery -A apiMonitoreo worker -l info -Q celery,cmsv6 -c 2 --prefetch-multiplier=1
     env_file: .env
     environment:
       DJANGO_DEBUG: "${DJANGO_DEBUG:-1}"
