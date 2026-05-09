@@ -512,11 +512,13 @@ class MonitoreoMDVRSemanalViewSet(viewsets.ViewSet):
             terminate=True,
             signal="SIGTERM",
         )
+        AsyncResult(CMSV6_MONITOR_MDVR_SEMANAL_TASK_ID).forget()
         return Response(
             {
                 "task_id": CMSV6_MONITOR_MDVR_SEMANAL_TASK_ID,
                 "status": "revoked",
                 "running": False,
+                "state_cleared": True,
             }
         )
 
