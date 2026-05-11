@@ -296,7 +296,7 @@ def _monitor_mdvr_activo_en_workers():
 def _rango_semanal_mdvr(*, incluir_futuro: bool = False):
     hoy = timezone.localdate()
     inicio_semana_actual = hoy - datetime.timedelta(days=hoy.weekday())
-    inicio = inicio_semana_actual - datetime.timedelta(days=7)
+    inicio = inicio_semana_actual
     fin_semana_actual = inicio_semana_actual + datetime.timedelta(days=6)
     fin = fin_semana_actual if incluir_futuro else hoy
     return inicio, fin
@@ -383,7 +383,7 @@ def _esperar_siguiente_ciclo(reporter: _TaskReporter, segundos: int, ciclo: int)
 @shared_task(bind=True)
 def cmsv6_monitor_mdvr_semanal_task(self, params: dict | None = None):
     """
-    Mantiene una descarga cíclica CMSV6 para semana anterior + semana actual.
+    Mantiene una descarga cíclica CMSV6 para la semana actual.
 
     La tarea descarga videos y XLSX de ruta GPS en la estructura MDVR esperada,
     luego importa a modelos Django por día para evitar recorrer material histórico

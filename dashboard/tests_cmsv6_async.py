@@ -10,7 +10,7 @@ from unittest.mock import Mock, patch
 from django.test import SimpleTestCase
 
 from dashboard.services import cmsv6_downloader
-from dashboard.tasks import importar_videos_mdvr_task
+from dashboard.tasks import _rango_semanal_mdvr, importar_videos_mdvr_task
 
 
 class _CMSV6ConfigStub:
@@ -71,6 +71,20 @@ class _CMSV6RangeTestServer:
 
 
 class CMSV6AsyncPipelineTests(SimpleTestCase):
+    def test_rango_semanal_mdvr_usa_solo_semana_actual(self):
+        with patch(
+            "dashboard.tasks.timezone.localdate",
+            return_value=datetime.date(2026, 5, 13),
+        ):
+            self.assertEqual(
+                _rango_semanal_mdvr(),
+                (datetime.date(2026, 5, 11), datetime.date(2026, 5, 13)),
+            )
+            self.assertEqual(
+                _rango_semanal_mdvr(incluir_futuro=True),
+                (datetime.date(2026, 5, 11), datetime.date(2026, 5, 17)),
+            )
+
     def test_ejecutar_rango_notifica_cada_dia_completado(self):
         session = Mock()
         session.get_gps.return_value = []
