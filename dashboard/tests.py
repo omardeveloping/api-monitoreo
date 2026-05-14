@@ -565,6 +565,60 @@ class ImportarMdvrBackfillVelocidadesTests(TestCase):
         video.refresh_from_db()
         self.assertEqual(video.estado_velocidades, EstadoVelocidadesVideo.SIN_XLSX)
 
+    def test_mp4_unico_se_registra_directo_sin_concatenar_ni_procesar(self):
+        camion = Camion.objects.create(
+            patente="BKCD13",
+            carpeta_id="4462510198",
+        )
+
+        with tempfile.TemporaryDirectory() as base_dir, tempfile.TemporaryDirectory() as media_dir:
+            carpeta_mdvr = os.path.join(base_dir, "4462510198(4462510198)")
+            carpeta_dia = os.path.join(carpeta_mdvr, "2026-05-12")
+            os.makedirs(carpeta_dia, exist_ok=True)
+
+            mp4 = os.path.join(
+                carpeta_dia,
+                "201-02-000000-010002-17p000.mp4",
+            )
+            h264_duplicado = os.path.join(
+                carpeta_dia,
+                "201-02-000000-010002-17p000.h264",
+            )
+            with open(mp4, "wb") as fh:
+                fh.write(b"\x00\x00\x00\x18ftypmp42" + b"mp4-source")
+            with open(h264_duplicado, "wb") as fh:
+                fh.write(b"raw-source")
+
+            with override_settings(MEDIA_ROOT=media_dir), patch(
+                "dashboard.services.importar_videos_mdvr.MIN_ANTIGUEDAD_ARCHIVO_SEGUNDOS",
+                0,
+            ), patch(
+                "dashboard.services.importar_videos_mdvr.calcular_duracion_video",
+                return_value=3602.0,
+            ) as duracion_mock, patch(
+                "dashboard.services.importar_videos_mdvr._concatenar_segmentos"
+            ) as concat_mock, patch(
+                "dashboard.services.importar_videos_mdvr.procesar_video_subida"
+            ) as procesar_video_mock:
+                detalle = _importar_camion_mdvr(
+                    camion=camion,
+                    base_dir=base_dir,
+                    importar_velocidades=False,
+                    fecha_objetivo=datetime.date(2026, 5, 12),
+                )
+
+        self.assertEqual(detalle["videos_creados"], 1)
+        video = Video.objects.get(nombre="MDVR_4462510198_2026-05-12_noche_C2")
+        self.assertEqual(video.estado, EstadoVideo.LISTO)
+        self.assertEqual(video.camara, 2)
+        self.assertEqual(video.duracion, 3602)
+        self.assertTrue(video.ruta_archivo.name.startswith("videos/"))
+        self.assertEqual(video.segmentos_origen, ["201-02-000000-010002-17p000.mp4"])
+        self.assertEqual(video.fecha_fin.time(), datetime.time(1, 0, 2))
+        self.assertGreaterEqual(duracion_mock.call_count, 1)
+        concat_mock.assert_not_called()
+        procesar_video_mock.assert_not_called()
+
 
 class EspacioDiscoMontajesTests(SimpleTestCase):
     def setUp(self):

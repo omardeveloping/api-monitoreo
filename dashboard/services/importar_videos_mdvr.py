@@ -28,6 +28,7 @@ from dashboard.models import (
     Video,
 )
 from dashboard.services.calcular_duracion_video import (
+    VIDEO_IMPORT_DURATION_TOLERANCE_SECONDS,
     calcular_duracion_video,
     envolver_h264_en_mp4,
     procesar_video_subida,
@@ -798,6 +799,40 @@ def _segmento_desde_archivo(ruta: str, fecha: datetime.date) -> SegmentoVideo | 
     return segmento
 
 
+def _prioridad_segmento_para_importar(segmento: SegmentoVideo) -> tuple[int, int, float]:
+    prioridad_extension = 1 if segmento.extension == ".mp4" else 0
+    try:
+        stat = os.stat(segmento.ruta)
+        tamano = int(stat.st_size or 0)
+        modificado = float(stat.st_mtime or 0)
+    except OSError:
+        tamano = 0
+        modificado = 0.0
+    return prioridad_extension, tamano, modificado
+
+
+def _deduplicar_segmentos_preferir_mp4(
+    segmentos: list[SegmentoVideo],
+) -> list[SegmentoVideo]:
+    """
+    CMSV6 puede dejar el crudo y el MP4 final para el mismo canal/rango.
+    En ese caso el MP4 es la fuente visible que queremos registrar.
+    """
+    deduplicados: dict[tuple[int, datetime.datetime, datetime.datetime], SegmentoVideo] = {}
+    for segmento in segmentos:
+        key = (segmento.camara, segmento.inicio_dt, segmento.fin_dt)
+        actual = deduplicados.get(key)
+        if actual is None:
+            deduplicados[key] = segmento
+            continue
+        if _prioridad_segmento_para_importar(segmento) > _prioridad_segmento_para_importar(actual):
+            deduplicados[key] = segmento
+    return sorted(
+        deduplicados.values(),
+        key=lambda item: (item.inicio_dt, item.camara, item.ruta),
+    )
+
+
 def _archivo_listo_para_importar(ruta_archivo: str) -> tuple[bool, str | None]:
     try:
         st = os.stat(ruta_archivo)
@@ -1176,6 +1211,149 @@ def _subir_archivo_temporal(ruta_local: str, nombre_base: str) -> str:
     with open(ruta_local, "rb") as archivo:
         destino = default_storage.save(destino, File(archivo))
     return destino
+
+
+def _archivo_tiene_ftyp_mp4(ruta: str) -> bool:
+    try:
+        with open(ruta, "rb") as archivo:
+            data = archivo.read(12)
+    except OSError:
+        return False
+    return len(data) >= 8 and data[4:8] == b"ftyp"
+
+
+def _archivo_parece_ssy_dvr(ruta: str) -> bool:
+    try:
+        with open(ruta, "rb") as archivo:
+            data = archivo.read(4096)
+    except OSError:
+        return False
+    return b"SSY_DVR" in data
+
+
+def _mp4_directo_seguro(ruta: str) -> bool:
+    if not _archivo_tiene_ftyp_mp4(ruta):
+        return False
+    if _archivo_parece_ssy_dvr(ruta):
+        return False
+    try:
+        return math.floor(calcular_duracion_video(ruta)) > 0
+    except Exception:
+        return False
+
+
+def _segmento_mp4_directo(segmentos: list[SegmentoVideo]) -> SegmentoVideo | None:
+    if len(segmentos) != 1:
+        return None
+    segmento = segmentos[0]
+    if segmento.extension != ".mp4":
+        return None
+    if not _mp4_directo_seguro(segmento.ruta):
+        return None
+    return segmento
+
+
+def _mensaje_video_incompleto(duracion_esperada: int, duracion_real: int) -> str:
+    return (
+        "El video parece incompleto: "
+        f"se esperaban al menos {duracion_esperada}s y solo se obtuvieron "
+        f"{duracion_real}s."
+    )
+
+
+def _registrar_mp4_directo(
+    video: Video,
+    segmento: SegmentoVideo,
+    *,
+    nombre_video: str,
+    duracion_esperada: int | None,
+    ruta_previa: str = "",
+):
+    inicio_procesamiento = video.procesamiento_iniciado_en or timezone.now()
+    destino_rel = _subir_archivo_temporal(segmento.ruta, f"{nombre_video}.mp4")
+    try:
+        ruta_final = default_storage.path(destino_rel)
+        duracion_real = math.floor(calcular_duracion_video(ruta_final))
+        if duracion_real <= 0:
+            raise ValidationError("No se pudo calcular una duración válida para el MP4.")
+    except Exception:
+        try:
+            default_storage.delete(destino_rel)
+        except Exception:
+            pass
+        raise
+
+    video.ruta_archivo = destino_rel
+    video.duracion = duracion_real
+    inicio = video.inicio_timestamp or segmento.inicio_dt.time()
+    if isinstance(inicio, datetime.datetime):
+        inicio = inicio.time()
+    video.inicio_timestamp = inicio
+
+    if video.fecha_inicio is not None:
+        fecha_fin = video.fecha_inicio + datetime.timedelta(seconds=duracion_real)
+        video.fecha_fin = fecha_fin
+        video.fin_timestamp = fecha_fin.timetz().replace(tzinfo=None)
+    else:
+        video.fin_timestamp = (
+            datetime.datetime.combine(datetime.date.today(), inicio)
+            + datetime.timedelta(seconds=duracion_real)
+        ).time()
+
+    video.mimetype = mimetypes.guess_type(ruta_final)[0] or "video/mp4"
+    video.procesamiento_iniciado_en = inicio_procesamiento
+    video.procesamiento_finalizado_en = timezone.now()
+    video.tiempo_procesamiento_segundos = round(
+        max((video.procesamiento_finalizado_en - inicio_procesamiento).total_seconds(), 0),
+        3,
+    )
+
+    mensaje_incompleto = ""
+    if (
+        duracion_esperada is not None
+        and duracion_real + VIDEO_IMPORT_DURATION_TOLERANCE_SECONDS < duracion_esperada
+    ):
+        mensaje_incompleto = _mensaje_video_incompleto(duracion_esperada, duracion_real)
+
+    if mensaje_incompleto:
+        video.estado = EstadoVideo.INCOMPLETO
+        video.error_tipo = "incompleto"
+        video.detalle_error = mensaje_incompleto
+        video.ultimo_error = mensaje_incompleto[:2000]
+    else:
+        video.estado = EstadoVideo.LISTO
+        video.error_tipo = ""
+        video.detalle_error = ""
+        video.ultimo_error = ""
+
+    video.reintentos = 0
+    video.proximo_reintento_en = None
+    video.save(
+        update_fields=[
+            "ruta_archivo",
+            "duracion",
+            "estado",
+            "inicio_timestamp",
+            "fin_timestamp",
+            "fecha_fin",
+            "mimetype",
+            "error_tipo",
+            "detalle_error",
+            "procesamiento_iniciado_en",
+            "procesamiento_finalizado_en",
+            "tiempo_procesamiento_segundos",
+            "reintentos",
+            "ultimo_error",
+            "proximo_reintento_en",
+        ]
+    )
+
+    if ruta_previa and ruta_previa != destino_rel:
+        try:
+            default_storage.delete(ruta_previa)
+        except Exception:
+            pass
+    return video
 
 
 def _parsear_iso_datetime(valor: str | None) -> datetime.datetime | None:
@@ -1643,6 +1821,8 @@ def _importar_camion_mdvr(
                 continue
             segmentos.append(segmento)
 
+        segmentos = _deduplicar_segmentos_preferir_mp4(segmentos)
+
         if not segmentos:
             _registrar_omision(
                 detalles,
@@ -1995,27 +2175,39 @@ def _importar_camion_mdvr(
                         id_turno=turno,
                     )
 
-                ruta_salida = os.path.join(tmp_dir, f"{nombre_video}{ext_salida}")
-                ok, error = _concatenar_segmentos(lista_procesable, ruta_salida)
-                if not ok:
-                    raise ValidationError(f"No se pudo concatenar segmentos ({error}).")
+                registro_directo_mp4 = False
+                segmento_directo = _segmento_mp4_directo(lista_procesable)
+                if segmento_directo is not None:
+                    _registrar_mp4_directo(
+                        video,
+                        segmento_directo,
+                        nombre_video=nombre_video,
+                        duracion_esperada=duracion_esperada,
+                        ruta_previa=ruta_previa if video_existente else "",
+                    )
+                    registro_directo_mp4 = True
+                else:
+                    ruta_salida = os.path.join(tmp_dir, f"{nombre_video}{ext_salida}")
+                    ok, error = _concatenar_segmentos(lista_procesable, ruta_salida)
+                    if not ok:
+                        raise ValidationError(f"No se pudo concatenar segmentos ({error}).")
 
-                destino_rel = _subir_archivo_temporal(
-                    ruta_salida, f"{nombre_video}{ext_salida}"
-                )
-                video.ruta_archivo = destino_rel
-                video.save(update_fields=["ruta_archivo"])
-                if video_existente and ruta_previa and ruta_previa != destino_rel:
-                    try:
-                        default_storage.delete(ruta_previa)
-                    except Exception:
-                        pass
+                    destino_rel = _subir_archivo_temporal(
+                        ruta_salida, f"{nombre_video}{ext_salida}"
+                    )
+                    video.ruta_archivo = destino_rel
+                    video.save(update_fields=["ruta_archivo"])
+                    if video_existente and ruta_previa and ruta_previa != destino_rel:
+                        try:
+                            default_storage.delete(ruta_previa)
+                        except Exception:
+                            pass
 
-                procesar_video_subida(
-                    video,
-                    video.ruta_archivo,
-                    duracion_esperada=duracion_esperada,
-                )
+                    procesar_video_subida(
+                        video,
+                        video.ruta_archivo,
+                        duracion_esperada=duracion_esperada,
+                    )
                 mapa_segmentos = _construir_mapa_segmentos(lista_procesable, video.duracion)
                 if mapa_segmentos:
                     video.mapa_segmentos = mapa_segmentos
@@ -2089,7 +2281,8 @@ def _importar_camion_mdvr(
                                 f"{nombre_video}: video guardado como incompleto; se intentará importar velocidades."
                             )
                     continue
-                videos_turno.setdefault(tipo_turno, []).append(video)
+                if not registro_directo_mp4:
+                    videos_turno.setdefault(tipo_turno, []).append(video)
 
                 if importar_velocidades:
                     _programar_importacion_velocidades_turno(
