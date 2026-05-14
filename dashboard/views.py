@@ -36,6 +36,7 @@ from dashboard.services.calcular_duracion_video import (
 )
 from dashboard.services.importar_velocidades_csv import importar_velocidades_csv
 from dashboard.services.importar_velocidades_xlsx import importar_velocidades_xlsx
+from dashboard.services.mdvr_weekly_status import resumen_semana_mdvr
 from dashboard.services.monitor_mdvr_state import (
     guardar_task_id_monitor_mdvr,
     limpiar_task_id_monitor_mdvr,
@@ -319,6 +320,13 @@ def _params_monitor_mdvr(request):
         )
     except (TypeError, ValueError):
         intervalo_default = 60
+    try:
+        download_workers_default = max(
+            1,
+            int(getattr(settings, "CMSV6_DOWNLOAD_WORKERS", 1) or 1),
+        )
+    except (TypeError, ValueError):
+        download_workers_default = 1
     params = {
         "output_dir": (_valor_request(request, "output_dir", "") or "").strip(),
         "intervalo_minutos": _int_request(
@@ -336,6 +344,12 @@ def _params_monitor_mdvr(request):
         "test_channel": _valor_request(request, "test_channel", "Todos") or "Todos",
         "test_30d_mode": _valor_request(request, "test_30d_mode", "off") or "off",
         "test_range_mode": _valor_request(request, "test_range_mode", "off") or "off",
+        "download_workers": _int_request(
+            request,
+            "download_workers",
+            download_workers_default,
+            minimum=1,
+        ),
         "max_logs": _int_request(request, "max_logs", 500, minimum=50),
     }
     ciclos = _valor_request(request, "ciclos", None)
@@ -498,6 +512,32 @@ class MonitoreoMDVRSemanalViewSet(viewsets.ViewSet):
 
     def list(self, request):
         return Response(_estado_monitor_mdvr())
+
+    @action(detail=False, methods=["get"], url_path="estado-semana")
+    def estado_semana(self, request):
+        try:
+            resumen = resumen_semana_mdvr(
+                output_dir=(_valor_request(request, "output_dir", "") or "").strip(),
+                desde=_valor_request(request, "desde", None),
+                hasta=_valor_request(request, "hasta", None),
+                incluir_futuro=_bool_request(request, "incluir_futuro", False),
+                incluir_vacios=_bool_request(request, "incluir_vacios", False),
+                detalle_archivos=_bool_request(request, "detalle_archivos", False),
+            )
+        except ValueError as exc:
+            raise ValidationError(str(exc)) from exc
+
+        estado_monitor = _estado_monitor_mdvr()
+        info = estado_monitor.get("info") if isinstance(estado_monitor.get("info"), dict) else {}
+        resumen["monitor"] = {
+            "running": estado_monitor.get("running", False),
+            "task_id": estado_monitor.get("task_id"),
+            "status": estado_monitor.get("status"),
+            "message": info.get("message", ""),
+            "descarga_actual": info.get("descarga_actual"),
+            "descargas_activas": info.get("descargas_activas", []),
+        }
+        return Response(resumen)
 
     def create(self, request):
         estado = _estado_monitor_mdvr()

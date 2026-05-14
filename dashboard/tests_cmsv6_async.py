@@ -7,9 +7,11 @@ from pathlib import Path
 from urllib.parse import parse_qs, urlparse
 from unittest.mock import Mock, patch
 
-from django.test import SimpleTestCase
+from django.test import SimpleTestCase, TestCase
 
+from dashboard.models import Camion, EstadoVideo, Turno, Video
 from dashboard.services import cmsv6_downloader
+from dashboard.services.mdvr_weekly_status import resumen_semana_mdvr
 from dashboard.tasks import _rango_semanal_mdvr, importar_videos_mdvr_task
 
 
@@ -220,3 +222,50 @@ class CMSV6AsyncPipelineTests(SimpleTestCase):
             dest.write_bytes(b"x" * 210)
 
             self.assertFalse(cmsv6_downloader._descarga_suficiente(dest, 100, config))
+
+
+class MDVRWeeklyStatusTests(TestCase):
+    def test_resumen_semana_muestra_descargados_parciales_y_procesados(self):
+        camion = Camion.objects.create(
+            patente="AA-BB-11",
+            carpeta_id="4462510196",
+        )
+        turno = Turno.objects.create(
+            fecha=datetime.date(2026, 5, 14),
+            tipo_turno="noche",
+            id_camion=camion,
+        )
+        Video.objects.create(
+            nombre="MDVR_4462510196_2026-05-14_noche_C1",
+            camara=1,
+            ruta_archivo="videos/procesado.mp4",
+            id_turno=turno,
+            estado=EstadoVideo.LISTO,
+        )
+
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            carpeta_dia = Path(tmp_dir) / "4462510196(4462510196)" / "2026-05-14"
+            carpeta_dia.mkdir(parents=True)
+            (carpeta_dia / "4462510196-260514-000000-010000-20010100.mp4").write_bytes(
+                b"x" * 1024
+            )
+            (carpeta_dia / "4462510196-260514-000000-010000-20010200.tmp").write_bytes(
+                b"y" * 512
+            )
+
+            resumen = resumen_semana_mdvr(
+                output_dir=tmp_dir,
+                desde="2026-05-14",
+                hasta="2026-05-14",
+            )
+
+        filas = {
+            (item["turno"], item["camara"]): item
+            for item in resumen["resultados"]
+        }
+        self.assertEqual(filas[("noche", 1)]["estado_resumen"], "procesado")
+        self.assertEqual(filas[("noche", 1)]["descarga"]["completos"], 1)
+        self.assertEqual(filas[("noche", 2)]["estado_resumen"], "descarga_parcial")
+        self.assertEqual(filas[("noche", 2)]["descarga"]["parciales"], 1)
+        self.assertEqual(resumen["totales"]["archivos_descargados"], 1)
+        self.assertEqual(resumen["totales"]["archivos_parciales"], 1)

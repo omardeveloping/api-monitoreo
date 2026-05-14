@@ -1,4 +1,5 @@
 import base64
+from concurrent.futures import ThreadPoolExecutor, as_completed
 import datetime
 import json
 import mmap
@@ -8,6 +9,7 @@ import shutil
 import socket
 import struct
 import subprocess
+import threading
 import time
 import urllib.error
 import urllib.parse
@@ -120,6 +122,7 @@ class CMSV6Config:
     test_30d_day_retry_wait_secs: int = 10
     test_30d_scan_newest_first: bool = True
     small_response_bytes: int = 4096
+    download_workers: int = 1
 
     @classmethod
     def from_settings(cls, output_dir: str | None = None):
@@ -156,6 +159,7 @@ class CMSV6Config:
             ),
             test_30d_scan_newest_first=_setting_int("CMSV6_TEST_30D_SCAN_NEWEST_FIRST", 1) != 0,
             small_response_bytes=_setting_int("CMSV6_SMALL_RESPONSE_BYTES", 4096, minimum=1),
+            download_workers=_setting_int("CMSV6_DOWNLOAD_WORKERS", 1, minimum=1),
         )
 
     def validate(self):
@@ -1721,6 +1725,159 @@ def _video_channel_idx(archivo: dict) -> int:
         return 0
 
 
+def _segundos_video(archivo: dict, key: str) -> int:
+    try:
+        return max(0, int(archivo.get(key, 0) or 0))
+    except (TypeError, ValueError):
+        return 0
+
+
+def _hhmmss_desde_segundos(segundos: int) -> str:
+    segundos = max(0, int(segundos or 0)) % 86400
+    hh = segundos // 3600
+    mm = (segundos % 3600) // 60
+    ss = segundos % 60
+    return f"{hh:02d}:{mm:02d}:{ss:02d}"
+
+
+def _tipo_turno_para_segundos(segundos: int) -> str:
+    hora = (max(0, int(segundos or 0)) % 86400) // 3600
+    if hora < 8:
+        return "noche"
+    if hora < 16:
+        return "manana"
+    return "tarde"
+
+
+def _turno_label(tipo_turno: str) -> str:
+    return {
+        "noche": "Noche",
+        "manana": "Dia",
+        "tarde": "Tarde",
+    }.get(tipo_turno or "", str(tipo_turno or "Turno"))
+
+
+def _contexto_video_descarga(
+    archivo: dict,
+    *,
+    config: CMSV6Config,
+    fecha: datetime.datetime,
+    index: int,
+    total: int,
+    nombre_mp4: str,
+    dest_tmp: Path,
+    dest_mp4: Path,
+) -> dict:
+    inicio = _segundos_video(archivo, "beg")
+    fin = _segundos_video(archivo, "end")
+    tipo_turno = _tipo_turno_para_segundos(inicio)
+    total_bytes = _video_size_bytes(archivo)
+    return {
+        "fecha": fecha.date().isoformat(),
+        "turno": tipo_turno,
+        "turno_label": _turno_label(tipo_turno),
+        "camara": _video_channel_idx(archivo) + 1,
+        "video_index": index,
+        "videos_total": total,
+        "archivo": nombre_mp4,
+        "equipo": config.device_id,
+        "hora_inicio": _hhmmss_desde_segundos(inicio),
+        "hora_fin": _hhmmss_desde_segundos(fin),
+        "bytes_total": total_bytes,
+        "mb_total": round(total_bytes / 1048576, 1) if total_bytes else None,
+        "ruta_parcial": str(dest_tmp),
+        "ruta_destino": str(dest_mp4),
+    }
+
+
+def _emit_progress(set_progress, progress, message, extra=None):
+    if extra:
+        try:
+            set_progress(progress, message, extra)
+            return
+        except TypeError:
+            pass
+    set_progress(progress, message)
+
+
+class _DayDownloadProgress:
+    def __init__(self, set_progress, *, base_pct: int, end_pct: int, total: int):
+        self.set_progress = set_progress
+        self.total = max(1, int(total or 1))
+        self.v_pct_base = base_pct + 18
+        self.v_pct_span = max(1, end_pct - base_pct - 18)
+        self.file_pcts: dict[int, int] = {}
+        self.active: dict[int, dict] = {}
+        self.last_global = self.v_pct_base
+        self.lock = threading.Lock()
+
+    def _global_pct_locked(self) -> int:
+        unidades = sum(max(0, min(100, pct)) for pct in self.file_pcts.values()) / 100
+        global_pct = self.v_pct_base + int((unidades / self.total) * self.v_pct_span)
+        global_pct = min(max(global_pct, self.last_global), 99)
+        self.last_global = global_pct
+        return global_pct
+
+    def update(
+        self,
+        index: int,
+        contexto: dict,
+        *,
+        pct_file: int = 0,
+        estado: str = "descargando",
+        downloaded: int | None = None,
+        total_bytes: int | None = None,
+        error: str = "",
+        active: bool = True,
+    ) -> int:
+        with self.lock:
+            pct_file = int(max(0, min(100, pct_file)))
+            self.file_pcts[index] = max(self.file_pcts.get(index, 0), pct_file)
+            actual = dict(contexto)
+            actual.update(
+                {
+                    "estado": estado,
+                    "porcentaje_archivo": pct_file,
+                    "bytes_descargados": downloaded,
+                    "bytes_total": total_bytes or contexto.get("bytes_total"),
+                    "mb_descargados": (
+                        round(downloaded / 1048576, 1) if downloaded is not None else None
+                    ),
+                    "error": error,
+                }
+            )
+            if active:
+                self.active[index] = actual
+            else:
+                self.active.pop(index, None)
+
+            global_pct = self._global_pct_locked()
+            message = self._message(global_pct, actual)
+            extra = {
+                "descarga_actual": actual,
+                "descargas_activas": [
+                    self.active[key] for key in sorted(self.active)
+                ],
+            }
+            _emit_progress(self.set_progress, global_pct, message, extra)
+            return global_pct
+
+    @staticmethod
+    def _message(global_pct: int, contexto: dict) -> str:
+        prefix = (
+            f"[{global_pct}%] {contexto['fecha']} {contexto['turno_label']} "
+            f"CH{contexto['camara']} video "
+            f"{contexto['video_index']}/{contexto['videos_total']}: "
+        )
+        if contexto.get("estado") == "descargando":
+            downloaded = contexto.get("mb_descargados")
+            total = contexto.get("mb_total")
+            if downloaded is not None and total:
+                return f"{prefix}{contexto['porcentaje_archivo']}% | {downloaded:.1f}/{total:.1f} MB"
+            return f"{prefix}{contexto['porcentaje_archivo']}%"
+        return f"{prefix}{contexto.get('estado') or 'preparando'}"
+
+
 def _filtrar_videos_testing(archivos, opts, require_downloadable=False):
     channel = str(opts.get("test_channel", "Todos"))
     max_mb = float(opts.get("test_max_mb", 0) or 0)
@@ -1824,7 +1981,259 @@ def _descarga_suficiente(path: Path, file_len: int, config: CMSV6Config) -> bool
     return size >= config.small_response_bytes
 
 
-def _descargar_videos_dia(session, archivos, fecha, carpeta_videos_base, log_fn, set_progress, config, base_pct, end_pct):
+def _descargar_video_archivo(
+    session,
+    archivo,
+    *,
+    fecha,
+    carpeta_dia,
+    log_fn,
+    tracker: _DayDownloadProgress,
+    config,
+    index: int,
+    total: int,
+) -> dict:
+    resumen = {"descargados": 0, "omitidos": 0, "errores": 0}
+    nombre_mp4 = nombre_video_cmsv6(archivo, config.device_id, fecha)
+    dest_mp4 = carpeta_dia / nombre_mp4
+    dest_tmp = carpeta_dia / (Path(nombre_mp4).stem + ".tmp")
+    contexto = _contexto_video_descarga(
+        archivo,
+        config=config,
+        fecha=fecha,
+        index=index,
+        total=total,
+        nombre_mp4=nombre_mp4,
+        dest_tmp=dest_tmp,
+        dest_mp4=dest_mp4,
+    )
+    channel = contexto["camara"]
+    size_mb = _video_size_bytes(archivo) / 1048576
+    expected_secs = None
+    try:
+        expected_secs = int(archivo.get("end", 0) or 0) - int(archivo.get("beg", 0) or 0)
+        if expected_secs <= 0:
+            expected_secs = None
+    except Exception:
+        expected_secs = None
+
+    if dest_mp4.exists() and dest_mp4.stat().st_size > 4096 and is_mp4(dest_mp4):
+        if _mp4_duration_ok(dest_mp4, expected_secs, log_fn):
+            log_fn(
+                f"  [{index}/{total}] EXISTE {contexto['fecha']} "
+                f"{contexto['turno_label']} CH{channel}: {nombre_mp4}"
+            )
+            tracker.update(index, contexto, pct_file=100, estado="ya existe", active=False)
+            resumen["omitidos"] += 1
+            return resumen
+        dest_mp4.unlink()
+
+    fpath = str(archivo.get("file", "") or "").strip()
+    down_task_url = str(archivo.get("DownTaskUrl", "") or "").strip()
+    raw_down_url = str(archivo.get("DownUrl", "") or "").strip()
+    raw_play_url = str(archivo.get("PlaybackUrl", "") or "").strip()
+    file_len = int(archivo.get("len", 0) or 0)
+    if not (fpath or raw_down_url or raw_play_url):
+        log_fn(f"  [{index}/{total}] SIN datos de descarga: {nombre_mp4}")
+        tracker.update(
+            index,
+            contexto,
+            pct_file=100,
+            estado="error",
+            error="sin datos de descarga",
+            active=False,
+        )
+        resumen["errores"] += 1
+        return resumen
+
+    log_fn(
+        f"\n  [{index}/{total}] {contexto['fecha']} {contexto['turno_label']} "
+        f"CH{channel} | {contexto['hora_inicio']}-{contexto['hora_fin']} | "
+        f"{nombre_mp4} | {size_mb:.1f} MB"
+    )
+    tracker.update(index, contexto, pct_file=0, estado="preparando")
+
+    if down_task_url:
+        try:
+            task_url = session.refresh_url(down_task_url).replace(" ", "%20")
+            request = urllib.request.Request(task_url, method="GET")
+            request.add_header("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64)")
+            with session.opener.open(request, timeout=20) as response:
+                task_response = json.loads(response.read())
+            log_fn(
+                f"    Tarea CMSV6: result={task_response.get('result', '?')} "
+                f"id={task_response.get('taskId', task_response.get('id', '?'))}"
+            )
+            if config.task_prepare_wait_secs:
+                log_fn(f"    Esperando preparacion ({config.task_prepare_wait_secs}s max)...")
+                waited = 0
+                while waited < config.task_prepare_wait_secs:
+                    step = min(config.task_poll_interval_secs, config.task_prepare_wait_secs - waited)
+                    time.sleep(step)
+                    waited += step
+                    log_fn(f"    Preparando... {waited}/{config.task_prepare_wait_secs}s")
+        except Exception as exc:
+            log_fn(f"    Tarea CMSV6 ignorada por error: {exc}")
+
+    dispositivo_online = None
+    try:
+        gps = session.get_gps()
+        if gps:
+            dispositivo_online = gps[0].get("ol") in (1, "1", True)
+    except Exception:
+        pass
+
+    candidates = []
+    if dispositivo_online is False:
+        if raw_play_url:
+            candidates.append(("PlaybackUrl", raw_play_url, config.playback_stall_secs))
+        if raw_down_url:
+            candidates.append(("DownUrl", raw_down_url, config.downurl_stall_secs))
+        log_fn("    Dispositivo OFFLINE: usando PlaybackUrl primero")
+    else:
+        if raw_down_url:
+            candidates.append(("DownUrl", raw_down_url, config.downurl_stall_secs))
+        if raw_play_url:
+            candidates.append(("PlaybackUrl", raw_play_url, config.playback_stall_secs))
+        if dispositivo_online:
+            log_fn("    Dispositivo ONLINE: usando DownUrl primero")
+
+    download_ok = False
+    last_error = "sin intento"
+
+    def progress(downloaded, total_bytes):
+        pct_file = downloaded * 100 // total_bytes if total_bytes else 0
+        tracker.update(
+            index,
+            contexto,
+            pct_file=pct_file,
+            estado="descargando",
+            downloaded=downloaded,
+            total_bytes=total_bytes,
+        )
+
+    for round_idx in range(1, config.url_rounds + 1):
+        if download_ok:
+            break
+        if round_idx > 1:
+            try:
+                session.full_relogin()
+            except Exception as exc:
+                log_fn(f"    Re-login para ronda {round_idx} fallo: {exc}")
+        for label, raw_url, stall_secs in candidates:
+            try:
+                if dest_tmp.exists() and dest_tmp.stat().st_size < config.small_response_bytes:
+                    dest_tmp.unlink()
+                log_fn(f"    [{label}] descargando...")
+                session.download_file(
+                    raw_url,
+                    dest_tmp,
+                    progress_cb=progress,
+                    log_fn=log_fn,
+                    max_retries=3,
+                    dl_timeout=max(120, min(int(file_len / (100 * 1024)) if file_len else 120, 1800)),
+                    stall_secs=stall_secs,
+                )
+                if dest_tmp.exists() and _descarga_suficiente(dest_tmp, file_len, config):
+                    if is_ssy_dvr(dest_tmp) and not ssy_dvr_has_h264(dest_tmp):
+                        last_error = "SSY_DVR sin paquetes H264"
+                        log_fn(f"    [{label}] sin video util; probando otra URL...")
+                        continue
+                    download_ok = True
+                    break
+                last_error = "descarga incompleta o vacia"
+                log_fn(f"    [{label}] {last_error}; probando otra URL...")
+            except (StalledDownloadError, SlowDownloadError, DownloadTimeLimitError) as exc:
+                last_error = str(exc)
+                log_fn(f"    [{label}] {exc}; probando otra URL...")
+            except Exception as exc:
+                last_error = str(exc)
+                log_fn(f"    Error [{label}]: {exc}")
+        if not download_ok and round_idx < config.url_rounds and config.url_round_wait_secs:
+            log_fn(f"    Sin exito en ronda {round_idx}; esperando {config.url_round_wait_secs}s...")
+            time.sleep(config.url_round_wait_secs)
+
+    try:
+        if not download_ok:
+            raise Exception(f"Ninguna URL funciono. Ultimo error: {last_error}")
+
+        raw4 = b""
+        if dest_tmp.exists() and dest_tmp.stat().st_size >= 4:
+            with open(dest_tmp, "rb") as archivo_tmp:
+                raw4 = archivo_tmp.read(8)
+        fmt_hex = raw4[:4].hex() if raw4 else "????"
+        log_fn(f"    Header: {fmt_hex} | Tamaño: {dest_tmp.stat().st_size / 1048576:.2f} MB")
+
+        if is_mp4(dest_tmp):
+            if _mp4_duration_ok(dest_tmp, expected_secs, log_fn):
+                if dest_mp4.exists():
+                    dest_mp4.unlink()
+                dest_tmp.rename(dest_mp4)
+                log_fn(f"    MP4 nativo: {nombre_mp4}")
+                tracker.update(index, contexto, pct_file=100, estado="completo", active=False)
+                resumen["descargados"] += 1
+                return resumen
+            log_fn("    MP4 nativo con timestamps sospechosos; reparando...")
+            if repair_mp4_timestamps(dest_tmp, dest_mp4, log_fn, expected_secs=expected_secs):
+                dest_tmp.unlink(missing_ok=True)
+                tracker.update(index, contexto, pct_file=100, estado="completo", active=False)
+                resumen["descargados"] += 1
+                return resumen
+
+        tracker.update(index, contexto, pct_file=99, estado="convirtiendo")
+        if convert_to_mp4(dest_tmp, dest_mp4, log_fn, expected_secs=expected_secs):
+            dest_tmp.unlink(missing_ok=True)
+            log_fn(f"    MP4 OK: {nombre_mp4} ({dest_mp4.stat().st_size / 1048576:.1f} MB)")
+            tracker.update(index, contexto, pct_file=100, estado="completo", active=False)
+            resumen["descargados"] += 1
+        else:
+            raw_dest = carpeta_dia / (Path(nombre_mp4).stem + f"_{fmt_hex}.raw")
+            if dest_tmp.exists():
+                dest_tmp.rename(raw_dest)
+            log_fn(f"    Conversion fallo; crudo guardado: {raw_dest.name}")
+            tracker.update(
+                index,
+                contexto,
+                pct_file=100,
+                estado="error",
+                error="conversion fallo",
+                active=False,
+            )
+            resumen["errores"] += 1
+    except Exception as exc:
+        log_fn(f"    ERROR: {exc}")
+        tracker.update(
+            index,
+            contexto,
+            pct_file=100,
+            estado="error",
+            error=str(exc),
+            active=False,
+        )
+        resumen["errores"] += 1
+        if dest_mp4.exists() and not is_mp4(dest_mp4):
+            dest_mp4.unlink()
+    return resumen
+
+
+def _merge_resumen_descarga(destino: dict, parcial: dict):
+    destino["descargados"] += int(parcial.get("descargados", 0) or 0)
+    destino["omitidos"] += int(parcial.get("omitidos", 0) or 0)
+    destino["errores"] += int(parcial.get("errores", 0) or 0)
+
+
+def _descargar_videos_dia(
+    session,
+    archivos,
+    fecha,
+    carpeta_videos_base,
+    log_fn,
+    set_progress,
+    config,
+    base_pct,
+    end_pct,
+    download_workers=1,
+):
     resumen = {"descargados": 0, "omitidos": 0, "errores": 0, "total": len(archivos or [])}
     if not archivos:
         log_fn("  Sin videos para este dia.")
@@ -1833,185 +2242,53 @@ def _descargar_videos_dia(session, archivos, fecha, carpeta_videos_base, log_fn,
     carpeta_dia = carpeta_videos_base / fecha.strftime("%Y-%m-%d")
     carpeta_dia.mkdir(parents=True, exist_ok=True)
     total = len(archivos)
+    tracker = _DayDownloadProgress(set_progress, base_pct=base_pct, end_pct=end_pct, total=total)
+    workers = max(1, min(int(download_workers or 1), total))
     log_fn(f"  Encontrados: {total} archivos en CMSV6")
+    if workers > 1:
+        log_fn(f"  Descargas paralelas: {workers} videos a la vez")
 
-    for index, archivo in enumerate(archivos, start=1):
-        nombre_mp4 = nombre_video_cmsv6(archivo, config.device_id, fecha)
-        dest_mp4 = carpeta_dia / nombre_mp4
-        dest_tmp = carpeta_dia / (Path(nombre_mp4).stem + ".tmp")
-        channel = _video_channel_idx(archivo)
-        size_mb = _video_size_bytes(archivo) / 1048576
-        expected_secs = None
-        try:
-            expected_secs = int(archivo.get("end", 0) or 0) - int(archivo.get("beg", 0) or 0)
-            if expected_secs <= 0:
-                expected_secs = None
-        except Exception:
-            expected_secs = None
-
-        v_pct_base = base_pct + 18
-        v_pct_span = max(1, end_pct - base_pct - 18)
-        v_global = min(v_pct_base + int(((index - 1) / total) * v_pct_span), 99)
-
-        if dest_mp4.exists() and dest_mp4.stat().st_size > 4096 and is_mp4(dest_mp4):
-            if _mp4_duration_ok(dest_mp4, expected_secs, log_fn):
-                log_fn(f"  [{index}/{total}] EXISTE CH{channel + 1}: {nombre_mp4}")
-                resumen["omitidos"] += 1
-                continue
-            dest_mp4.unlink()
-
-        fpath = str(archivo.get("file", "") or "").strip()
-        down_task_url = str(archivo.get("DownTaskUrl", "") or "").strip()
-        raw_down_url = str(archivo.get("DownUrl", "") or "").strip()
-        raw_play_url = str(archivo.get("PlaybackUrl", "") or "").strip()
-        file_len = int(archivo.get("len", 0) or 0)
-        if not (fpath or raw_down_url or raw_play_url):
-            log_fn(f"  [{index}/{total}] SIN datos de descarga: {nombre_mp4}")
-            resumen["errores"] += 1
-            continue
-
-        log_fn(f"\n  [{index}/{total}] CH{channel + 1} | {nombre_mp4} | {size_mb:.1f} MB")
-        set_progress(v_global, f"[{v_global}%] Video {index}/{total} CH{channel + 1}: preparando...")
-
-        if down_task_url:
-            try:
-                task_url = session.refresh_url(down_task_url).replace(" ", "%20")
-                request = urllib.request.Request(task_url, method="GET")
-                request.add_header("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64)")
-                with session.opener.open(request, timeout=20) as response:
-                    task_response = json.loads(response.read())
-                log_fn(
-                    f"    Tarea CMSV6: result={task_response.get('result', '?')} "
-                    f"id={task_response.get('taskId', task_response.get('id', '?'))}"
-                )
-                if config.task_prepare_wait_secs:
-                    log_fn(f"    Esperando preparacion ({config.task_prepare_wait_secs}s max)...")
-                    waited = 0
-                    while waited < config.task_prepare_wait_secs:
-                        step = min(config.task_poll_interval_secs, config.task_prepare_wait_secs - waited)
-                        time.sleep(step)
-                        waited += step
-                        log_fn(f"    Preparando... {waited}/{config.task_prepare_wait_secs}s")
-            except Exception as exc:
-                log_fn(f"    Tarea CMSV6 ignorada por error: {exc}")
-
-        dispositivo_online = None
-        try:
-            gps = session.get_gps()
-            if gps:
-                dispositivo_online = gps[0].get("ol") in (1, "1", True)
-        except Exception:
-            pass
-
-        candidates = []
-        if dispositivo_online is False:
-            if raw_play_url:
-                candidates.append(("PlaybackUrl", raw_play_url, config.playback_stall_secs))
-            if raw_down_url:
-                candidates.append(("DownUrl", raw_down_url, config.downurl_stall_secs))
-            log_fn("    Dispositivo OFFLINE: usando PlaybackUrl primero")
-        else:
-            if raw_down_url:
-                candidates.append(("DownUrl", raw_down_url, config.downurl_stall_secs))
-            if raw_play_url:
-                candidates.append(("PlaybackUrl", raw_play_url, config.playback_stall_secs))
-            if dispositivo_online:
-                log_fn("    Dispositivo ONLINE: usando DownUrl primero")
-
-        download_ok = False
-        last_error = "sin intento"
-
-        def progress(downloaded, total_bytes):
-            pct_file = downloaded * 100 // total_bytes if total_bytes else 0
-            global_pct = min(v_pct_base + int(((index - 1 + pct_file / 100) / total) * v_pct_span), 99)
-            set_progress(
-                global_pct,
-                f"[{global_pct}%] Video {index}/{total} CH{channel + 1}: "
-                f"{pct_file}% | {downloaded / 1048576:.1f}/{max(size_mb, 0):.1f} MB",
+    if workers == 1:
+        for index, archivo in enumerate(archivos, start=1):
+            parcial = _descargar_video_archivo(
+                session,
+                archivo,
+                fecha=fecha,
+                carpeta_dia=carpeta_dia,
+                log_fn=log_fn,
+                tracker=tracker,
+                config=config,
+                index=index,
+                total=total,
+            )
+            _merge_resumen_descarga(resumen, parcial)
+    else:
+        def _run(index, archivo):
+            worker_session = CMSV6Session(config)
+            worker_session.login()
+            return _descargar_video_archivo(
+                worker_session,
+                archivo,
+                fecha=fecha,
+                carpeta_dia=carpeta_dia,
+                log_fn=log_fn,
+                tracker=tracker,
+                config=config,
+                index=index,
+                total=total,
             )
 
-        for round_idx in range(1, config.url_rounds + 1):
-            if download_ok:
-                break
-            if round_idx > 1:
+        with ThreadPoolExecutor(max_workers=workers) as executor:
+            futures = [
+                executor.submit(_run, index, archivo)
+                for index, archivo in enumerate(archivos, start=1)
+            ]
+            for future in as_completed(futures):
                 try:
-                    session.full_relogin()
+                    _merge_resumen_descarga(resumen, future.result())
                 except Exception as exc:
-                    log_fn(f"    Re-login para ronda {round_idx} fallo: {exc}")
-            for label, raw_url, stall_secs in candidates:
-                try:
-                    if dest_tmp.exists() and dest_tmp.stat().st_size < config.small_response_bytes:
-                        dest_tmp.unlink()
-                    log_fn(f"    [{label}] descargando...")
-                    session.download_file(
-                        raw_url,
-                        dest_tmp,
-                        progress_cb=progress,
-                        log_fn=log_fn,
-                        max_retries=3,
-                        dl_timeout=max(120, min(int(file_len / (100 * 1024)) if file_len else 120, 1800)),
-                        stall_secs=stall_secs,
-                    )
-                    if dest_tmp.exists() and _descarga_suficiente(dest_tmp, file_len, config):
-                        if is_ssy_dvr(dest_tmp) and not ssy_dvr_has_h264(dest_tmp):
-                            last_error = "SSY_DVR sin paquetes H264"
-                            log_fn(f"    [{label}] sin video util; probando otra URL...")
-                            continue
-                        download_ok = True
-                        break
-                    last_error = "descarga incompleta o vacia"
-                    log_fn(f"    [{label}] {last_error}; probando otra URL...")
-                except (StalledDownloadError, SlowDownloadError, DownloadTimeLimitError) as exc:
-                    last_error = str(exc)
-                    log_fn(f"    [{label}] {exc}; probando otra URL...")
-                except Exception as exc:
-                    last_error = str(exc)
-                    log_fn(f"    Error [{label}]: {exc}")
-            if not download_ok and round_idx < config.url_rounds and config.url_round_wait_secs:
-                log_fn(f"    Sin exito en ronda {round_idx}; esperando {config.url_round_wait_secs}s...")
-                time.sleep(config.url_round_wait_secs)
-
-        try:
-            if not download_ok:
-                raise Exception(f"Ninguna URL funciono. Ultimo error: {last_error}")
-
-            raw4 = b""
-            if dest_tmp.exists() and dest_tmp.stat().st_size >= 4:
-                with open(dest_tmp, "rb") as archivo_tmp:
-                    raw4 = archivo_tmp.read(8)
-            fmt_hex = raw4[:4].hex() if raw4 else "????"
-            log_fn(f"    Header: {fmt_hex} | Tamaño: {dest_tmp.stat().st_size / 1048576:.2f} MB")
-
-            if is_mp4(dest_tmp):
-                if _mp4_duration_ok(dest_tmp, expected_secs, log_fn):
-                    if dest_mp4.exists():
-                        dest_mp4.unlink()
-                    dest_tmp.rename(dest_mp4)
-                    log_fn(f"    MP4 nativo: {nombre_mp4}")
-                    resumen["descargados"] += 1
-                    continue
-                log_fn("    MP4 nativo con timestamps sospechosos; reparando...")
-                if repair_mp4_timestamps(dest_tmp, dest_mp4, log_fn, expected_secs=expected_secs):
-                    dest_tmp.unlink(missing_ok=True)
-                    resumen["descargados"] += 1
-                    continue
-
-            set_progress(min(v_global + 1, 99), f"[{min(v_global + 1, 99)}%] Video {index}/{total}: convirtiendo...")
-            if convert_to_mp4(dest_tmp, dest_mp4, log_fn, expected_secs=expected_secs):
-                dest_tmp.unlink(missing_ok=True)
-                log_fn(f"    MP4 OK: {nombre_mp4} ({dest_mp4.stat().st_size / 1048576:.1f} MB)")
-                resumen["descargados"] += 1
-            else:
-                raw_dest = carpeta_dia / (Path(nombre_mp4).stem + f"_{fmt_hex}.raw")
-                if dest_tmp.exists():
-                    dest_tmp.rename(raw_dest)
-                log_fn(f"    Conversion fallo; crudo guardado: {raw_dest.name}")
-                resumen["errores"] += 1
-        except Exception as exc:
-            log_fn(f"    ERROR: {exc}")
-            resumen["errores"] += 1
-            if dest_mp4.exists() and not is_mp4(dest_mp4):
-                dest_mp4.unlink()
+                    log_fn(f"    ERROR descarga paralela: {exc}")
+                    resumen["errores"] += 1
 
     log_fn(
         f"\n  VIDEOS COMPLETADOS: {resumen['descargados']} descargados | "
@@ -2043,6 +2320,13 @@ def ejecutar_rango(
     hacer_videos = bool(opts.get("videos", True))
     test_30d_mode = str(opts.get("test_30d_mode", "off") or "off")
     test_range_mode = str(opts.get("test_range_mode", "off") or "off")
+    try:
+        download_workers = max(
+            1,
+            int(opts.get("download_workers") or getattr(config, "download_workers", 1)),
+        )
+    except (TypeError, ValueError):
+        download_workers = 1
     if test_30d_mode not in ("off", "min", "max"):
         test_30d_mode = "off"
     if test_range_mode not in ("off", "min", "max"):
@@ -2213,6 +2497,7 @@ def ejecutar_rango(
             config,
             base_pct,
             end_pct,
+            download_workers=download_workers,
         )
         resumen_total["videos_descargados"] += resumen_dia["descargados"]
         resumen_total["videos_omitidos"] += resumen_dia["omitidos"]

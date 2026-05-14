@@ -158,10 +158,12 @@ class _TaskReporter:
             self.logs = self.logs[-self.max_logs :]
         self.publish()
 
-    def progress_cb(self, progress, message):
+    def progress_cb(self, progress, message, extra=None):
         if progress is not None:
             self.progress = int(max(0, min(100, progress)))
         self.message = str(message or self.message)
+        if isinstance(extra, dict):
+            self.extra.update(extra)
         self.publish()
 
     def set_extra(self, **extra):
@@ -303,6 +305,10 @@ def _rango_semanal_mdvr(*, incluir_futuro: bool = False):
 
 
 def _opciones_monitor_cmsv6(params: dict) -> dict:
+    try:
+        download_workers_default = int(getattr(settings, "CMSV6_DOWNLOAD_WORKERS", 1) or 1)
+    except (TypeError, ValueError):
+        download_workers_default = 1
     return {
         "excel_ruta": True,
         "excel_alarmas": _param_bool(params, "excel_alarmas", False),
@@ -314,6 +320,12 @@ def _opciones_monitor_cmsv6(params: dict) -> dict:
         "test_channel": params.get("test_channel", "Todos"),
         "test_30d_mode": params.get("test_30d_mode", "off"),
         "test_range_mode": params.get("test_range_mode", "off"),
+        "download_workers": _param_int(
+            params,
+            "download_workers",
+            download_workers_default,
+            minimum=1,
+        ),
     }
 
 
