@@ -186,6 +186,62 @@ try:
 except ValueError:
     MDVR_TIMING_MAX_FPS = 30.0
 
+MDVR_RECHAZAR_VIDEO_NEGRO = os.environ.get("MDVR_RECHAZAR_VIDEO_NEGRO", "1").lower() in {
+    "1",
+    "true",
+    "yes",
+}
+try:
+    MDVR_BLACK_MIN_DURATION_SECONDS = int(os.environ.get("MDVR_BLACK_MIN_DURATION_SECONDS", "10"))
+except ValueError:
+    MDVR_BLACK_MIN_DURATION_SECONDS = 10
+MDVR_BLACK_MIN_DURATION_SECONDS = max(1, MDVR_BLACK_MIN_DURATION_SECONDS)
+try:
+    MDVR_BLACK_MAX_RATIO = float(os.environ.get("MDVR_BLACK_MAX_RATIO", "0.98"))
+except ValueError:
+    MDVR_BLACK_MAX_RATIO = 0.98
+MDVR_BLACK_MAX_RATIO = min(max(MDVR_BLACK_MAX_RATIO, 0.5), 1.0)
+try:
+    MDVR_BLACK_PIX_TH = float(os.environ.get("MDVR_BLACK_PIX_TH", "0.03"))
+except ValueError:
+    MDVR_BLACK_PIX_TH = 0.03
+MDVR_BLACK_PIX_TH = min(max(MDVR_BLACK_PIX_TH, 0.0), 1.0)
+try:
+    MDVR_BLACK_PIC_TH = float(os.environ.get("MDVR_BLACK_PIC_TH", "0.995"))
+except ValueError:
+    MDVR_BLACK_PIC_TH = 0.995
+MDVR_BLACK_PIC_TH = min(max(MDVR_BLACK_PIC_TH, 0.5), 1.0)
+MDVR_BLACK_ANALYSIS_MODE = os.environ.get("MDVR_BLACK_ANALYSIS_MODE", "sample").strip().lower()
+if MDVR_BLACK_ANALYSIS_MODE not in {"sample", "full"}:
+    MDVR_BLACK_ANALYSIS_MODE = "sample"
+try:
+    MDVR_BLACK_SAMPLE_COUNT = int(os.environ.get("MDVR_BLACK_SAMPLE_COUNT", "7"))
+except ValueError:
+    MDVR_BLACK_SAMPLE_COUNT = 7
+MDVR_BLACK_SAMPLE_COUNT = min(max(MDVR_BLACK_SAMPLE_COUNT, 3), 25)
+try:
+    MDVR_BLACK_MIN_VALID_SAMPLES = int(os.environ.get("MDVR_BLACK_MIN_VALID_SAMPLES", "3"))
+except ValueError:
+    MDVR_BLACK_MIN_VALID_SAMPLES = 3
+MDVR_BLACK_MIN_VALID_SAMPLES = min(max(MDVR_BLACK_MIN_VALID_SAMPLES, 1), 25)
+try:
+    MDVR_BLACK_SAMPLE_WIDTH = int(os.environ.get("MDVR_BLACK_SAMPLE_WIDTH", "64"))
+except ValueError:
+    MDVR_BLACK_SAMPLE_WIDTH = 64
+MDVR_BLACK_SAMPLE_WIDTH = min(max(MDVR_BLACK_SAMPLE_WIDTH, 16), 320)
+try:
+    MDVR_BLACK_SAMPLE_HEIGHT = int(os.environ.get("MDVR_BLACK_SAMPLE_HEIGHT", "36"))
+except ValueError:
+    MDVR_BLACK_SAMPLE_HEIGHT = 36
+MDVR_BLACK_SAMPLE_HEIGHT = min(max(MDVR_BLACK_SAMPLE_HEIGHT, 16), 240)
+try:
+    MDVR_BLACK_FRAME_TIMEOUT_SECONDS = int(
+        os.environ.get("MDVR_BLACK_FRAME_TIMEOUT_SECONDS", "20")
+    )
+except ValueError:
+    MDVR_BLACK_FRAME_TIMEOUT_SECONDS = 20
+MDVR_BLACK_FRAME_TIMEOUT_SECONDS = max(3, MDVR_BLACK_FRAME_TIMEOUT_SECONDS)
+
 RAW_VIDEO_EXTENSIONS = {".h264", ".grec"}
 TRANSIENT_ERRNOS = {
     errno.EAGAIN,
@@ -199,6 +255,10 @@ TRANSIENT_ERRNOS = {
     errno.EHOSTUNREACH,
 }
 logger = logging.getLogger(__name__)
+
+
+class VideoSinImagenUtilError(ValidationError):
+    pass
 
 
 @dataclass(frozen=True)
@@ -1369,6 +1429,184 @@ def _duracion_archivo_segura(ruta: str) -> float:
         return 0.0
 
 
+_BLACKDETECT_RE = re.compile(
+    r"black_start:(?P<inicio>[0-9.]+)\s+"
+    r"black_end:(?P<fin>[0-9.]+)\s+"
+    r"black_duration:(?P<duracion>[0-9.]+)"
+)
+
+
+def _analizar_video_negro_completo_blackdetect(ruta: str, duracion: float) -> dict:
+    filtro = (
+        "blackdetect="
+        f"d=0.5:pic_th={MDVR_BLACK_PIC_TH:.6f}:pix_th={MDVR_BLACK_PIX_TH:.6f}"
+    )
+    try:
+        result = subprocess.run(
+            [
+                "ffmpeg",
+                "-hide_banner",
+                "-nostats",
+                "-i",
+                ruta,
+                "-vf",
+                filtro,
+                "-an",
+                "-f",
+                "null",
+                "-",
+            ],
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+    except OSError as exc:
+        return {
+            "negro_total": False,
+            "habilitado": True,
+            "duracion": duracion,
+            "modo": "full",
+            "error": str(exc),
+        }
+
+    texto = f"{result.stderr or ''}\n{result.stdout or ''}"
+    total_negro = 0.0
+    for match in _BLACKDETECT_RE.finditer(texto):
+        try:
+            total_negro += float(match.group("duracion") or 0.0)
+        except (TypeError, ValueError):
+            continue
+    ratio = total_negro / duracion if duracion > 0 else 0.0
+    return {
+        "negro_total": ratio >= MDVR_BLACK_MAX_RATIO,
+        "habilitado": True,
+        "modo": "full",
+        "duracion": duracion,
+        "segundos_negros": round(total_negro, 3),
+        "ratio_negro": round(ratio, 6),
+        "returncode": result.returncode,
+    }
+
+
+def _puntos_muestreo_negro(duracion: float) -> list[float]:
+    cantidad = min(MDVR_BLACK_SAMPLE_COUNT, max(3, int(duracion // 300) + 3))
+    cantidad = min(cantidad, MDVR_BLACK_SAMPLE_COUNT)
+    return [
+        max(0.5, min(duracion - 0.5, duracion * (indice + 1) / (cantidad + 1)))
+        for indice in range(cantidad)
+    ]
+
+
+def _ratio_negro_frame_muestreado(ruta: str, segundo: float) -> dict:
+    ancho = MDVR_BLACK_SAMPLE_WIDTH
+    alto = MDVR_BLACK_SAMPLE_HEIGHT
+    try:
+        result = subprocess.run(
+            [
+                "ffmpeg",
+                "-hide_banner",
+                "-loglevel",
+                "error",
+                "-ss",
+                f"{segundo:.3f}",
+                "-i",
+                ruta,
+                "-frames:v",
+                "1",
+                "-vf",
+                f"scale={ancho}:{alto}:flags=fast_bilinear,format=gray",
+                "-f",
+                "rawvideo",
+                "-",
+            ],
+            check=False,
+            capture_output=True,
+            timeout=MDVR_BLACK_FRAME_TIMEOUT_SECONDS,
+        )
+    except subprocess.TimeoutExpired:
+        return {"segundo": round(segundo, 3), "error": "timeout"}
+    except OSError as exc:
+        return {"segundo": round(segundo, 3), "error": str(exc)}
+
+    data = result.stdout or b""
+    if result.returncode != 0 or len(data) < ancho * alto:
+        detalle = (result.stderr or b"").decode("utf-8", errors="replace").strip()
+        return {
+            "segundo": round(segundo, 3),
+            "error": detalle or f"frame incompleto ({len(data)} bytes)",
+            "returncode": result.returncode,
+        }
+
+    umbral_pixel = int(round(MDVR_BLACK_PIX_TH * 255))
+    pixeles_negros = sum(1 for pixel in data[: ancho * alto] if pixel <= umbral_pixel)
+    ratio_pixeles_negros = pixeles_negros / float(ancho * alto)
+    return {
+        "segundo": round(segundo, 3),
+        "ratio_pixeles_negros": round(ratio_pixeles_negros, 6),
+        "negro": ratio_pixeles_negros >= MDVR_BLACK_PIC_TH,
+    }
+
+
+def _analizar_video_negro_por_muestras(ruta: str, duracion: float) -> dict:
+    muestras = [_ratio_negro_frame_muestreado(ruta, punto) for punto in _puntos_muestreo_negro(duracion)]
+    muestras_validas = [muestra for muestra in muestras if "negro" in muestra]
+    min_validas = min(MDVR_BLACK_MIN_VALID_SAMPLES, len(muestras))
+    if len(muestras_validas) < min_validas:
+        return {
+            "negro_total": False,
+            "habilitado": True,
+            "modo": "sample",
+            "duracion": duracion,
+            "motivo": "muestras_validas_insuficientes",
+            "muestras_total": len(muestras),
+            "muestras_validas": len(muestras_validas),
+            "muestras_minimas": min_validas,
+            "muestras": muestras,
+        }
+
+    muestras_negras = sum(1 for muestra in muestras_validas if muestra.get("negro"))
+    ratio = muestras_negras / float(len(muestras_validas))
+    return {
+        "negro_total": ratio >= MDVR_BLACK_MAX_RATIO,
+        "habilitado": True,
+        "modo": "sample",
+        "duracion": duracion,
+        "muestras_total": len(muestras),
+        "muestras_validas": len(muestras_validas),
+        "muestras_negras": muestras_negras,
+        "ratio_negro": round(ratio, 6),
+        "muestras": muestras,
+    }
+
+
+def _analizar_video_totalmente_negro(ruta: str) -> dict:
+    if not MDVR_RECHAZAR_VIDEO_NEGRO:
+        return {"negro_total": False, "habilitado": False}
+    duracion = _duracion_archivo_segura(ruta)
+    if duracion < MDVR_BLACK_MIN_DURATION_SECONDS:
+        return {
+            "negro_total": False,
+            "habilitado": True,
+            "duracion": duracion,
+            "motivo": "duracion_menor_al_minimo",
+        }
+    if MDVR_BLACK_ANALYSIS_MODE == "full":
+        return _analizar_video_negro_completo_blackdetect(ruta, duracion)
+    return _analizar_video_negro_por_muestras(ruta, duracion)
+
+
+def _validar_video_con_imagen_util(ruta: str, *, contexto: str = "video") -> dict:
+    info = _analizar_video_totalmente_negro(ruta)
+    if info.get("negro_total"):
+        ratio = float(info.get("ratio_negro") or 0.0) * 100
+        unidad = "muestras" if info.get("modo") == "sample" else "duracion"
+        raise VideoSinImagenUtilError(
+            f"{contexto}: el video resultante quedo practicamente negro "
+            f"({ratio:.1f}% de {unidad}). Se rechaza para no publicar un MP4 sin imagen util."
+        )
+    return info
+
+
 def _estirar_mp4_a_duracion(
     ruta_origen: str,
     ruta_destino: str,
@@ -1552,6 +1790,20 @@ def _corregir_timing_video_si_corresponde(
         duracion_corregida = math.floor(calcular_duracion_video(ruta_corregida))
         if duracion_corregida <= math.floor(float(plan["duracion"] or 0.0)):
             raise ValidationError("La correccion de timing no aumento la duracion.")
+        validacion_negro = _analizar_video_totalmente_negro(ruta_corregida)
+        if validacion_negro.get("negro_total"):
+            return {
+                "aplicada": False,
+                "omitida": True,
+                "motivo": "correccion_timing_genero_video_negro",
+                "duracion_original": round(float(plan["duracion"]), 3),
+                "duracion_corregida": duracion_corregida,
+                "duracion_esperada": plan["duracion_esperada"],
+                "fps_declarado": round(float(plan.get("fps_declarado") or 0.0), 3),
+                "fps_timeline": round(float(plan["fps_timeline"]), 3),
+                "factor": round(float(plan["factor"]), 6),
+                "validacion_negro": validacion_negro,
+            }
         os.replace(ruta_corregida, ruta)
         _actualizar_estado_video_por_duracion(
             video,
@@ -1605,6 +1857,7 @@ def _registrar_mp4_directo(
         duracion_real = math.floor(calcular_duracion_video(ruta_final))
         if duracion_real <= 0:
             raise ValidationError("No se pudo calcular una duración válida para el MP4.")
+        _validar_video_con_imagen_util(ruta_final, contexto=nombre_video)
     except Exception:
         try:
             default_storage.delete(destino_rel)
@@ -2468,11 +2721,12 @@ def _importar_camion_mdvr(
 
             video = video_existente
             tmp_dir = tempfile.mkdtemp(prefix="mdvr_")
+            ruta_previa = ""
+            ruta_generada_en_intento = ""
             try:
                 ext_salida = ".mp4"
                 inicio_dt = lista_procesable[0].inicio_dt
                 lease_hasta = timezone.now() + datetime.timedelta(seconds=PROCESANDO_LEASE_SEGUNDOS)
-                ruta_previa = ""
                 if video_existente:
                     ruta_previa = (video_existente.ruta_archivo.name or "").strip()
                     video_existente.camara = camara
@@ -2578,17 +2832,14 @@ def _importar_camion_mdvr(
                     ok, error = _concatenar_segmentos(lista_procesable, ruta_salida)
                     if not ok:
                         raise ValidationError(f"No se pudo concatenar segmentos ({error}).")
+                    _validar_video_con_imagen_util(ruta_salida, contexto=nombre_video)
 
                     destino_rel = _subir_archivo_temporal(
                         ruta_salida, f"{nombre_video}{ext_salida}"
                     )
+                    ruta_generada_en_intento = destino_rel
                     video.ruta_archivo = destino_rel
                     video.save(update_fields=["ruta_archivo"])
-                    if video_existente and ruta_previa and ruta_previa != destino_rel:
-                        try:
-                            default_storage.delete(ruta_previa)
-                        except Exception:
-                            pass
 
                     procesar_video_subida(
                         video,
@@ -2626,6 +2877,22 @@ def _importar_camion_mdvr(
                             "proximo_reintento_en",
                         ]
                     )
+                if video.estado in {EstadoVideo.LISTO, EstadoVideo.INCOMPLETO}:
+                    _validar_video_con_imagen_util(
+                        video.ruta_archivo.path,
+                        contexto=nombre_video,
+                    )
+                if (
+                    video_existente
+                    and ruta_previa
+                    and video.ruta_archivo
+                    and ruta_previa != (video.ruta_archivo.name or "")
+                ):
+                    try:
+                        default_storage.delete(ruta_previa)
+                    except Exception:
+                        pass
+                    ruta_previa = ""
                 if video.estado == EstadoVideo.LISTO:
                     _normalizar_video_exitoso(video)
                 detalles["videos_creados"] += 1
@@ -2697,6 +2964,23 @@ def _importar_camion_mdvr(
                 raise
             except Exception as exc:
                 if video is not None:
+                    if isinstance(exc, VideoSinImagenUtilError):
+                        ruta_actual = (video.ruta_archivo.name or "").strip()
+                        if ruta_previa:
+                            if ruta_actual and ruta_actual != ruta_previa:
+                                try:
+                                    default_storage.delete(ruta_actual)
+                                except Exception:
+                                    pass
+                            video.ruta_archivo.name = ruta_previa
+                            video.save(update_fields=["ruta_archivo"])
+                        elif ruta_actual and ruta_actual == ruta_generada_en_intento:
+                            try:
+                                default_storage.delete(ruta_actual)
+                            except Exception:
+                                pass
+                            video.ruta_archivo.name = ""
+                            video.save(update_fields=["ruta_archivo"])
                     estado_error = _marcar_video_para_reintento(video, timezone.now(), exc)
                     detalles["errores"].append(f"{nombre_video}: {estado_error}.")
                 else:

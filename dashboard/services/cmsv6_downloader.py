@@ -123,6 +123,7 @@ class CMSV6Config:
     test_30d_scan_newest_first: bool = True
     small_response_bytes: int = 4096
     download_workers: int = 1
+    serial_downloads_per_device: bool = True
 
     @classmethod
     def from_settings(cls, output_dir: str | None = None):
@@ -160,6 +161,12 @@ class CMSV6Config:
             test_30d_scan_newest_first=_setting_int("CMSV6_TEST_30D_SCAN_NEWEST_FIRST", 1) != 0,
             small_response_bytes=_setting_int("CMSV6_SMALL_RESPONSE_BYTES", 4096, minimum=1),
             download_workers=_setting_int("CMSV6_DOWNLOAD_WORKERS", 1, minimum=1),
+            serial_downloads_per_device=_setting_int(
+                "CMSV6_SERIAL_DOWNLOADS_PER_DEVICE",
+                1,
+                minimum=0,
+            )
+            != 0,
         )
 
     def validate(self):
@@ -2245,6 +2252,12 @@ def _descargar_videos_dia(
     tracker = _DayDownloadProgress(set_progress, base_pct=base_pct, end_pct=end_pct, total=total)
     workers = max(1, min(int(download_workers or 1), total))
     log_fn(f"  Encontrados: {total} archivos en CMSV6")
+    if workers > 1 and getattr(config, "serial_downloads_per_device", True):
+        log_fn(
+            "  Descargas serializadas por equipo MDVR: "
+            f"se usara 1 video a la vez (configurado: {workers})"
+        )
+        workers = 1
     if workers > 1:
         log_fn(f"  Descargas paralelas: {workers} videos a la vez")
 
