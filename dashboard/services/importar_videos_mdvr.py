@@ -1,6 +1,7 @@
 import datetime
 import errno
 import hashlib
+import json
 import logging
 import mimetypes
 import math
@@ -162,6 +163,28 @@ try:
 except ValueError:
     GAP_PADDING_MIN_SEGUNDOS = _GAP_PADDING_MIN_SEGUNDOS_DEFAULT
 GAP_PADDING_MIN_SEGUNDOS = max(0.0, GAP_PADDING_MIN_SEGUNDOS)
+
+MDVR_CORREGIR_TIMING_FPS = os.environ.get("MDVR_CORREGIR_TIMING_FPS", "1").lower() in {
+    "1",
+    "true",
+    "yes",
+}
+try:
+    MDVR_TIMING_MIN_FACTOR = float(os.environ.get("MDVR_TIMING_MIN_FACTOR", "1.05"))
+except ValueError:
+    MDVR_TIMING_MIN_FACTOR = 1.05
+try:
+    MDVR_TIMING_MAX_FACTOR = float(os.environ.get("MDVR_TIMING_MAX_FACTOR", "2.5"))
+except ValueError:
+    MDVR_TIMING_MAX_FACTOR = 2.5
+try:
+    MDVR_TIMING_MIN_FPS = float(os.environ.get("MDVR_TIMING_MIN_FPS", "5"))
+except ValueError:
+    MDVR_TIMING_MIN_FPS = 5.0
+try:
+    MDVR_TIMING_MAX_FPS = float(os.environ.get("MDVR_TIMING_MAX_FPS", "30"))
+except ValueError:
+    MDVR_TIMING_MAX_FPS = 30.0
 
 RAW_VIDEO_EXTENSIONS = {".h264", ".grec"}
 TRANSIENT_ERRNOS = {
@@ -800,7 +823,10 @@ def _segmento_desde_archivo(ruta: str, fecha: datetime.date) -> SegmentoVideo | 
 
 
 def _prioridad_segmento_para_importar(segmento: SegmentoVideo) -> tuple[int, int, float]:
-    prioridad_extension = 1 if segmento.extension == ".mp4" else 0
+    if segmento.extension == ".mp4":
+        prioridad_extension = 2 if _mp4_directo_seguro(segmento.ruta) else 0
+    else:
+        prioridad_extension = 1
     try:
         stat = os.stat(segmento.ruta)
         tamano = int(stat.st_size or 0)
@@ -1242,6 +1268,248 @@ def _mp4_directo_seguro(ruta: str) -> bool:
         return False
 
 
+def _leer_timing_video(ruta: str, *, count_frames: bool = False) -> dict:
+    cmd = [
+        "ffprobe",
+        "-v",
+        "error",
+    ]
+    if count_frames:
+        cmd.append("-count_frames")
+    cmd.extend(
+        [
+            "-select_streams",
+            "v:0",
+            "-show_entries",
+            (
+                "stream=codec_name,avg_frame_rate,r_frame_rate,"
+                "nb_frames,nb_read_frames,duration:format=duration"
+            ),
+            "-of",
+            "json",
+            ruta,
+        ]
+    )
+    result = run_command(cmd, error_prefix="No se pudo inspeccionar timing del video")
+    try:
+        data = json.loads(result.stdout or "{}")
+    except json.JSONDecodeError as exc:
+        raise ValidationError("No se pudo inspeccionar timing del video: JSON invalido.") from exc
+
+    stream = next(iter(data.get("streams") or []), {})
+    formato = data.get("format") or {}
+
+    def _float(valor) -> float:
+        try:
+            return float(valor or 0)
+        except (TypeError, ValueError):
+            return 0.0
+
+    def _int(valor) -> int:
+        try:
+            return int(valor or 0)
+        except (TypeError, ValueError):
+            return 0
+
+    duracion = _float(stream.get("duration")) or _float(formato.get("duration"))
+    frames = _int(stream.get("nb_frames")) or _int(stream.get("nb_read_frames"))
+    fps_declarado = (
+        _parsear_fraccion_ffprobe(stream.get("avg_frame_rate"))
+        or _parsear_fraccion_ffprobe(stream.get("r_frame_rate"))
+        or 0.0
+    )
+    if frames <= 0 and not count_frames:
+        return _leer_timing_video(ruta, count_frames=True)
+    return {
+        "duracion": duracion,
+        "frames": frames,
+        "fps_declarado": fps_declarado,
+        "codec": stream.get("codec_name") or "",
+    }
+
+
+def _correccion_timing_necesaria(ruta: str, duracion_esperada: int | None) -> dict | None:
+    if not MDVR_CORREGIR_TIMING_FPS or not duracion_esperada or duracion_esperada <= 0:
+        return None
+    if not str(ruta or "").lower().endswith(".mp4"):
+        return None
+
+    try:
+        timing = _leer_timing_video(ruta)
+    except Exception:
+        return None
+
+    duracion_real = float(timing.get("duracion") or 0.0)
+    frames = int(timing.get("frames") or 0)
+    if duracion_real <= 0 or frames <= 0:
+        return None
+    if duracion_real + VIDEO_IMPORT_DURATION_TOLERANCE_SECONDS >= duracion_esperada:
+        return None
+
+    factor = float(duracion_esperada) / duracion_real
+    if factor < MDVR_TIMING_MIN_FACTOR or factor > MDVR_TIMING_MAX_FACTOR:
+        return None
+
+    fps_timeline = frames / float(duracion_esperada)
+    if fps_timeline < MDVR_TIMING_MIN_FPS or fps_timeline > MDVR_TIMING_MAX_FPS:
+        return None
+
+    return {
+        **timing,
+        "duracion_esperada": int(duracion_esperada),
+        "factor": factor,
+        "fps_timeline": fps_timeline,
+    }
+
+
+def _estirar_mp4_a_duracion(ruta_origen: str, ruta_destino: str, factor: float):
+    filtro = f"setpts={factor:.8f}*PTS"
+    run_command(
+        [
+            "ffmpeg",
+            "-y",
+            "-hide_banner",
+            "-loglevel",
+            "error",
+            "-i",
+            ruta_origen,
+            "-an",
+            "-vf",
+            filtro,
+            "-c:v",
+            "libx264",
+            "-preset",
+            "veryfast",
+            "-crf",
+            "23",
+            "-pix_fmt",
+            "yuv420p",
+            "-movflags",
+            "+faststart",
+            ruta_destino,
+        ],
+        error_prefix="No se pudo corregir timing/FPS MDVR",
+    )
+    if not os.path.exists(ruta_destino) or os.path.getsize(ruta_destino) <= 0:
+        raise ValidationError("No se pudo corregir timing/FPS MDVR: salida vacia.")
+
+
+def _actualizar_estado_video_por_duracion(
+    video: Video,
+    *,
+    duracion_esperada: int | None,
+    inicio_procesamiento: datetime.datetime | None = None,
+):
+    duracion_real = math.floor(calcular_duracion_video(video.ruta_archivo.path))
+    video.duracion = duracion_real
+
+    inicio = video.inicio_timestamp or datetime.time(0, 0)
+    if isinstance(inicio, datetime.datetime):
+        inicio = inicio.time()
+    video.inicio_timestamp = inicio
+
+    if video.fecha_inicio is not None:
+        fecha_fin = video.fecha_inicio + datetime.timedelta(seconds=duracion_real)
+        video.fecha_fin = fecha_fin
+        video.fin_timestamp = fecha_fin.timetz().replace(tzinfo=None)
+    else:
+        video.fecha_fin = None
+        video.fin_timestamp = (
+            datetime.datetime.combine(datetime.date.today(), inicio)
+            + datetime.timedelta(seconds=duracion_real)
+        ).time()
+
+    mensaje_incompleto = ""
+    if (
+        duracion_esperada is not None
+        and duracion_real + VIDEO_IMPORT_DURATION_TOLERANCE_SECONDS < duracion_esperada
+    ):
+        mensaje_incompleto = _mensaje_video_incompleto(duracion_esperada, duracion_real)
+
+    if mensaje_incompleto:
+        video.estado = EstadoVideo.INCOMPLETO
+        video.error_tipo = "incompleto"
+        video.detalle_error = mensaje_incompleto
+        video.ultimo_error = mensaje_incompleto[:2000]
+    else:
+        video.estado = EstadoVideo.LISTO
+        video.error_tipo = ""
+        video.detalle_error = ""
+        video.ultimo_error = ""
+
+    video.mimetype = mimetypes.guess_type(video.ruta_archivo.path)[0] or "video/mp4"
+    video.procesamiento_finalizado_en = timezone.now()
+    inicio_ref = inicio_procesamiento or video.procesamiento_iniciado_en
+    if inicio_ref:
+        video.tiempo_procesamiento_segundos = round(
+            max((video.procesamiento_finalizado_en - inicio_ref).total_seconds(), 0),
+            3,
+        )
+    video.reintentos = 0
+    video.proximo_reintento_en = None
+    video.save(
+        update_fields=[
+            "duracion",
+            "estado",
+            "inicio_timestamp",
+            "fin_timestamp",
+            "fecha_fin",
+            "mimetype",
+            "error_tipo",
+            "detalle_error",
+            "procesamiento_finalizado_en",
+            "tiempo_procesamiento_segundos",
+            "reintentos",
+            "ultimo_error",
+            "proximo_reintento_en",
+        ]
+    )
+
+
+def _corregir_timing_video_si_corresponde(
+    video: Video,
+    *,
+    duracion_esperada: int | None,
+    inicio_procesamiento: datetime.datetime | None = None,
+) -> dict:
+    if not video.ruta_archivo or not getattr(video.ruta_archivo, "name", ""):
+        return {"aplicada": False}
+    try:
+        ruta = video.ruta_archivo.path
+    except Exception:
+        return {"aplicada": False}
+
+    plan = _correccion_timing_necesaria(ruta, duracion_esperada)
+    if not plan:
+        return {"aplicada": False}
+
+    destino_dir = os.path.dirname(ruta) or "."
+    with tempfile.NamedTemporaryFile(delete=False, suffix=".mp4", dir=destino_dir) as tmp:
+        ruta_corregida = tmp.name
+    try:
+        _estirar_mp4_a_duracion(ruta, ruta_corregida, float(plan["factor"]))
+        duracion_corregida = math.floor(calcular_duracion_video(ruta_corregida))
+        if duracion_corregida <= math.floor(float(plan["duracion"] or 0.0)):
+            raise ValidationError("La correccion de timing no aumento la duracion.")
+        os.replace(ruta_corregida, ruta)
+        _actualizar_estado_video_por_duracion(
+            video,
+            duracion_esperada=duracion_esperada,
+            inicio_procesamiento=inicio_procesamiento,
+        )
+        return {
+            "aplicada": True,
+            "duracion_original": round(float(plan["duracion"]), 3),
+            "duracion_corregida": duracion_corregida,
+            "duracion_esperada": plan["duracion_esperada"],
+            "fps_declarado": round(float(plan.get("fps_declarado") or 0.0), 3),
+            "fps_timeline": round(float(plan["fps_timeline"]), 3),
+            "factor": round(float(plan["factor"]), 6),
+        }
+    finally:
+        remove_if_exists(ruta_corregida)
+
+
 def _segmento_mp4_directo(segmentos: list[SegmentoVideo]) -> SegmentoVideo | None:
     if len(segmentos) != 1:
         return None
@@ -1385,15 +1653,53 @@ def _duracion_segmento_real(seg: SegmentoVideo) -> float:
     return 1.0
 
 
+def _duracion_segmento_nombre(seg: SegmentoVideo) -> float:
+    duracion_nombre = float((seg.fin_dt - seg.inicio_dt).total_seconds())
+    if 0 < duracion_nombre <= 6 * 3600:
+        return duracion_nombre
+    return _duracion_segmento_real(seg)
+
+
 def _construir_mapa_segmentos(
     segmentos: list[SegmentoVideo],
     duracion_video: int | None,
+    *,
+    usar_duracion_nombre: bool = False,
 ) -> list[dict]:
     total_video = int(duracion_video or 0)
     if not segmentos or total_video <= 0:
         return []
 
-    plan, total_real = _planificar_timeline_segmentos(segmentos)
+    if usar_duracion_nombre:
+        plan = []
+        cursor = 0.0
+        total = len(segmentos)
+        for idx, segmento in enumerate(segmentos, start=1):
+            duracion_seg = max(1.0, _duracion_segmento_nombre(segmento))
+            inicio_timeline = cursor
+            fin_timeline = inicio_timeline + duracion_seg
+            hueco_despues = 0.0
+            if idx < total:
+                siguiente = segmentos[idx]
+                hueco_despues = max(
+                    0.0,
+                    float((siguiente.inicio_dt - segmento.fin_dt).total_seconds()),
+                )
+                if hueco_despues < GAP_PADDING_MIN_SEGUNDOS:
+                    hueco_despues = 0.0
+            plan.append(
+                {
+                    "segmento": segmento,
+                    "duracion_segundos": duracion_seg,
+                    "timeline_inicio": inicio_timeline,
+                    "timeline_fin": fin_timeline,
+                    "hueco_despues": hueco_despues,
+                }
+            )
+            cursor = fin_timeline + hueco_despues
+        total_real = cursor
+    else:
+        plan, total_real = _planificar_timeline_segmentos(segmentos)
     if not plan or total_real <= 0:
         return []
 
@@ -1694,6 +2000,7 @@ def importar_videos_mdvr(
     base_dir: str | None = None,
     importar_velocidades: bool = True,
     fecha_objetivo: datetime.date | str | None = None,
+    forzar_reproceso: bool = False,
 ):
     base = (base_dir or "").strip()
     if not base:
@@ -1721,6 +2028,7 @@ def importar_videos_mdvr(
             base_real,
             importar_velocidades=importar_velocidades,
             fecha_objetivo=fecha_filtrada,
+            forzar_reproceso=forzar_reproceso,
         )
         respuesta["camiones"] += 1
         respuesta["videos_creados"] += detalle.get("videos_creados", 0)
@@ -1735,6 +2043,7 @@ def _importar_camion_mdvr(
     base_dir: str,
     importar_velocidades: bool = True,
     fecha_objetivo: datetime.date | None = None,
+    forzar_reproceso: bool = False,
 ):
     carpeta_id = (camion.carpeta_id or "").strip()
     if not carpeta_id:
@@ -1865,19 +2174,28 @@ def _importar_camion_mdvr(
                 )
                 turnos_creados[tipo_turno] = turno
 
-            inspeccion_mdvr = _inspeccionar_segmentos_mdvr(
-                lista_procesable,
-                carpeta_id=carpeta_id,
-                fecha=fecha,
-                tipo_turno=tipo_turno,
-                camara=camara,
-            )
-            grupo_origen = inspeccion_mdvr["grupo_origen"]
             nombre_video = f"MDVR_{carpeta_id}_{fecha.isoformat()}_{tipo_turno}_C{camara}"
             duracion_esperada = sum(
                 max(1, int((segmento.fin_dt - segmento.inicio_dt).total_seconds()))
                 for segmento in lista_procesable
             )
+            try:
+                inspeccion_mdvr = _inspeccionar_segmentos_mdvr(
+                    lista_procesable,
+                    carpeta_id=carpeta_id,
+                    fecha=fecha,
+                    tipo_turno=tipo_turno,
+                    camara=camara,
+                )
+            except Exception as exc:
+                _registrar_omision(
+                    detalles,
+                    motivo=f"no se pudo inspeccionar origen MDVR ({_normalizar_error(exc)}).",
+                    nombre_video=nombre_video,
+                    omision_video=True,
+                )
+                continue
+            grupo_origen = inspeccion_mdvr["grupo_origen"]
             ahora = timezone.now()
             video_listo = (
                 Video.objects.filter(
@@ -1922,7 +2240,8 @@ def _importar_camion_mdvr(
                     .first()
                 )
             if (
-                video_listo
+                not forzar_reproceso
+                and video_listo
                 and video_listo.origen_sha256 == inspeccion_mdvr["origen_sha256"]
                 and video_listo.ruta_archivo
                 and video_listo.ruta_archivo.name
@@ -1985,7 +2304,8 @@ def _importar_camion_mdvr(
                 )
                 continue
             if (
-                video_incompleto
+                not forzar_reproceso
+                and video_incompleto
                 and video_incompleto.origen_sha256 == inspeccion_mdvr["origen_sha256"]
                 and video_incompleto.ruta_archivo
                 and video_incompleto.ruta_archivo.name
@@ -2176,6 +2496,7 @@ def _importar_camion_mdvr(
                     )
 
                 registro_directo_mp4 = False
+                correccion_timing = {"aplicada": False}
                 segmento_directo = _segmento_mp4_directo(lista_procesable)
                 if segmento_directo is not None:
                     _registrar_mp4_directo(
@@ -2186,6 +2507,11 @@ def _importar_camion_mdvr(
                         ruta_previa=ruta_previa if video_existente else "",
                     )
                     registro_directo_mp4 = True
+                    correccion_timing = _corregir_timing_video_si_corresponde(
+                        video,
+                        duracion_esperada=duracion_esperada,
+                        inicio_procesamiento=video.procesamiento_iniciado_en,
+                    )
                 else:
                     ruta_salida = os.path.join(tmp_dir, f"{nombre_video}{ext_salida}")
                     ok, error = _concatenar_segmentos(lista_procesable, ruta_salida)
@@ -2208,7 +2534,16 @@ def _importar_camion_mdvr(
                         video.ruta_archivo,
                         duracion_esperada=duracion_esperada,
                     )
-                mapa_segmentos = _construir_mapa_segmentos(lista_procesable, video.duracion)
+                    correccion_timing = _corregir_timing_video_si_corresponde(
+                        video,
+                        duracion_esperada=duracion_esperada,
+                        inicio_procesamiento=video.procesamiento_iniciado_en,
+                    )
+                mapa_segmentos = _construir_mapa_segmentos(
+                    lista_procesable,
+                    video.duracion,
+                    usar_duracion_nombre=bool(correccion_timing.get("aplicada")),
+                )
                 if mapa_segmentos:
                     video.mapa_segmentos = mapa_segmentos
                     video.save(update_fields=["mapa_segmentos"])
@@ -2252,6 +2587,7 @@ def _importar_camion_mdvr(
                             else None
                         ),
                         "tiempo_procesamiento_segundos": video.tiempo_procesamiento_segundos,
+                        "timing_fps": correccion_timing,
                     }
                 )
                 if video.estado == EstadoVideo.INCOMPLETO:

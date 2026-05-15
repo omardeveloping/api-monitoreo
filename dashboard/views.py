@@ -798,6 +798,49 @@ class VideoViewSet(viewsets.ModelViewSet):
             status=status.HTTP_202_ACCEPTED,
         )
 
+    @action(detail=False, methods=["post"], url_path="reponer-mdvr")
+    def reponer_mdvr(self, request):
+        """Reprocesa una fecha MDVR ya descargada y regenera videos con timing corregido."""
+        fecha_param = str(
+            request.query_params.get("fecha")
+            or getattr(request, "data", {}).get("fecha")
+            or ""
+        ).strip()
+        if not fecha_param:
+            raise ValidationError("Debe indicar 'fecha' en formato YYYY-MM-DD.")
+        try:
+            datetime.strptime(fecha_param, "%Y-%m-%d")
+        except ValueError as exc:
+            raise ValidationError(
+                "Parametro 'fecha' invalido. Use formato YYYY-MM-DD."
+            ) from exc
+
+        incluir_velocidades = (
+            request.query_params.get("velocidades")
+            or getattr(request, "data", {}).get("velocidades")
+            or "1"
+        )
+        incluir_velocidades = str(incluir_velocidades).lower() in {"1", "true", "yes"}
+
+        task = importar_videos_mdvr_task.apply_async(
+            kwargs={
+                "importar_velocidades": incluir_velocidades,
+                "fecha_objetivo": fecha_param,
+                "forzar_reproceso": True,
+            },
+            queue="mdvr",
+        )
+        return Response(
+            {
+                "task_id": task.id,
+                "status": "queued",
+                "accion": "reponer_mdvr",
+                "fecha": fecha_param,
+                "importar_velocidades": incluir_velocidades,
+            },
+            status=status.HTTP_202_ACCEPTED,
+        )
+
     @action(detail=False, methods=["get"], url_path="importar-mdvr-estado")
     def importar_mdvr_estado(self, request):
         task_id = (request.query_params.get("task_id") or "").strip()
