@@ -1362,7 +1362,63 @@ def _correccion_timing_necesaria(ruta: str, duracion_esperada: int | None) -> di
     }
 
 
-def _estirar_mp4_a_duracion(ruta_origen: str, ruta_destino: str, factor: float):
+def _duracion_archivo_segura(ruta: str) -> float:
+    try:
+        return float(calcular_duracion_video(ruta))
+    except Exception:
+        return 0.0
+
+
+def _estirar_mp4_a_duracion(
+    ruta_origen: str,
+    ruta_destino: str,
+    factor: float,
+    *,
+    duracion_original: float = 0.0,
+):
+    ruta_remux = None
+    with tempfile.NamedTemporaryFile(
+        delete=False,
+        suffix=".mp4",
+        dir=os.path.dirname(ruta_destino) or ".",
+    ) as tmp:
+        ruta_remux = tmp.name
+    try:
+        run_command(
+            [
+                "ffmpeg",
+                "-y",
+                "-hide_banner",
+                "-loglevel",
+                "error",
+                "-itsscale",
+                f"{factor:.8f}",
+                "-i",
+                ruta_origen,
+                "-map",
+                "0:v:0",
+                "-map",
+                "0:a?",
+                "-c",
+                "copy",
+                "-movflags",
+                "+faststart",
+                ruta_remux,
+            ],
+            error_prefix="No se pudo corregir timing/FPS MDVR por remux",
+        )
+        if (
+            os.path.exists(ruta_remux)
+            and os.path.getsize(ruta_remux) > 0
+            and _duracion_archivo_segura(ruta_remux) > max(float(duracion_original or 0.0), 0.0)
+        ):
+            os.replace(ruta_remux, ruta_destino)
+            return
+    except Exception:
+        pass
+    finally:
+        remove_if_exists(ruta_remux)
+
     filtro = f"setpts={factor:.8f}*PTS"
     run_command(
         [
@@ -1487,7 +1543,12 @@ def _corregir_timing_video_si_corresponde(
     with tempfile.NamedTemporaryFile(delete=False, suffix=".mp4", dir=destino_dir) as tmp:
         ruta_corregida = tmp.name
     try:
-        _estirar_mp4_a_duracion(ruta, ruta_corregida, float(plan["factor"]))
+        _estirar_mp4_a_duracion(
+            ruta,
+            ruta_corregida,
+            float(plan["factor"]),
+            duracion_original=float(plan["duracion"] or 0.0),
+        )
         duracion_corregida = math.floor(calcular_duracion_video(ruta_corregida))
         if duracion_corregida <= math.floor(float(plan["duracion"] or 0.0)):
             raise ValidationError("La correccion de timing no aumento la duracion.")
