@@ -299,11 +299,7 @@ def _monitor_mdvr_activo_en_workers():
 
 def _rango_semanal_mdvr(*, incluir_futuro: bool = False):
     hoy = timezone.localdate()
-    inicio_semana_actual = hoy - datetime.timedelta(days=hoy.weekday())
-    inicio = inicio_semana_actual
-    fin_semana_actual = inicio_semana_actual + datetime.timedelta(days=6)
-    fin = fin_semana_actual if incluir_futuro else hoy
-    return inicio, fin
+    return hoy - datetime.timedelta(days=1), hoy
 
 
 def _opciones_monitor_cmsv6(params: dict) -> dict:
@@ -428,7 +424,7 @@ def cmsv6_monitor_mdvr_semanal_task(self, params: dict | None = None):
 
     ciclo = 0
     resultados = []
-    reporter.log("Monitor semanal CMSV6 iniciado.")
+    reporter.log("Monitor CMSV6 iniciado para hoy y ayer.")
     while max_ciclos == 0 or ciclo < max_ciclos:
         ciclo += 1
         fecha_inicio, fecha_fin = _rango_semanal_mdvr(incluir_futuro=incluir_futuro)
@@ -449,7 +445,7 @@ def cmsv6_monitor_mdvr_semanal_task(self, params: dict | None = None):
             "iniciado_en": timezone.now().isoformat(),
         }
         reporter.set_extra(monitor=monitor_base)
-        reporter.progress_cb(1, f"Ciclo {ciclo}: descargando semanas monitoreadas...")
+        reporter.progress_cb(1, f"Ciclo {ciclo}: descargando videos de hoy y ayer...")
         reporter.log(
             "Ciclo "
             f"{ciclo}: {fecha_inicio.isoformat()} -> {fecha_fin.isoformat()}"

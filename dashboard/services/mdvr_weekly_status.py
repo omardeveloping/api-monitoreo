@@ -22,9 +22,7 @@ _SEGMENTO_NUEVO_RE = re.compile(
 
 def rango_semana_actual(*, incluir_futuro: bool = False) -> tuple[datetime.date, datetime.date]:
     hoy = timezone.localdate()
-    inicio = hoy - datetime.timedelta(days=hoy.weekday())
-    fin_semana = inicio + datetime.timedelta(days=6)
-    return inicio, fin_semana if incluir_futuro else hoy
+    return hoy - datetime.timedelta(days=1), hoy
 
 
 def _parse_fecha(value: str | datetime.date | None, *, default: datetime.date) -> datetime.date:
