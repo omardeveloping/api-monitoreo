@@ -42,6 +42,23 @@ _VIDEO_IMPORT_TEMP_SPACE_FACTOR_DEFAULT = 3
 _VIDEO_IMPORT_STORAGE_SPACE_FACTOR_DEFAULT = 2
 
 
+def asegurar_permisos_storage(nombre_relativo: str) -> None:
+    """Permite que Nginx sirva archivos guardados por Celery/Django."""
+    try:
+        ruta = default_storage.path(nombre_relativo)
+    except (AttributeError, NotImplementedError, ValueError):
+        return
+
+    try:
+        os.chmod(ruta, getattr(settings, "FILE_UPLOAD_PERMISSIONS", 0o644))
+        os.chmod(
+            os.path.dirname(ruta),
+            getattr(settings, "FILE_UPLOAD_DIRECTORY_PERMISSIONS", 0o755),
+        )
+    except OSError:
+        return
+
+
 def _get_int_setting(name: str, default: int, *, minimum: int = 0) -> int:
     value = getattr(settings, name, os.environ.get(name, default))
     try:
@@ -765,6 +782,7 @@ def copiar_archivo_a_storage(
     destino_rel = default_storage.get_available_name(os.path.join(carpeta_destino, nombre_archivo))
     with open(origen_real, "rb") as archivo_origen:
         destino_rel = default_storage.save(destino_rel, File(archivo_origen))
+    asegurar_permisos_storage(destino_rel)
 
     if firma_esperada is not None and _firma_stat(_stat_archivo(origen_real)) != firma_esperada:
         default_storage.delete(destino_rel)

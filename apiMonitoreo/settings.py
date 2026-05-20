@@ -213,6 +213,8 @@ STATIC_ROOT = BASE_DIR / "staticfiles"
 # Media files (user uploads)
 MEDIA_URL = '/media/'
 MEDIA_ROOT = BASE_DIR / "media"
+FILE_UPLOAD_PERMISSIONS = 0o644
+FILE_UPLOAD_DIRECTORY_PERMISSIONS = 0o755
 LOGIN_URL = "/api-auth/login/"
 
 # Directorio base para importar videos locales (sin subirlos por HTTP).

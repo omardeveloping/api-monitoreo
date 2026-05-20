@@ -42,7 +42,10 @@ from dashboard.services.video_commands import (
     run_ffprobe_json,
     validation_error_message,
 )
-from dashboard.services.video_importacion import inspeccionar_origen_importacion
+from dashboard.services.video_importacion import (
+    asegurar_permisos_storage,
+    inspeccionar_origen_importacion,
+)
 
 
 _DIR_FECHA_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
@@ -1296,6 +1299,7 @@ def _subir_archivo_temporal(ruta_local: str, nombre_base: str) -> str:
     destino = default_storage.get_available_name(os.path.join("videos", nombre_base))
     with open(ruta_local, "rb") as archivo:
         destino = default_storage.save(destino, File(archivo))
+    asegurar_permisos_storage(destino)
     return destino
 
 
