@@ -36,6 +36,7 @@ from dashboard.services.calcular_duracion_video import (
 )
 from dashboard.services.importar_velocidades_xlsx import importar_velocidades_xlsx
 from dashboard.services.video_commands import (
+    asegurar_permisos_archivo,
     build_ffmpeg_command,
     remove_if_exists,
     run_command,
@@ -1655,6 +1656,7 @@ def _estirar_mp4_a_duracion(
             and _duracion_archivo_segura(ruta_remux) > max(float(duracion_original or 0.0), 0.0)
         ):
             os.replace(ruta_remux, ruta_destino)
+            asegurar_permisos_archivo(ruta_destino)
             return
     except Exception:
         pass
@@ -1690,6 +1692,7 @@ def _estirar_mp4_a_duracion(
     )
     if not os.path.exists(ruta_destino) or os.path.getsize(ruta_destino) <= 0:
         raise ValidationError("No se pudo corregir timing/FPS MDVR: salida vacia.")
+    asegurar_permisos_archivo(ruta_destino)
 
 
 def _actualizar_estado_video_por_duracion(
@@ -1809,6 +1812,7 @@ def _corregir_timing_video_si_corresponde(
                 "validacion_negro": validacion_negro,
             }
         os.replace(ruta_corregida, ruta)
+        asegurar_permisos_archivo(ruta)
         _actualizar_estado_video_por_duracion(
             video,
             duracion_esperada=duracion_esperada,
@@ -2201,6 +2205,7 @@ def _recortar_video(video: Video, segundos: int, inicio_offset: int = 0) -> bool
         return False
 
     os.replace(ruta_tmp, ruta)
+    asegurar_permisos_archivo(ruta)
     nueva_duracion = math.floor(calcular_duracion_video(ruta))
     video.duracion = nueva_duracion
     inicio = video.inicio_timestamp or datetime.time(0, 0)

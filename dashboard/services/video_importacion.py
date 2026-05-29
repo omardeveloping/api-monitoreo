@@ -23,6 +23,7 @@ from dashboard.services.calcular_duracion_video import (
 )
 from dashboard.services.turnos_tiempo import limites_turno
 from dashboard.services.video_commands import (
+    asegurar_permisos_archivo,
     build_ffmpeg_command,
     remove_if_exists,
     run_command,
@@ -49,14 +50,7 @@ def asegurar_permisos_storage(nombre_relativo: str) -> None:
     except (AttributeError, NotImplementedError, ValueError):
         return
 
-    try:
-        os.chmod(ruta, getattr(settings, "FILE_UPLOAD_PERMISSIONS", 0o644))
-        os.chmod(
-            os.path.dirname(ruta),
-            getattr(settings, "FILE_UPLOAD_DIRECTORY_PERMISSIONS", 0o755),
-        )
-    except OSError:
-        return
+    asegurar_permisos_archivo(ruta)
 
 
 def _get_int_setting(name: str, default: int, *, minimum: int = 0) -> int:

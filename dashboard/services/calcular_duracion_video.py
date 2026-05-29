@@ -12,6 +12,7 @@ from rest_framework.exceptions import ValidationError
 from dashboard.models import EstadoVideo
 from dashboard.services.video_commands import (
     FFMPEG_LARGE_PROBE_ARGS,
+    asegurar_permisos_archivo,
     build_ffmpeg_command,
     remove_if_exists,
     run_command,
@@ -398,10 +399,7 @@ def _transcodificar_mp4(ruta_mp4, stream_info):
         raise ValidationError("El MP4 convertido no es compatible con navegadores.")
 
     os.replace(ruta_salida, ruta_mp4)
-    try:
-        os.chmod(ruta_mp4, PERMISOS_ARCHIVO_VIDEO)
-    except OSError:
-        pass
+    asegurar_permisos_archivo(ruta_mp4)
     return True
 
 
@@ -558,6 +556,7 @@ def envolver_h264_en_mp4(ruta_h264):
                     capture_output=True,
                     text=True,
                 )
+                asegurar_permisos_archivo(ruta_salida)
                 return True
             except subprocess.CalledProcessError as exc:
                 stderr = (exc.stderr or exc.stdout or str(exc)).strip()

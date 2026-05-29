@@ -2,6 +2,7 @@ import json
 import os
 import subprocess
 
+from django.conf import settings
 from rest_framework.exceptions import ValidationError
 
 FFMPEG_LARGE_PROBE_ARGS = [
@@ -17,6 +18,18 @@ FFMPEG_LARGE_PROBE_ARGS = [
 def remove_if_exists(path: str | None) -> None:
     if path and os.path.exists(path):
         os.remove(path)
+
+
+def asegurar_permisos_archivo(path: str | None) -> None:
+    if not path:
+        return
+    try:
+        os.chmod(path, getattr(settings, "FILE_UPLOAD_PERMISSIONS", 0o644))
+        parent = os.path.dirname(path)
+        if parent:
+            os.chmod(parent, getattr(settings, "FILE_UPLOAD_DIRECTORY_PERMISSIONS", 0o755))
+    except OSError:
+        return
 
 
 def build_ffmpeg_command(
