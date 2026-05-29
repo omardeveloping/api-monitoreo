@@ -173,6 +173,11 @@ MDVR_CORREGIR_TIMING_FPS = os.environ.get("MDVR_CORREGIR_TIMING_FPS", "1").lower
     "true",
     "yes",
 }
+MDVR_RECONSTRUIR_TIMELINE = os.environ.get("MDVR_RECONSTRUIR_TIMELINE", "1").lower() in {
+    "1",
+    "true",
+    "yes",
+}
 try:
     MDVR_TIMING_MIN_FACTOR = float(os.environ.get("MDVR_TIMING_MIN_FACTOR", "1.05"))
 except ValueError:
@@ -1408,22 +1413,25 @@ def _correccion_timing_necesaria(ruta: str, duracion_esperada: int | None) -> di
     frames = int(timing.get("frames") or 0)
     if duracion_real <= 0 or frames <= 0:
         return None
-    if duracion_real + VIDEO_IMPORT_DURATION_TOLERANCE_SECONDS >= duracion_esperada:
-        return None
 
     factor = float(duracion_esperada) / duracion_real
-    if factor < MDVR_TIMING_MIN_FACTOR or factor > MDVR_TIMING_MAX_FACTOR:
-        return None
-
     fps_timeline = frames / float(duracion_esperada)
     if fps_timeline < MDVR_TIMING_MIN_FPS or fps_timeline > MDVR_TIMING_MAX_FPS:
         return None
+
+    reconstruir_timeline = MDVR_RECONSTRUIR_TIMELINE
+    if not reconstruir_timeline:
+        if duracion_real + VIDEO_IMPORT_DURATION_TOLERANCE_SECONDS >= duracion_esperada:
+            return None
+        if factor < MDVR_TIMING_MIN_FACTOR or factor > MDVR_TIMING_MAX_FACTOR:
+            return None
 
     return {
         **timing,
         "duracion_esperada": int(duracion_esperada),
         "factor": factor,
         "fps_timeline": fps_timeline,
+        "modo": "reconstruir_timeline" if reconstruir_timeline else "estirar_duracion",
     }
 
 
@@ -1695,6 +1703,47 @@ def _estirar_mp4_a_duracion(
     asegurar_permisos_archivo(ruta_destino)
 
 
+def _reconstruir_timeline_mp4(
+    ruta_origen: str,
+    ruta_destino: str,
+    fps_timeline: float,
+):
+    filtro = f"setpts=N/({fps_timeline:.8f}*TB),format=yuv420p"
+    run_command(
+        [
+            "ffmpeg",
+            "-y",
+            "-hide_banner",
+            "-loglevel",
+            "error",
+            "-i",
+            ruta_origen,
+            "-an",
+            "-vf",
+            filtro,
+            "-vsync",
+            "vfr",
+            "-c:v",
+            "libx264",
+            "-preset",
+            "veryfast",
+            "-crf",
+            "23",
+            "-pix_fmt",
+            "yuv420p",
+            "-movflags",
+            "+faststart",
+            "-video_track_timescale",
+            "90000",
+            ruta_destino,
+        ],
+        error_prefix="No se pudo reconstruir timeline/FPS MDVR",
+    )
+    if not os.path.exists(ruta_destino) or os.path.getsize(ruta_destino) <= 0:
+        raise ValidationError("No se pudo reconstruir timeline/FPS MDVR: salida vacia.")
+    asegurar_permisos_archivo(ruta_destino)
+
+
 def _actualizar_estado_video_por_duracion(
     video: Video,
     *,
@@ -1788,15 +1837,35 @@ def _corregir_timing_video_si_corresponde(
     with tempfile.NamedTemporaryFile(delete=False, suffix=".mp4", dir=destino_dir) as tmp:
         ruta_corregida = tmp.name
     try:
-        _estirar_mp4_a_duracion(
-            ruta,
-            ruta_corregida,
-            float(plan["factor"]),
-            duracion_original=float(plan["duracion"] or 0.0),
-        )
+        modo = str(plan.get("modo") or "")
+        if modo == "reconstruir_timeline":
+            _reconstruir_timeline_mp4(
+                ruta,
+                ruta_corregida,
+                float(plan["fps_timeline"]),
+            )
+        else:
+            _estirar_mp4_a_duracion(
+                ruta,
+                ruta_corregida,
+                float(plan["factor"]),
+                duracion_original=float(plan["duracion"] or 0.0),
+            )
         duracion_corregida = math.floor(calcular_duracion_video(ruta_corregida))
-        if duracion_corregida <= math.floor(float(plan["duracion"] or 0.0)):
+        if (
+            modo != "reconstruir_timeline"
+            and duracion_corregida <= math.floor(float(plan["duracion"] or 0.0))
+        ):
             raise ValidationError("La correccion de timing no aumento la duracion.")
+        if (
+            modo == "reconstruir_timeline"
+            and abs(duracion_corregida - int(plan["duracion_esperada"]))
+            > VIDEO_IMPORT_DURATION_TOLERANCE_SECONDS
+        ):
+            raise ValidationError(
+                "La reconstruccion de timeline no alcanzo la duracion esperada "
+                f"({duracion_corregida}s vs {plan['duracion_esperada']}s)."
+            )
         validacion_negro = _analizar_video_totalmente_negro(ruta_corregida)
         if validacion_negro.get("negro_total"):
             return {
@@ -1809,6 +1878,7 @@ def _corregir_timing_video_si_corresponde(
                 "fps_declarado": round(float(plan.get("fps_declarado") or 0.0), 3),
                 "fps_timeline": round(float(plan["fps_timeline"]), 3),
                 "factor": round(float(plan["factor"]), 6),
+                "modo": modo,
                 "validacion_negro": validacion_negro,
             }
         os.replace(ruta_corregida, ruta)
@@ -1826,6 +1896,7 @@ def _corregir_timing_video_si_corresponde(
             "fps_declarado": round(float(plan.get("fps_declarado") or 0.0), 3),
             "fps_timeline": round(float(plan["fps_timeline"]), 3),
             "factor": round(float(plan["factor"]), 6),
+            "modo": modo,
         }
     finally:
         remove_if_exists(ruta_corregida)
