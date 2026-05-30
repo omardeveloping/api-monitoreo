@@ -173,7 +173,7 @@ MDVR_CORREGIR_TIMING_FPS = os.environ.get("MDVR_CORREGIR_TIMING_FPS", "1").lower
     "true",
     "yes",
 }
-MDVR_RECONSTRUIR_TIMELINE = os.environ.get("MDVR_RECONSTRUIR_TIMELINE", "1").lower() in {
+MDVR_RECONSTRUIR_TIMELINE = os.environ.get("MDVR_RECONSTRUIR_TIMELINE", "0").lower() in {
     "1",
     "true",
     "yes",
