@@ -183,6 +183,11 @@ MDVR_PREFERIR_RAW_H264 = os.environ.get("MDVR_PREFERIR_RAW_H264", "1").lower() i
     "true",
     "yes",
 }
+MDVR_RAW_H264_FPS_MODE = os.environ.get("MDVR_RAW_H264_FPS_MODE", "natural").strip().lower()
+if MDVR_RAW_H264_FPS_MODE not in {"natural", "duration"}:
+    MDVR_RAW_H264_FPS_MODE = "natural"
+MDVR_RAW_H264_FPS = os.environ.get("MDVR_RAW_H264_FPS", "").strip()
+MDVR_RAW_H264_FPS_BY_CAMERA = os.environ.get("MDVR_RAW_H264_FPS_BY_CAMERA", "").strip()
 try:
     MDVR_TIMING_MIN_FACTOR = float(os.environ.get("MDVR_TIMING_MIN_FACTOR", "1.05"))
 except ValueError:
@@ -199,6 +204,45 @@ try:
     MDVR_TIMING_MAX_FPS = float(os.environ.get("MDVR_TIMING_MAX_FPS", "30"))
 except ValueError:
     MDVR_TIMING_MAX_FPS = 30.0
+
+
+def _normalizar_fps_raw_config(valor: str | float | None) -> str | None:
+    if valor is None:
+        return None
+    try:
+        fps = float(str(valor).strip().replace(",", "."))
+    except (TypeError, ValueError):
+        return None
+    if fps < MDVR_TIMING_MIN_FPS or fps > MDVR_TIMING_MAX_FPS:
+        return None
+    return f"{fps:.8f}".rstrip("0").rstrip(".")
+
+
+def _parsear_fps_raw_por_camara(valor: str) -> dict[int, str]:
+    resultado: dict[int, str] = {}
+    for parte in (valor or "").split(","):
+        parte = parte.strip()
+        if not parte:
+            continue
+        separador = "=" if "=" in parte else ":"
+        if separador not in parte:
+            continue
+        camara_raw, fps_raw = parte.split(separador, 1)
+        camara_raw = camara_raw.strip().upper().removeprefix("C")
+        try:
+            camara = int(camara_raw)
+        except ValueError:
+            continue
+        if camara not in {1, 2, 3, 4}:
+            continue
+        fps = _normalizar_fps_raw_config(fps_raw)
+        if fps:
+            resultado[camara] = fps
+    return resultado
+
+
+MDVR_RAW_H264_FPS_NORMALIZADO = _normalizar_fps_raw_config(MDVR_RAW_H264_FPS)
+MDVR_RAW_H264_FPS_POR_CAMARA = _parsear_fps_raw_por_camara(MDVR_RAW_H264_FPS_BY_CAMERA)
 
 MDVR_RECHAZAR_VIDEO_NEGRO = False
 try:
@@ -1265,7 +1309,18 @@ def _normalizar_segmentos_raw_a_mp4(segmentos: list[SegmentoVideo]) -> tuple[lis
             continue
         ruta_temporal_raw = tempfile.NamedTemporaryFile(delete=False, suffix=segmento.extension).name
         shutil.copyfile(segmento.ruta, ruta_temporal_raw)
-        fps_salida = _fps_raw_desde_duracion_nombre(segmento)
+        fps_salida = _fps_raw_configurado(segmento)
+        fps_origen = "config" if fps_salida else "natural"
+        if MDVR_RAW_H264_FPS_MODE == "duration":
+            fps_salida = _fps_raw_desde_duracion_nombre(segmento)
+            fps_origen = "duration" if fps_salida else "natural"
+        logger.info(
+            "MDVR raw convertido [%s]: fps=%s modo=%s origen=%s",
+            os.path.basename(segmento.ruta),
+            fps_salida or "natural",
+            MDVR_RAW_H264_FPS_MODE,
+            fps_origen,
+        )
         ruta_mp4 = envolver_h264_en_mp4(ruta_temporal_raw, fps_salida=fps_salida)
         temporales.extend([ruta_temporal_raw, ruta_mp4])
         rutas_mp4.append(ruta_mp4)
@@ -1437,6 +1492,12 @@ def _contar_frames_raw_h264(ruta: str) -> int:
             if frames > 0:
                 return frames
     return 0
+
+
+def _fps_raw_configurado(segmento: SegmentoVideo) -> str | None:
+    if segmento.extension not in RAW_VIDEO_EXTENSIONS:
+        return None
+    return MDVR_RAW_H264_FPS_POR_CAMARA.get(segmento.camara) or MDVR_RAW_H264_FPS_NORMALIZADO
 
 
 def _fps_raw_desde_duracion_nombre(segmento: SegmentoVideo) -> str | None:
@@ -2118,6 +2179,24 @@ def _construir_mapa_segmentos(
     total_video = int(duracion_video or 0)
     if not segmentos or total_video <= 0:
         return []
+
+    if len(segmentos) == 1 and not usar_duracion_nombre:
+        seg = segmentos[0]
+        inicio_real = seg.inicio_dt
+        tz_actual = timezone.get_current_timezone()
+        if timezone.is_naive(inicio_real):
+            inicio_real = timezone.make_aware(inicio_real, tz_actual)
+        fin_real = inicio_real + datetime.timedelta(seconds=total_video)
+        return [
+            {
+                "orden": 1,
+                "archivo": os.path.basename(seg.ruta),
+                "video_inicio_segundo": 0,
+                "video_fin_segundo": int(total_video - 1),
+                "real_inicio": inicio_real.isoformat(),
+                "real_fin": fin_real.isoformat(),
+            }
+        ]
 
     if usar_duracion_nombre:
         plan = []
