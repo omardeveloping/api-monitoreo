@@ -2629,6 +2629,11 @@ def _importar_camion_mdvr(
                 max(1, int((segmento.fin_dt - segmento.inicio_dt).total_seconds()))
                 for segmento in lista_procesable
             )
+            logger.info(
+                "MDVR fuente seleccionada [%s]: %s",
+                nombre_video,
+                ", ".join(os.path.basename(segmento.ruta) for segmento in lista_procesable),
+            )
             try:
                 inspeccion_mdvr = _inspeccionar_segmentos_mdvr(
                     lista_procesable,
@@ -2981,6 +2986,7 @@ def _importar_camion_mdvr(
                         video,
                         video.ruta_archivo,
                         duracion_esperada=duracion_esperada,
+                        normalizar_mp4=False,
                     )
                     correccion_timing = _corregir_timing_video_si_corresponde(
                         video,

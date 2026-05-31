@@ -660,7 +660,13 @@ def _mensaje_video_incompleto(duracion_esperada: int, duracion_real: int) -> str
     )
 
 
-def procesar_video_subida(video_obj, archivo, *, duracion_esperada: int | None = None):
+def procesar_video_subida(
+    video_obj,
+    archivo,
+    *,
+    duracion_esperada: int | None = None,
+    normalizar_mp4: bool = True,
+):
     """
     Valida, convierte H264 a MP4 si es necesario, calcula duración y persiste cambios.
     Elimina archivos y el registro si ocurre algún error para evitar residuos.
@@ -685,7 +691,7 @@ def procesar_video_subida(video_obj, archivo, *, duracion_esperada: int | None =
         ruta_final = video_obj.ruta_archivo.path
         # MP4 result from H264 conversion is already encoded by our pipeline.
         # Re-normalizing it again can damage timestamps on some MDVR streams.
-        if ruta_final.lower().endswith(".mp4") and not convertido_desde_h264:
+        if ruta_final.lower().endswith(".mp4") and normalizar_mp4 and not convertido_desde_h264:
             asegurar_mp4_compatible(ruta_final)
 
         duracion_real = math.floor(calcular_duracion_video(video_obj.ruta_archivo.path))
