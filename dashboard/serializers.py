@@ -78,7 +78,9 @@ class VideoSerializer(serializers.ModelSerializer):
                 # Keep URL stable per object state while busting stale browser/CDN cache.
                 token = (
                     f"{instance.id}-{instance.estado}-"
-                    f"{instance.duracion or 0}-{instance.fin_timestamp or ''}"
+                    f"{instance.duracion or 0}-{instance.fin_timestamp or ''}-"
+                    f"{instance.procesamiento_finalizado_en or ''}-"
+                    f"{instance.ruta_archivo.name or ''}"
                 )
                 data["ruta_archivo"] = _with_query_param(ruta, "v", token)
         if (
