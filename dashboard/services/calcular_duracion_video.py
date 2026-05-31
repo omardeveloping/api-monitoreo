@@ -472,12 +472,12 @@ def prevalidar_video_origen(ruta_video: str) -> None:
         raise ValidationError("El archivo H264/GREC origen no parece contener un stream válido.")
 
 
-def envolver_h264_en_mp4(ruta_h264):
+def envolver_h264_en_mp4(ruta_h264, fps_salida=None):
     if not ruta_h264:
         raise ValidationError("No se encontró la ruta del archivo H264.")
 
     ruta_salida = os.path.splitext(ruta_h264)[0] + ".mp4"
-    fps_salida = MP4_TARGET_FPS or _H264_OUTPUT_FPS_DEFAULT
+    fps_salida = str(fps_salida or MP4_TARGET_FPS or _H264_OUTPUT_FPS_DEFAULT)
 
     def construir_comandos_ffmpeg(ruta_entrada):
         return [
@@ -495,6 +495,8 @@ def envolver_h264_en_mp4(ruta_h264):
                 "+genpts+discardcorrupt",
                 "-err_detect",
                 "ignore_err",
+                "-r",
+                fps_salida,
                 "-f",
                 "h264",
                 "-i",
@@ -528,6 +530,8 @@ def envolver_h264_en_mp4(ruta_h264):
                 "+genpts+discardcorrupt",
                 "-err_detect",
                 "ignore_err",
+                "-r",
+                fps_salida,
                 "-i",
                 ruta_entrada,
                 "-an",

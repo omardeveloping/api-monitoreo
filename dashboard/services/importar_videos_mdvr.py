@@ -178,6 +178,11 @@ MDVR_RECONSTRUIR_TIMELINE = os.environ.get("MDVR_RECONSTRUIR_TIMELINE", "0").low
     "true",
     "yes",
 }
+MDVR_PREFERIR_RAW_H264 = os.environ.get("MDVR_PREFERIR_RAW_H264", "1").lower() in {
+    "1",
+    "true",
+    "yes",
+}
 try:
     MDVR_TIMING_MIN_FACTOR = float(os.environ.get("MDVR_TIMING_MIN_FACTOR", "1.05"))
 except ValueError:
@@ -195,11 +200,7 @@ try:
 except ValueError:
     MDVR_TIMING_MAX_FPS = 30.0
 
-MDVR_RECHAZAR_VIDEO_NEGRO = os.environ.get("MDVR_RECHAZAR_VIDEO_NEGRO", "1").lower() in {
-    "1",
-    "true",
-    "yes",
-}
+MDVR_RECHAZAR_VIDEO_NEGRO = False
 try:
     MDVR_BLACK_MIN_DURATION_SECONDS = int(os.environ.get("MDVR_BLACK_MIN_DURATION_SECONDS", "10"))
 except ValueError:
@@ -892,7 +893,9 @@ def _segmento_desde_archivo(ruta: str, fecha: datetime.date) -> SegmentoVideo | 
 
 
 def _prioridad_segmento_para_importar(segmento: SegmentoVideo) -> tuple[int, int, float]:
-    if segmento.extension == ".mp4":
+    if segmento.extension in RAW_VIDEO_EXTENSIONS and MDVR_PREFERIR_RAW_H264:
+        prioridad_extension = 3
+    elif segmento.extension == ".mp4":
         prioridad_extension = 2 if _mp4_directo_seguro(segmento.ruta) else 0
     else:
         prioridad_extension = 1
@@ -911,7 +914,8 @@ def _deduplicar_segmentos_preferir_mp4(
 ) -> list[SegmentoVideo]:
     """
     CMSV6 puede dejar el crudo y el MP4 final para el mismo canal/rango.
-    En ese caso el MP4 es la fuente visible que queremos registrar.
+    En ese caso se prefiere el crudo H264/GREC para reconstruir un reloj estable
+    desde frames + duración real del nombre.
     """
     deduplicados: dict[tuple[int, datetime.datetime, datetime.datetime], SegmentoVideo] = {}
     for segmento in segmentos:
@@ -1261,7 +1265,8 @@ def _normalizar_segmentos_raw_a_mp4(segmentos: list[SegmentoVideo]) -> tuple[lis
             continue
         ruta_temporal_raw = tempfile.NamedTemporaryFile(delete=False, suffix=segmento.extension).name
         shutil.copyfile(segmento.ruta, ruta_temporal_raw)
-        ruta_mp4 = envolver_h264_en_mp4(ruta_temporal_raw)
+        fps_salida = _fps_raw_desde_duracion_nombre(segmento)
+        ruta_mp4 = envolver_h264_en_mp4(ruta_temporal_raw, fps_salida=fps_salida)
         temporales.extend([ruta_temporal_raw, ruta_mp4])
         rutas_mp4.append(ruta_mp4)
     return rutas_mp4, temporales
@@ -1396,6 +1401,57 @@ def _leer_timing_video(ruta: str, *, count_frames: bool = False) -> dict:
         "fps_declarado": fps_declarado,
         "codec": stream.get("codec_name") or "",
     }
+
+
+def _contar_frames_raw_h264(ruta: str) -> int:
+    variantes = (
+        ["-f", "h264"],
+        [],
+    )
+    for input_args in variantes:
+        cmd = [
+            "ffprobe",
+            "-v",
+            "error",
+            *input_args,
+            "-count_frames",
+            "-select_streams",
+            "v:0",
+            "-show_entries",
+            "stream=nb_read_frames,nb_frames",
+            "-of",
+            "json",
+            ruta,
+        ]
+        try:
+            result = run_command(cmd)
+            data = json.loads(result.stdout or "{}")
+        except Exception:
+            continue
+        stream = next(iter(data.get("streams") or []), {})
+        for key in ("nb_read_frames", "nb_frames"):
+            try:
+                frames = int(stream.get(key) or 0)
+            except (TypeError, ValueError):
+                frames = 0
+            if frames > 0:
+                return frames
+    return 0
+
+
+def _fps_raw_desde_duracion_nombre(segmento: SegmentoVideo) -> str | None:
+    if segmento.extension not in RAW_VIDEO_EXTENSIONS:
+        return None
+    duracion_nombre = _duracion_segmento_nombre(segmento)
+    if duracion_nombre <= 0:
+        return None
+    frames = _contar_frames_raw_h264(segmento.ruta)
+    if frames <= 0:
+        return None
+    fps = frames / float(duracion_nombre)
+    if fps < MDVR_TIMING_MIN_FPS or fps > MDVR_TIMING_MAX_FPS:
+        return None
+    return f"{fps:.8f}"
 
 
 def _correccion_timing_necesaria(ruta: str, duracion_esperada: int | None) -> dict | None:
