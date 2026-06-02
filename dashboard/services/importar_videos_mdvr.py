@@ -11,7 +11,7 @@ import shutil
 import subprocess
 import tempfile
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 from celery.exceptions import SoftTimeLimitExceeded
 from django.conf import settings
@@ -159,7 +159,7 @@ except ValueError:
     MIN_ANTIGUEDAD_ARCHIVO_SEGUNDOS = _MIN_ANTIGUEDAD_ARCHIVO_DEFAULT
 MIN_ANTIGUEDAD_ARCHIVO_SEGUNDOS = max(0, MIN_ANTIGUEDAD_ARCHIVO_SEGUNDOS)
 
-_GAP_PADDING_MIN_SEGUNDOS_DEFAULT = 3.0
+_GAP_PADDING_MIN_SEGUNDOS_DEFAULT = 10.0
 try:
     GAP_PADDING_MIN_SEGUNDOS = float(
         os.environ.get("MDVR_GAP_PADDING_MIN_SECONDS", _GAP_PADDING_MIN_SEGUNDOS_DEFAULT)
@@ -330,6 +330,7 @@ class SegmentoVideo:
     inicio_dt: datetime.datetime
     fin_dt: datetime.datetime
     extension: str
+    cmsv6_metadata: dict = field(default_factory=dict)
 
 
 @dataclass(frozen=True)
@@ -351,6 +352,40 @@ def _parse_hora_hhmmss(valor: str) -> datetime.time | None:
     if not (0 <= hh < 24 and 0 <= mm < 60 and 0 <= ss < 60):
         return None
     return datetime.time(hh, mm, ss)
+
+
+def _leer_metadata_cmsv6_segmento(ruta: str) -> dict:
+    sidecar = f"{ruta}.cmsv6.json"
+    if not os.path.exists(sidecar):
+        return {}
+    try:
+        with open(sidecar, "r", encoding="utf-8") as archivo:
+            data = json.load(archivo)
+    except (OSError, json.JSONDecodeError):
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
+def _int_metadata_cmsv6(metadata: dict, key: str) -> int | None:
+    try:
+        return int(metadata.get(key))
+    except (TypeError, ValueError):
+        return None
+
+
+def _cmsv6_dt_desde_segundo_dia(
+    fecha: datetime.date,
+    segundo: int | None,
+    *,
+    referencia: datetime.datetime | None = None,
+) -> datetime.datetime | None:
+    if segundo is None:
+        return None
+    base = datetime.datetime.combine(fecha, datetime.time.min)
+    resultado = base + datetime.timedelta(seconds=max(0, int(segundo)))
+    if referencia is not None and resultado < referencia:
+        resultado += datetime.timedelta(days=1)
+    return resultado
 
 
 def _parse_fecha_yymmdd(valor: str) -> datetime.date | None:
@@ -798,6 +833,7 @@ def _inspeccionar_segmentos_mdvr(
                 "inicio_dt": segmento.inicio_dt,
                 "fin_dt": segmento.fin_dt,
                 "extension": segmento.extension,
+                "cmsv6": segmento.cmsv6_metadata,
                 **inspeccion,
             }
         )
@@ -927,6 +963,20 @@ def _segmento_desde_archivo_con_motivo(
     if fin_dt <= inicio_dt:
         fin_dt += datetime.timedelta(days=1)
     extension = ext or os.path.splitext(nombre)[1].lower()
+    cmsv6_metadata = _leer_metadata_cmsv6_segmento(ruta)
+    cmsv6_inicio = _cmsv6_dt_desde_segundo_dia(
+        fecha,
+        _int_metadata_cmsv6(cmsv6_metadata, "beg_segundo_dia"),
+    )
+    cmsv6_fin = _cmsv6_dt_desde_segundo_dia(
+        fecha,
+        _int_metadata_cmsv6(cmsv6_metadata, "end_segundo_dia"),
+        referencia=cmsv6_inicio,
+    )
+    if cmsv6_inicio is not None:
+        inicio_dt = cmsv6_inicio
+    if cmsv6_fin is not None and cmsv6_fin > inicio_dt:
+        fin_dt = cmsv6_fin
     return (
         SegmentoVideo(
             ruta=ruta,
@@ -934,6 +984,7 @@ def _segmento_desde_archivo_con_motivo(
             inicio_dt=inicio_dt,
             fin_dt=fin_dt,
             extension=extension,
+            cmsv6_metadata=cmsv6_metadata,
         ),
         None,
     )
@@ -1191,6 +1242,74 @@ def _mensaje_video_cortado_en_hueco(info_hueco: dict | None) -> str:
         f"Quedaron {omitidos} segmento(s) pendientes después del hueco; "
         "el video se regenerará cuando aparezca continuidad."
     )[:2000]
+
+
+def _aware_local(dt: datetime.datetime) -> datetime.datetime:
+    if timezone.is_aware(dt):
+        return dt
+    return timezone.make_aware(dt, timezone.get_current_timezone())
+
+
+def _rango_real_segmento(
+    segmento: SegmentoVideo,
+    duracion_fallback: float,
+) -> tuple[datetime.datetime, datetime.datetime]:
+    metadata = segmento.cmsv6_metadata or {}
+    inicio_real = segmento.inicio_dt
+    fin_real = segmento.fin_dt
+    cmsv6_inicio = _cmsv6_dt_desde_segundo_dia(
+        segmento.inicio_dt.date(),
+        _int_metadata_cmsv6(metadata, "beg_segundo_dia"),
+    )
+    cmsv6_fin = _cmsv6_dt_desde_segundo_dia(
+        segmento.inicio_dt.date(),
+        _int_metadata_cmsv6(metadata, "end_segundo_dia"),
+        referencia=cmsv6_inicio,
+    )
+    if cmsv6_inicio is not None:
+        inicio_real = cmsv6_inicio
+    if cmsv6_fin is not None and cmsv6_fin > inicio_real:
+        fin_real = cmsv6_fin
+    elif fin_real <= inicio_real:
+        fin_real = inicio_real + datetime.timedelta(seconds=max(1.0, duracion_fallback))
+    return _aware_local(inicio_real), _aware_local(fin_real)
+
+
+def _cmsv6_metadata_mapa(
+    segmento: SegmentoVideo,
+    *,
+    duracion_video_segundos: float | None = None,
+) -> dict:
+    metadata = segmento.cmsv6_metadata or {}
+    if not metadata:
+        return {}
+    keys = (
+        "fuente",
+        "archivo",
+        "fecha_consulta",
+        "beg_segundo_dia",
+        "end_segundo_dia",
+        "duracion_api_segundos",
+        "dev_idno",
+        "camara_indice",
+        "camara",
+        "loc",
+        "svr",
+        "file",
+        "len",
+        "mediaType",
+        "type",
+        "stream",
+        "streamType",
+        "sourceId",
+        "descarga_usada",
+    )
+    resultado = {key: metadata.get(key) for key in keys if metadata.get(key) not in (None, "")}
+    if duracion_video_segundos is not None:
+        resultado["duracion_mp4_segundos"] = round(float(duracion_video_segundos), 3)
+    if resultado:
+        resultado.setdefault("fuente_tiempo", "cmsv6_api")
+    return resultado
 
 
 def _crear_padding_negro_mp4(segundos: float, referencia_ruta: str) -> str:
@@ -2210,21 +2329,21 @@ def _construir_mapa_segmentos(
 
     if len(segmentos) == 1 and not usar_duracion_nombre:
         seg = segmentos[0]
-        inicio_real = seg.inicio_dt
-        tz_actual = timezone.get_current_timezone()
-        if timezone.is_naive(inicio_real):
-            inicio_real = timezone.make_aware(inicio_real, tz_actual)
-        fin_real = inicio_real + datetime.timedelta(seconds=total_video)
-        return [
-            {
-                "orden": 1,
-                "archivo": os.path.basename(seg.ruta),
-                "video_inicio_segundo": 0,
-                "video_fin_segundo": int(total_video - 1),
-                "real_inicio": inicio_real.isoformat(),
-                "real_fin": fin_real.isoformat(),
-            }
-        ]
+        inicio_real, fin_real = _rango_real_segmento(seg, float(total_video))
+        item = {
+            "orden": 1,
+            "archivo": os.path.basename(seg.ruta),
+            "video_inicio_segundo": 0,
+            "video_fin_segundo": int(total_video - 1),
+            "real_inicio": inicio_real.isoformat(),
+            "real_fin": fin_real.isoformat(),
+            "duracion_video_segundos": int(total_video),
+            "duracion_real_segundos": round((fin_real - inicio_real).total_seconds(), 3),
+        }
+        cmsv6 = _cmsv6_metadata_mapa(seg, duracion_video_segundos=float(total_video))
+        if cmsv6:
+            item["cmsv6"] = cmsv6
+        return [item]
 
     if usar_duracion_nombre:
         plan = []
@@ -2259,7 +2378,6 @@ def _construir_mapa_segmentos(
     if not plan or total_real <= 0:
         return []
 
-    tz_actual = timezone.get_current_timezone()
     mapa: list[dict] = []
     cantidad = len(plan)
     ultimo_fin_exclusivo = 0
@@ -2284,21 +2402,28 @@ def _construir_mapa_segmentos(
         if fin_video_exclusivo <= inicio_video:
             continue
 
-        inicio_real = seg.inicio_dt
-        if timezone.is_naive(inicio_real):
-            inicio_real = timezone.make_aware(inicio_real, tz_actual)
-        fin_real = inicio_real + datetime.timedelta(seconds=duracion_seg)
+        inicio_real, fin_real = _rango_real_segmento(seg, duracion_seg)
 
-        mapa.append(
-            {
-                "orden": idx,
-                "archivo": os.path.basename(seg.ruta),
-                "video_inicio_segundo": int(inicio_video),
-                "video_fin_segundo": int(fin_video_exclusivo - 1),
-                "real_inicio": inicio_real.isoformat(),
-                "real_fin": fin_real.isoformat(),
-            }
+        item_mapa = {
+            "orden": idx,
+            "archivo": os.path.basename(seg.ruta),
+            "video_inicio_segundo": int(inicio_video),
+            "video_fin_segundo": int(fin_video_exclusivo - 1),
+            "real_inicio": inicio_real.isoformat(),
+            "real_fin": fin_real.isoformat(),
+            "duracion_video_segundos": round(
+                max(0.0, float(fin_video_exclusivo - inicio_video)),
+                3,
+            ),
+            "duracion_real_segundos": round((fin_real - inicio_real).total_seconds(), 3),
+        }
+        cmsv6 = _cmsv6_metadata_mapa(
+            seg,
+            duracion_video_segundos=max(0.0, float(fin_video_exclusivo - inicio_video)),
         )
+        if cmsv6:
+            item_mapa["cmsv6"] = cmsv6
+        mapa.append(item_mapa)
         ultimo_fin_exclusivo = fin_video_exclusivo
 
     return mapa

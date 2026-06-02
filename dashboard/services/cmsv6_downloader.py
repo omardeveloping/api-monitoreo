@@ -1597,11 +1597,19 @@ class CMSV6Session:
                 return files
             if result.get("result") == 0 or "files" in result:
                 log("  Sin grabaciones (media directo)")
+                return []
             else:
                 log(f"  result={result.get('result')} (media directo)")
-            return []
+            return None
 
         auth_results = (32, 3)
+
+        try:
+            media_files = _probar_media_directo()
+            if media_files is not None:
+                return media_files
+        except Exception as exc:
+            log(f"  Error media directo: {exc}; probando endpoints antiguos...")
 
         def _query_valid(endpoint, down_type=2, fileattr=0, rectype=0, timeout=20):
             session_kinds = ["api"]
@@ -1690,14 +1698,6 @@ class CMSV6Session:
                 log(f"  Error auth ({combo}): {exc}; probando siguiente combinacion...")
             except Exception as exc:
                 log(f"  Error consultando {combo}: {exc}")
-        try:
-            media_files = _probar_media_directo()
-            if media_files:
-                return media_files
-        except Exception as exc:
-            log(f"  Error media directo: {exc}")
-            if not auth_errors:
-                raise
         if auth_errors:
             resumen = "; ".join(auth_errors[:4])
             extra = "" if len(auth_errors) <= 4 else f"; +{len(auth_errors) - 4} mas"
@@ -1983,6 +1983,62 @@ def _segundos_video(archivo: dict, key: str) -> int:
         return max(0, int(archivo.get(key, 0) or 0))
     except (TypeError, ValueError):
         return 0
+
+
+def _metadata_cmsv6_video(
+    archivo: dict,
+    *,
+    fecha: datetime.date | datetime.datetime,
+    nombre_mp4: str,
+    descarga_usada: str | None = None,
+) -> dict:
+    beg = _segundos_video(archivo, "beg")
+    end = _segundos_video(archivo, "end")
+    metadata = {
+        "fuente": "cmsv6",
+        "archivo": nombre_mp4,
+        "fecha_consulta": _fecha_nombre_video(fecha).isoformat(),
+        "beg_segundo_dia": beg,
+        "end_segundo_dia": end,
+        "duracion_api_segundos": max(0, end - beg),
+        "dev_idno": str(archivo.get("devIdno", archivo.get("DevIDNO", "")) or ""),
+        "camara_indice": _video_channel_idx(archivo),
+        "camara": _video_channel_idx(archivo) + 1,
+        "loc": archivo.get("loc"),
+        "svr": archivo.get("svr"),
+        "file": str(archivo.get("file", "") or ""),
+        "len": _video_size_bytes(archivo),
+        "mediaType": archivo.get("mediaType"),
+        "type": archivo.get("type"),
+        "stream": archivo.get("stream"),
+        "streamType": archivo.get("streamType"),
+        "sourceId": archivo.get("sourceId"),
+        "descarga_usada": descarga_usada or "",
+    }
+    return {key: value for key, value in metadata.items() if value not in (None, "")}
+
+
+def _guardar_metadata_cmsv6_video(
+    dest_mp4: Path,
+    archivo: dict,
+    *,
+    fecha: datetime.date | datetime.datetime,
+    nombre_mp4: str,
+    descarga_usada: str | None = None,
+) -> None:
+    metadata = _metadata_cmsv6_video(
+        archivo,
+        fecha=fecha,
+        nombre_mp4=nombre_mp4,
+        descarga_usada=descarga_usada,
+    )
+    sidecar = Path(f"{dest_mp4}.cmsv6.json")
+    tmp_sidecar = sidecar.with_suffix(sidecar.suffix + ".tmp")
+    tmp_sidecar.write_text(
+        json.dumps(metadata, ensure_ascii=False, indent=2, sort_keys=True),
+        encoding="utf-8",
+    )
+    tmp_sidecar.replace(sidecar)
 
 
 def _completar_down_url_cmsv6(
@@ -2312,6 +2368,13 @@ def _descargar_video_archivo(
 
     if dest_mp4.exists() and dest_mp4.stat().st_size > 4096 and is_mp4(dest_mp4):
         if _mp4_duration_ok(dest_mp4, expected_secs, log_fn):
+            _guardar_metadata_cmsv6_video(
+                dest_mp4,
+                archivo,
+                fecha=fecha,
+                nombre_mp4=nombre_mp4,
+                descarga_usada="existente",
+            )
             log_fn(
                 f"  [{index}/{total}] EXISTE {contexto['fecha']} "
                 f"{contexto['turno_label']} CH{channel}: {nombre_mp4}"
@@ -2399,6 +2462,7 @@ def _descargar_video_archivo(
 
     download_ok = False
     last_error = "sin intento"
+    download_label = ""
 
     def progress(downloaded, total_bytes):
         pct_file = downloaded * 100 // total_bytes if total_bytes else 0
@@ -2439,6 +2503,7 @@ def _descargar_video_archivo(
                         log_fn(f"    [{label}] sin video util; probando otra URL...")
                         continue
                     download_ok = True
+                    download_label = label
                     break
                 last_error = "descarga incompleta o vacia"
                 log_fn(f"    [{label}] {last_error}; probando otra URL...")
@@ -2468,6 +2533,13 @@ def _descargar_video_archivo(
                 if dest_mp4.exists():
                     dest_mp4.unlink()
                 dest_tmp.rename(dest_mp4)
+                _guardar_metadata_cmsv6_video(
+                    dest_mp4,
+                    archivo,
+                    fecha=fecha,
+                    nombre_mp4=nombre_mp4,
+                    descarga_usada=download_label,
+                )
                 log_fn(f"    MP4 nativo: {nombre_mp4}")
                 tracker.update(index, contexto, pct_file=100, estado="completo", active=False)
                 resumen["descargados"] += 1
@@ -2475,6 +2547,13 @@ def _descargar_video_archivo(
             log_fn("    MP4 nativo con timestamps sospechosos; reparando...")
             if repair_mp4_timestamps(dest_tmp, dest_mp4, log_fn, expected_secs=expected_secs):
                 dest_tmp.unlink(missing_ok=True)
+                _guardar_metadata_cmsv6_video(
+                    dest_mp4,
+                    archivo,
+                    fecha=fecha,
+                    nombre_mp4=nombre_mp4,
+                    descarga_usada=f"{download_label}:reparado" if download_label else "reparado",
+                )
                 tracker.update(index, contexto, pct_file=100, estado="completo", active=False)
                 resumen["descargados"] += 1
                 return resumen
@@ -2482,6 +2561,13 @@ def _descargar_video_archivo(
         tracker.update(index, contexto, pct_file=99, estado="convirtiendo")
         if convert_to_mp4(dest_tmp, dest_mp4, log_fn, expected_secs=expected_secs):
             dest_tmp.unlink(missing_ok=True)
+            _guardar_metadata_cmsv6_video(
+                dest_mp4,
+                archivo,
+                fecha=fecha,
+                nombre_mp4=nombre_mp4,
+                descarga_usada=f"{download_label}:convertido" if download_label else "convertido",
+            )
             log_fn(f"    MP4 OK: {nombre_mp4} ({dest_mp4.stat().st_size / 1048576:.1f} MB)")
             tracker.update(index, contexto, pct_file=100, estado="completo", active=False)
             resumen["descargados"] += 1
