@@ -124,6 +124,9 @@ class CMSV6Config:
     small_response_bytes: int = 4096
     download_workers: int = 1
     serial_downloads_per_device: bool = True
+    media_query_port: int = 6603
+    company_id: str = ""
+    user_id: str = ""
 
     @classmethod
     def from_settings(cls, output_dir: str | None = None):
@@ -167,6 +170,9 @@ class CMSV6Config:
                 minimum=0,
             )
             != 0,
+            media_query_port=_setting_int("CMSV6_MEDIA_QUERY_PORT", 6603, minimum=1),
+            company_id=str(_setting("CMSV6_COMPANY_ID", "") or ""),
+            user_id=str(_setting("CMSV6_USER_ID", "") or ""),
         )
 
     def validate(self):
@@ -229,6 +235,35 @@ def _cmsv6_url_reset_foffset(url: str) -> str:
     return urllib.parse.urlunparse(parsed._replace(query=urllib.parse.urlencode(updated)))
 
 
+def _cmsv6_url_completar_params(url: str, params: dict, *, llenar_vacios=()) -> str:
+    if not url:
+        return url
+    parsed = urllib.parse.urlparse(url)
+    if not parsed.query:
+        return url
+    llenar_vacios_norm = {str(key).upper() for key in llenar_vacios}
+    pairs = urllib.parse.parse_qsl(parsed.query, keep_blank_values=True)
+    index_by_key = {key.upper(): idx for idx, (key, _value) in enumerate(pairs)}
+    changed = False
+    for key, value in params.items():
+        if value in (None, ""):
+            continue
+        key_norm = str(key).upper()
+        value = str(value)
+        if key_norm in index_by_key:
+            idx = index_by_key[key_norm]
+            current_key, current_value = pairs[idx]
+            if current_value == "" and key_norm in llenar_vacios_norm:
+                pairs[idx] = (current_key, value)
+                changed = True
+            continue
+        pairs.append((str(key), value))
+        changed = True
+    if not changed:
+        return url
+    return urllib.parse.urlunparse(parsed._replace(query=urllib.parse.urlencode(pairs)))
+
+
 def _crypto_imports():
     try:
         from Crypto.Cipher import AES
@@ -248,6 +283,33 @@ def _dec(value: str) -> str:
     AES, _pad, unpad = _crypto_imports()
     data = base64.b64decode(value.replace(" ", "+"))
     return unpad(AES.new(AES_KEY, AES.MODE_ECB).decrypt(data), AES.block_size).decode("utf-8")
+
+
+def _buscar_valor_anidado(data, nombres):
+    nombres_norm = {str(nombre).lower() for nombre in nombres}
+    if isinstance(data, dict):
+        for key, value in data.items():
+            if str(key).lower() in nombres_norm and value not in (None, ""):
+                return value
+        for value in data.values():
+            encontrado = _buscar_valor_anidado(value, nombres_norm)
+            if encontrado not in (None, ""):
+                return encontrado
+    elif isinstance(data, list):
+        for item in data:
+            encontrado = _buscar_valor_anidado(item, nombres_norm)
+            if encontrado not in (None, ""):
+                return encontrado
+    return None
+
+
+def _normalizar_id_texto(value) -> str:
+    if value in (None, ""):
+        return ""
+    try:
+        return str(int(value))
+    except (TypeError, ValueError):
+        return str(value).strip()
 
 
 def _parse_response(response):
@@ -1173,6 +1235,8 @@ class CMSV6Session:
         self._reset_opener()
         self.jsession = None
         self.sid = None
+        self.api_login_response = {}
+        self.web_login_response = {}
 
     def _reset_opener(self):
         self.cookie_jar = http.cookiejar.CookieJar()
@@ -1194,6 +1258,7 @@ class CMSV6Session:
         )
         with self.opener.open(request, timeout=30) as response:
             api_response = json.loads(response.read())
+        self.api_login_response = api_response
         self.jsession = api_response.get("jsession")
         if not self.jsession:
             raise Exception(f"Login API sin jsession: {api_response}")
@@ -1224,6 +1289,7 @@ class CMSV6Session:
         )
         with self.opener.open(request, timeout=30) as response:
             result = _parse_response(json.loads(response.read()))
+        self.web_login_response = result
         if result.get("result") != 0:
             raise Exception(f"Login CMSV6 fallido: {result}")
 
@@ -1364,7 +1430,8 @@ class CMSV6Session:
         log = log_fn or (lambda _msg: None)
         user_agent = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) CMSV6Client/4.0"
 
-        def _query(endpoint, down_type=2, fileattr=0, rectype=0, timeout=20):
+        def _query(endpoint, down_type=2, fileattr=0, rectype=0, timeout=20, session_kind="api"):
+            session_token = self.sid if session_kind == "web" else self.jsession
             params = {
                 "DevIDNO": self.config.device_id,
                 "LOC": 1,
@@ -1376,7 +1443,7 @@ class CMSV6Session:
                 "FILEATTR": fileattr,
                 "BEG": "00:00:00",
                 "END": "23:59:59",
-                "jsession": self.jsession,
+                "jsession": session_token,
                 "DownType": down_type,
                 "ARM1": 0,
                 "ARM2": 0,
@@ -1389,6 +1456,9 @@ class CMSV6Session:
                 f"{self.config.base_url}/808gps/{endpoint}", data=data, method="POST"
             )
             request.add_header("User-Agent", user_agent)
+            if session_kind == "web" and self.sid:
+                request.add_header("Newv", "1")
+                request.add_header("jsessionId", self.sid)
             with self.opener.open(request, timeout=timeout) as response:
                 return _parse_response(json.loads(response.read()))
 
@@ -1404,22 +1474,172 @@ class CMSV6Session:
                             return subvalue
             return []
 
+        def _media_direct_ids():
+            user_id = _normalizar_id_texto(self.config.user_id) or _normalizar_id_texto(
+                _buscar_valor_anidado(
+                    [self.web_login_response, self.api_login_response],
+                    ("userid", "userId", "userID", "uid", "id"),
+                )
+            )
+            company_id = _normalizar_id_texto(self.config.company_id) or _normalizar_id_texto(
+                _buscar_valor_anidado(
+                    [self.web_login_response, self.api_login_response],
+                    (
+                        "companyid",
+                        "companyId",
+                        "companyID",
+                        "company",
+                        "companyNo",
+                        "companyno",
+                    ),
+                )
+            )
+            return company_id, user_id
+
+        def _media_direct_base():
+            parsed = urllib.parse.urlparse(self.config.base_url)
+            scheme = parsed.scheme or "http"
+            host = parsed.hostname or parsed.netloc.split(":")[0]
+            if not host:
+                raise Exception(f"CMSV6_BASE_URL invalida para media directo: {self.config.base_url}")
+            return f"{scheme}://{host}:{self.config.media_query_port}", host
+
+        def _normalizar_canal_query():
+            try:
+                canales = int(self.config.canales)
+            except (TypeError, ValueError):
+                return ""
+            return "" if canales < 0 else canales
+
+        def _filtrar_device(files):
+            filtrados = []
+            for item in files:
+                dev_id = str(item.get("devIdno", item.get("DevIDNO", "")) or "").strip()
+                if not dev_id or dev_id == self.config.device_id:
+                    filtrados.append(item)
+            return filtrados
+
+        def _query_media_directo(timeout=25):
+            company_id, user_id = _media_direct_ids()
+            if not company_id or not user_id:
+                raise Exception(
+                    "faltan CMSV6_COMPANY_ID/CMSV6_USER_ID para media directo "
+                    "y no se pudieron inferir desde el login"
+                )
+            media_base, host = _media_direct_base()
+            params = {
+                "DownType": 2,
+                "LOC": 2,
+                "CHN": _normalizar_canal_query(),
+                "YEAR": fecha.year,
+                "MON": fecha.month,
+                "DAY": fecha.day,
+                "RECTYPE": -1,
+                "FILEATTR": 2,
+                "BEG": 0,
+                "END": 86399,
+                "ARM1": 0,
+                "ARM2": 0,
+                "RES": 0,
+                "STREAM": -1,
+                "STORE": 0,
+                "host": host,
+                "jsession": self.jsession,
+                "YEARE": fecha.year,
+                "MONE": fecha.month,
+                "DAYE": fecha.day,
+                "COMPANYID": company_id,
+                "USERID": user_id,
+            }
+            url = f"{media_base}/3/5?{urllib.parse.urlencode(params)}"
+            request = urllib.request.Request(url, method="GET")
+            request.add_header("User-Agent", user_agent)
+            with self.opener.open(request, timeout=timeout) as response:
+                return _parse_response(json.loads(response.read()))
+
+        def _query_media_directo_valid(timeout=25):
+            last_auth = ""
+            for attempt in range(1, 4):
+                try:
+                    result = _query_media_directo(timeout=timeout)
+                except urllib.error.HTTPError as exc:
+                    if exc.code not in (401, 403):
+                        raise
+                    last_auth = f"HTTP {exc.code}"
+                    log(f"  Media directo rechazo sesion ({last_auth}), renovando...")
+                    try:
+                        self.relogin_api() if attempt == 1 else self.full_relogin()
+                    except Exception as relogin_exc:
+                        last_auth = str(relogin_exc)
+                        log(f"  Re-login media directo intento {attempt}/3 fallo: {relogin_exc}")
+                    time.sleep(1)
+                    continue
+                if result.get("result") not in auth_results:
+                    if attempt > 1:
+                        log("  Sesion renovada correctamente para media directo.")
+                    return result
+                last_auth = f"result={result.get('result')}"
+                log(f"  Media directo rechazo sesion ({last_auth}), renovando...")
+                try:
+                    self.relogin_api() if attempt == 1 else self.full_relogin()
+                except Exception as exc:
+                    last_auth = str(exc)
+                    log(f"  Re-login media directo intento {attempt}/3 fallo: {exc}")
+                time.sleep(1)
+            raise CMSV6AuthError(f"sesion CMSV6 rechazada en media directo ({last_auth})")
+
+        def _probar_media_directo():
+            log("  Probando media directo LOC=2 FA=2 RT=-1...")
+            result = _query_media_directo_valid(timeout=25)
+            files = _filtrar_device(_extract_files(result))
+            if files:
+                log(f"  OK: {len(files)} archivos (media directo)")
+                return files
+            if result.get("result") == 0 or "files" in result:
+                log("  Sin grabaciones (media directo)")
+            else:
+                log(f"  result={result.get('result')} (media directo)")
+            return []
+
         auth_results = (32, 3)
 
         def _query_valid(endpoint, down_type=2, fileattr=0, rectype=0, timeout=20):
-            result = _query(endpoint, down_type, fileattr, rectype, timeout)
-            if result.get("result") not in auth_results:
-                return result
-            last_auth = f"result={result.get('result')}"
+            session_kinds = ["api"]
+            if self.sid:
+                session_kinds.append("web")
+
+            last_auth = ""
+            for session_kind in session_kinds:
+                result = _query(endpoint, down_type, fileattr, rectype, timeout, session_kind=session_kind)
+                if result.get("result") not in auth_results:
+                    if session_kind == "web":
+                        log("  Consulta de video aceptada usando sesion web.")
+                    return result
+                last_auth = f"{session_kind}: result={result.get('result')}"
+
             log(f"  Sesion expirada/rechazada ({last_auth}), renovando...")
             for attempt in range(1, 4):
                 try:
                     self.relogin_api() if attempt == 1 else self.full_relogin()
-                    result = _query(endpoint, down_type, fileattr, rectype, timeout)
-                    if result.get("result") not in auth_results:
-                        log("  Sesion renovada correctamente.")
-                        return result
-                    last_auth = f"result={result.get('result')}"
+                    session_kinds = ["api"]
+                    if self.sid:
+                        session_kinds.append("web")
+                    for session_kind in session_kinds:
+                        result = _query(
+                            endpoint,
+                            down_type,
+                            fileattr,
+                            rectype,
+                            timeout,
+                            session_kind=session_kind,
+                        )
+                        if result.get("result") not in auth_results:
+                            log(
+                                "  Sesion renovada correctamente"
+                                + (" usando sesion web." if session_kind == "web" else ".")
+                            )
+                            return result
+                        last_auth = f"{session_kind}: result={result.get('result')}"
                 except Exception as exc:
                     last_auth = str(exc)
                     log(f"  Re-login intento {attempt}/3 fallo: {exc}")
@@ -1440,6 +1660,7 @@ class CMSV6Session:
         ]
         result0_count = 0
         ep2_available = True
+        auth_errors = []
         for endpoint, down_type, fileattr, rectype in combos:
             if endpoint == ep2 and not ep2_available:
                 continue
@@ -1464,10 +1685,23 @@ class CMSV6Session:
                     log("  EP2 no disponible (404); se omite.")
                 else:
                     log(f"  Error HTTP {exc.code} ({combo})")
-            except CMSV6AuthError:
-                raise
+            except CMSV6AuthError as exc:
+                auth_errors.append(f"{combo}: {exc}")
+                log(f"  Error auth ({combo}): {exc}; probando siguiente combinacion...")
             except Exception as exc:
                 log(f"  Error consultando {combo}: {exc}")
+        try:
+            media_files = _probar_media_directo()
+            if media_files:
+                return media_files
+        except Exception as exc:
+            log(f"  Error media directo: {exc}")
+            if not auth_errors:
+                raise
+        if auth_errors:
+            resumen = "; ".join(auth_errors[:4])
+            extra = "" if len(auth_errors) <= 4 else f"; +{len(auth_errors) - 4} mas"
+            raise CMSV6AuthError(f"sesion CMSV6 rechazada en combinaciones de video ({resumen}{extra})")
         return []
 
     def refresh_url(self, url):
@@ -1680,6 +1914,18 @@ def _codigo_video_compatible_mdvr(channel: int) -> str:
     return f"2001{camara:02d}00"
 
 
+def _cmsv6_segundos_a_hhmmss(valor) -> int:
+    try:
+        segundos = int(valor or 0)
+    except (TypeError, ValueError):
+        return 0
+    segundos = max(0, segundos) % 86400
+    hh = segundos // 3600
+    mm = (segundos % 3600) // 60
+    ss = segundos % 60
+    return int(f"{hh:02d}{mm:02d}{ss:02d}")
+
+
 def _nombre_compatible_mdvr(nombre: str) -> bool:
     match_legacy = _CMSV6_MDVR_LEGACY_NAME_RE.match(nombre or "")
     if match_legacy:
@@ -1711,8 +1957,8 @@ def nombre_video_cmsv6(
         if _nombre_compatible_mdvr(nombre_original):
             return nombre_original
     channel = int(archivo.get("chn", 0) or 0)
-    begin = int(archivo.get("beg", 0) or 0)
-    end = int(archivo.get("end", 0) or 0)
+    begin = _cmsv6_segundos_a_hhmmss(archivo.get("beg", 0))
+    end = _cmsv6_segundos_a_hhmmss(archivo.get("end", 0))
     fecha_nombre = _fecha_nombre_video(fecha)
     codigo = _codigo_video_compatible_mdvr(channel)
     return f"{device_id}-{fecha_nombre.strftime('%y%m%d')}-{begin:06d}-{end:06d}-{codigo}.mp4"
@@ -1737,6 +1983,46 @@ def _segundos_video(archivo: dict, key: str) -> int:
         return max(0, int(archivo.get(key, 0) or 0))
     except (TypeError, ValueError):
         return 0
+
+
+def _completar_down_url_cmsv6(
+    url: str,
+    archivo: dict,
+    *,
+    fecha: datetime.date | datetime.datetime,
+    nombre_mp4: str,
+) -> str:
+    if not url or _cmsv6_url_int_param(url, "DownType") != 3:
+        return url
+    try:
+        archivo_loc = int(archivo.get("loc", 0) or 0)
+    except (TypeError, ValueError):
+        archivo_loc = 0
+    url_fileloc = _cmsv6_url_int_param(url, "FILELOC")
+    if url_fileloc not in (2, None) and archivo_loc != 2:
+        return url
+
+    fecha_nombre = _fecha_nombre_video(fecha)
+    chn_mask = archivo.get("chnMask")
+    if chn_mask in (None, ""):
+        chn_mask = _video_channel_idx(archivo)
+    fileattr = (
+        archivo.get("FILEATTR")
+        or archivo.get("fileattr")
+        or archivo.get("fileAttr")
+        or (2 if archivo_loc == 2 or url_fileloc == 2 else None)
+    )
+    params = {
+        "SAVENAME": nombre_mp4,
+        "YEAR": fecha_nombre.year % 100,
+        "MON": fecha_nombre.month,
+        "DAY": fecha_nombre.day,
+        "BEG": _segundos_video(archivo, "beg"),
+        "END": _segundos_video(archivo, "end"),
+        "CHNMASK": chn_mask,
+        "FILEATTR": fileattr,
+    }
+    return _cmsv6_url_completar_params(url, params, llenar_vacios=("SAVENAME",))
 
 
 def _hhmmss_desde_segundos(segundos: int) -> str:
@@ -2038,6 +2324,12 @@ def _descargar_video_archivo(
     fpath = str(archivo.get("file", "") or "").strip()
     down_task_url = str(archivo.get("DownTaskUrl", "") or "").strip()
     raw_down_url = str(archivo.get("DownUrl", "") or "").strip()
+    raw_down_url = _completar_down_url_cmsv6(
+        raw_down_url,
+        archivo,
+        fecha=fecha,
+        nombre_mp4=nombre_mp4,
+    )
     raw_play_url = str(archivo.get("PlaybackUrl", "") or "").strip()
     file_len = int(archivo.get("len", 0) or 0)
     if not (fpath or raw_down_url or raw_play_url):

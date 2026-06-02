@@ -178,7 +178,15 @@ MDVR_RECONSTRUIR_TIMELINE = os.environ.get("MDVR_RECONSTRUIR_TIMELINE", "0").low
     "true",
     "yes",
 }
-MDVR_PREFERIR_RAW_H264 = os.environ.get("MDVR_PREFERIR_RAW_H264", "1").lower() in {
+MDVR_PRESERVAR_TIMELINE_MP4_CMSV6 = os.environ.get(
+    "MDVR_PRESERVAR_TIMELINE_MP4_CMSV6",
+    "1",
+).lower() in {
+    "1",
+    "true",
+    "yes",
+}
+MDVR_PREFERIR_RAW_H264 = os.environ.get("MDVR_PREFERIR_RAW_H264", "0").lower() in {
     "1",
     "true",
     "yes",
@@ -937,7 +945,13 @@ def _segmento_desde_archivo(ruta: str, fecha: datetime.date) -> SegmentoVideo | 
 
 
 def _prioridad_segmento_para_importar(segmento: SegmentoVideo) -> tuple[int, int, float]:
-    if segmento.extension in RAW_VIDEO_EXTENSIONS and MDVR_PREFERIR_RAW_H264:
+    if (
+        segmento.extension == ".mp4"
+        and MDVR_PRESERVAR_TIMELINE_MP4_CMSV6
+        and _mp4_directo_seguro(segmento.ruta)
+    ):
+        prioridad_extension = 4
+    elif segmento.extension in RAW_VIDEO_EXTENSIONS and MDVR_PREFERIR_RAW_H264:
         prioridad_extension = 3
     elif segmento.extension == ".mp4":
         prioridad_extension = 2 if _mp4_directo_seguro(segmento.ruta) else 0
@@ -958,8 +972,8 @@ def _deduplicar_segmentos_preferir_mp4(
 ) -> list[SegmentoVideo]:
     """
     CMSV6 puede dejar el crudo y el MP4 final para el mismo canal/rango.
-    En ese caso se prefiere el crudo H264/GREC para reconstruir un reloj estable
-    desde frames + duración real del nombre.
+    En ese caso se prefiere el MP4 del servidor CMSV6 cuando trae un timeline
+    legible, porque conserva los tiempos por frame que usa el reproductor web.
     """
     deduplicados: dict[tuple[int, datetime.datetime, datetime.datetime], SegmentoVideo] = {}
     for segmento in segmentos:
@@ -2030,6 +2044,20 @@ def _segmento_mp4_directo(segmentos: list[SegmentoVideo]) -> SegmentoVideo | Non
     return segmento
 
 
+def _debe_preservar_timeline_mp4(segmentos: list[SegmentoVideo]) -> bool:
+    if not MDVR_PRESERVAR_TIMELINE_MP4_CMSV6 or not segmentos:
+        return False
+    return all(seg.extension == ".mp4" and _mp4_directo_seguro(seg.ruta) for seg in segmentos)
+
+
+def _correccion_timing_omitida_por_timeline_mp4() -> dict:
+    return {
+        "aplicada": False,
+        "omitida": True,
+        "motivo": "mp4_cmsv6_preserva_timeline",
+    }
+
+
 def _mensaje_video_incompleto(duracion_esperada: int, duracion_real: int) -> str:
     return (
         "El video parece incompleto: "
@@ -3032,6 +3060,7 @@ def _importar_camion_mdvr(
 
                 registro_directo_mp4 = False
                 correccion_timing = {"aplicada": False}
+                preservar_timeline_mp4 = _debe_preservar_timeline_mp4(lista_procesable)
                 segmento_directo = _segmento_mp4_directo(lista_procesable)
                 if segmento_directo is not None:
                     _registrar_mp4_directo(
@@ -3042,11 +3071,14 @@ def _importar_camion_mdvr(
                         ruta_previa=ruta_previa if video_existente else "",
                     )
                     registro_directo_mp4 = True
-                    correccion_timing = _corregir_timing_video_si_corresponde(
-                        video,
-                        duracion_esperada=duracion_esperada,
-                        inicio_procesamiento=video.procesamiento_iniciado_en,
-                    )
+                    if preservar_timeline_mp4:
+                        correccion_timing = _correccion_timing_omitida_por_timeline_mp4()
+                    else:
+                        correccion_timing = _corregir_timing_video_si_corresponde(
+                            video,
+                            duracion_esperada=duracion_esperada,
+                            inicio_procesamiento=video.procesamiento_iniciado_en,
+                        )
                 else:
                     ruta_salida = os.path.join(tmp_dir, f"{nombre_video}{ext_salida}")
                     ok, error = _concatenar_segmentos(lista_procesable, ruta_salida)
@@ -3067,11 +3099,14 @@ def _importar_camion_mdvr(
                         duracion_esperada=duracion_esperada,
                         normalizar_mp4=False,
                     )
-                    correccion_timing = _corregir_timing_video_si_corresponde(
-                        video,
-                        duracion_esperada=duracion_esperada,
-                        inicio_procesamiento=video.procesamiento_iniciado_en,
-                    )
+                    if preservar_timeline_mp4:
+                        correccion_timing = _correccion_timing_omitida_por_timeline_mp4()
+                    else:
+                        correccion_timing = _corregir_timing_video_si_corresponde(
+                            video,
+                            duracion_esperada=duracion_esperada,
+                            inicio_procesamiento=video.procesamiento_iniciado_en,
+                        )
                 mapa_segmentos = _construir_mapa_segmentos(
                     lista_procesable,
                     video.duracion,
