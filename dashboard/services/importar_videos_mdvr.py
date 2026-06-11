@@ -7,7 +7,6 @@ import mimetypes
 import math
 import os
 import re
-import shutil
 import subprocess
 import tempfile
 import time
@@ -34,16 +33,13 @@ from dashboard.services.calcular_duracion_video import (
     envolver_h264_en_mp4,
     procesar_video_subida,
 )
-from dashboard.services.importar_velocidades_xlsx import importar_velocidades_xlsx
+from dashboard.services.importar_velocidades_cmsv6 import importar_velocidades_cmsv6_tracks
 from dashboard.services.video_commands import (
     asegurar_permisos_archivo,
-    build_ffmpeg_command,
     remove_if_exists,
     run_command,
-    run_ffprobe_json,
-    validation_error_message,
 )
-from dashboard.services.video_importacion import (
+from dashboard.services.video_storage import (
     asegurar_permisos_storage,
     inspeccionar_origen_importacion,
 )
@@ -52,17 +48,15 @@ from dashboard.services.video_importacion import (
 _DIR_FECHA_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
 _ID_PREFIX_RE = re.compile(r"^(?P<id>\d+)")
 _SEGMENTO_RE = re.compile(
-    r"^(?P<equipo>\d+)-(?P<camara>\d{2})-(?P<inicio>\d{6})-(?P<fin>\d{6})-.*\.(?P<ext>h264|grec|mp4)$",
+    r"^(?P<equipo>\d+)-(?P<camara>\d{2})-(?P<inicio>\d{6})-(?P<fin>\d{6})-.*\.(?P<ext>h264|mp4)$",
     re.IGNORECASE,
 )
-_SEGMENTO_GREC_NUEVO_RE = re.compile(
-    r"^(?P<equipo>\d+)-(?P<fecha>\d{6})-(?P<inicio>\d{6})-(?P<fin>\d{6})-(?P<codigo>\d+)\.(?P<ext>grec|mp4)$",
+_SEGMENTO_NUEVO_RE = re.compile(
+    r"^(?P<equipo>\d+)-(?P<fecha>\d{6})-(?P<inicio>\d{6})-(?P<fin>\d{6})-(?P<codigo>\d+)\.(?P<ext>mp4)$",
     re.IGNORECASE,
 )
-_XLSX_RE = re.compile(
-    r"^(?P<id>\d+)\s+"
-    r"(?P<inicio_fecha>\d{4}-\d{2}-\d{2})\s+(?P<inicio_hora>\d{2}-\d{2}-\d{2})\s*~\s*"
-    r"(?P<fin_fecha>\d{4}-\d{2}-\d{2})\s+(?P<fin_hora>\d{2}-\d{2}-\d{2})\.xlsx$",
+_TRACKS_JSON_RE = re.compile(
+    r"^(?P<id>\d+)\s+(?P<fecha>\d{4}-\d{2}-\d{2})_tracks\.json$",
     re.IGNORECASE,
 )
 _MIN_DURACION_ALINEACION_DEFAULT = 60
@@ -159,15 +153,6 @@ except ValueError:
     MIN_ANTIGUEDAD_ARCHIVO_SEGUNDOS = _MIN_ANTIGUEDAD_ARCHIVO_DEFAULT
 MIN_ANTIGUEDAD_ARCHIVO_SEGUNDOS = max(0, MIN_ANTIGUEDAD_ARCHIVO_SEGUNDOS)
 
-_GAP_PADDING_MIN_SEGUNDOS_DEFAULT = 10.0
-try:
-    GAP_PADDING_MIN_SEGUNDOS = float(
-        os.environ.get("MDVR_GAP_PADDING_MIN_SECONDS", _GAP_PADDING_MIN_SEGUNDOS_DEFAULT)
-    )
-except ValueError:
-    GAP_PADDING_MIN_SEGUNDOS = _GAP_PADDING_MIN_SEGUNDOS_DEFAULT
-GAP_PADDING_MIN_SEGUNDOS = max(0.0, GAP_PADDING_MIN_SEGUNDOS)
-
 MDVR_CORREGIR_TIMING_FPS = os.environ.get("MDVR_CORREGIR_TIMING_FPS", "1").lower() in {
     "1",
     "true",
@@ -191,7 +176,7 @@ MDVR_PREFERIR_RAW_H264 = os.environ.get("MDVR_PREFERIR_RAW_H264", "0").lower() i
     "true",
     "yes",
 }
-MDVR_RAW_H264_FPS_MODE = os.environ.get("MDVR_RAW_H264_FPS_MODE", "natural").strip().lower()
+MDVR_RAW_H264_FPS_MODE = os.environ.get("MDVR_RAW_H264_FPS_MODE", "duration").strip().lower()
 if MDVR_RAW_H264_FPS_MODE not in {"natural", "duration"}:
     MDVR_RAW_H264_FPS_MODE = "natural"
 MDVR_RAW_H264_FPS = os.environ.get("MDVR_RAW_H264_FPS", "").strip()
@@ -252,59 +237,7 @@ def _parsear_fps_raw_por_camara(valor: str) -> dict[int, str]:
 MDVR_RAW_H264_FPS_NORMALIZADO = _normalizar_fps_raw_config(MDVR_RAW_H264_FPS)
 MDVR_RAW_H264_FPS_POR_CAMARA = _parsear_fps_raw_por_camara(MDVR_RAW_H264_FPS_BY_CAMERA)
 
-MDVR_RECHAZAR_VIDEO_NEGRO = False
-try:
-    MDVR_BLACK_MIN_DURATION_SECONDS = int(os.environ.get("MDVR_BLACK_MIN_DURATION_SECONDS", "10"))
-except ValueError:
-    MDVR_BLACK_MIN_DURATION_SECONDS = 10
-MDVR_BLACK_MIN_DURATION_SECONDS = max(1, MDVR_BLACK_MIN_DURATION_SECONDS)
-try:
-    MDVR_BLACK_MAX_RATIO = float(os.environ.get("MDVR_BLACK_MAX_RATIO", "0.98"))
-except ValueError:
-    MDVR_BLACK_MAX_RATIO = 0.98
-MDVR_BLACK_MAX_RATIO = min(max(MDVR_BLACK_MAX_RATIO, 0.5), 1.0)
-try:
-    MDVR_BLACK_PIX_TH = float(os.environ.get("MDVR_BLACK_PIX_TH", "0.03"))
-except ValueError:
-    MDVR_BLACK_PIX_TH = 0.03
-MDVR_BLACK_PIX_TH = min(max(MDVR_BLACK_PIX_TH, 0.0), 1.0)
-try:
-    MDVR_BLACK_PIC_TH = float(os.environ.get("MDVR_BLACK_PIC_TH", "0.995"))
-except ValueError:
-    MDVR_BLACK_PIC_TH = 0.995
-MDVR_BLACK_PIC_TH = min(max(MDVR_BLACK_PIC_TH, 0.5), 1.0)
-MDVR_BLACK_ANALYSIS_MODE = os.environ.get("MDVR_BLACK_ANALYSIS_MODE", "sample").strip().lower()
-if MDVR_BLACK_ANALYSIS_MODE not in {"sample", "full"}:
-    MDVR_BLACK_ANALYSIS_MODE = "sample"
-try:
-    MDVR_BLACK_SAMPLE_COUNT = int(os.environ.get("MDVR_BLACK_SAMPLE_COUNT", "7"))
-except ValueError:
-    MDVR_BLACK_SAMPLE_COUNT = 7
-MDVR_BLACK_SAMPLE_COUNT = min(max(MDVR_BLACK_SAMPLE_COUNT, 3), 25)
-try:
-    MDVR_BLACK_MIN_VALID_SAMPLES = int(os.environ.get("MDVR_BLACK_MIN_VALID_SAMPLES", "3"))
-except ValueError:
-    MDVR_BLACK_MIN_VALID_SAMPLES = 3
-MDVR_BLACK_MIN_VALID_SAMPLES = min(max(MDVR_BLACK_MIN_VALID_SAMPLES, 1), 25)
-try:
-    MDVR_BLACK_SAMPLE_WIDTH = int(os.environ.get("MDVR_BLACK_SAMPLE_WIDTH", "64"))
-except ValueError:
-    MDVR_BLACK_SAMPLE_WIDTH = 64
-MDVR_BLACK_SAMPLE_WIDTH = min(max(MDVR_BLACK_SAMPLE_WIDTH, 16), 320)
-try:
-    MDVR_BLACK_SAMPLE_HEIGHT = int(os.environ.get("MDVR_BLACK_SAMPLE_HEIGHT", "36"))
-except ValueError:
-    MDVR_BLACK_SAMPLE_HEIGHT = 36
-MDVR_BLACK_SAMPLE_HEIGHT = min(max(MDVR_BLACK_SAMPLE_HEIGHT, 16), 240)
-try:
-    MDVR_BLACK_FRAME_TIMEOUT_SECONDS = int(
-        os.environ.get("MDVR_BLACK_FRAME_TIMEOUT_SECONDS", "20")
-    )
-except ValueError:
-    MDVR_BLACK_FRAME_TIMEOUT_SECONDS = 20
-MDVR_BLACK_FRAME_TIMEOUT_SECONDS = max(3, MDVR_BLACK_FRAME_TIMEOUT_SECONDS)
-
-RAW_VIDEO_EXTENSIONS = {".h264", ".grec"}
+RAW_VIDEO_EXTENSIONS = {".h264"}
 TRANSIENT_ERRNOS = {
     errno.EAGAIN,
     errno.EBUSY,
@@ -319,10 +252,6 @@ TRANSIENT_ERRNOS = {
 logger = logging.getLogger(__name__)
 
 
-class VideoSinImagenUtilError(ValidationError):
-    pass
-
-
 @dataclass(frozen=True)
 class SegmentoVideo:
     ruta: str
@@ -331,13 +260,6 @@ class SegmentoVideo:
     fin_dt: datetime.datetime
     extension: str
     cmsv6_metadata: dict = field(default_factory=dict)
-
-
-@dataclass(frozen=True)
-class XlsxInfo:
-    ruta: str
-    inicio: datetime.datetime
-    fin: datetime.datetime
 
 
 def _parse_hora_hhmmss(valor: str) -> datetime.time | None:
@@ -417,21 +339,6 @@ def _extraer_camara_desde_codigo_nuevo(codigo: str) -> int | None:
     return camara
 
 
-def _parse_hora_hh_mm_ss(valor: str) -> datetime.time | None:
-    if not valor:
-        return None
-    parts = valor.split("-")
-    if len(parts) != 3:
-        return None
-    try:
-        hh, mm, ss = [int(p) for p in parts]
-    except ValueError:
-        return None
-    if not (0 <= hh < 24 and 0 <= mm < 60 and 0 <= ss < 60):
-        return None
-    return datetime.time(hh, mm, ss)
-
-
 def _tipo_turno_para_hora(hora: datetime.time) -> str:
     if hora < datetime.time(8, 0):
         return TipoTurnoChoices.NOCHE
@@ -455,33 +362,36 @@ def _buscar_carpeta_mdvr(base_dir: str, carpeta_id: str) -> str | None:
     return None
 
 
-def _listar_xlsx(base_dir: str, carpeta_id: str) -> list[XlsxInfo]:
-    resultados = []
+def _listar_tracks_json(base_dir: str, carpeta_id: str) -> dict[datetime.date, str]:
+    resultados = {}
     try:
         entries = os.listdir(base_dir)
     except OSError:
         return resultados
     for nombre in entries:
-        match = _XLSX_RE.match(nombre)
+        match = _TRACKS_JSON_RE.match(nombre)
         if not match or match.group("id") != carpeta_id:
             continue
-        hora_inicio = _parse_hora_hh_mm_ss(match.group("inicio_hora"))
-        hora_fin = _parse_hora_hh_mm_ss(match.group("fin_hora"))
-        if not hora_inicio or not hora_fin:
-            continue
         try:
-            fecha_inicio = datetime.date.fromisoformat(match.group("inicio_fecha"))
-            fecha_fin = datetime.date.fromisoformat(match.group("fin_fecha"))
+            fecha = datetime.date.fromisoformat(match.group("fecha"))
         except ValueError:
             continue
-        inicio_dt = datetime.datetime.combine(fecha_inicio, hora_inicio)
-        fin_dt = datetime.datetime.combine(fecha_fin, hora_fin)
-        if fin_dt < inicio_dt:
-            continue
-        resultados.append(
-            XlsxInfo(ruta=os.path.join(base_dir, nombre), inicio=inicio_dt, fin=fin_dt)
-        )
+        resultados[fecha] = os.path.join(base_dir, nombre)
     return resultados
+
+
+def _leer_tracks_json(ruta: str) -> list[dict]:
+    with open(ruta, "r", encoding="utf-8") as archivo:
+        payload = json.load(archivo)
+    if isinstance(payload, dict):
+        tracks = payload.get("tracks") or []
+    elif isinstance(payload, list):
+        tracks = payload
+    else:
+        tracks = []
+    if not isinstance(tracks, list):
+        raise ValidationError("El JSON de tracks CMSV6 no tiene una lista valida.")
+    return [track for track in tracks if isinstance(track, dict)]
 
 
 def _obtener_o_crear_turno(
@@ -511,31 +421,15 @@ def _obtener_o_crear_turno(
     )
 
 
-def _seleccionar_xlsx(xlsx_files: list[XlsxInfo], fecha_inicio: datetime.datetime) -> XlsxInfo | None:
-    candidatos = [
-        info
-        for info in xlsx_files
-        if info.inicio <= fecha_inicio <= info.fin
-    ]
-    if not candidatos:
-        return None
-    return min(candidatos, key=lambda info: info.fin - info.inicio)
-
-
 def _programar_importacion_velocidades_turno(
     *,
     turno: Turno,
     video_ref: Video,
-    xlsx_files: list[XlsxInfo],
-    fecha_inicio: datetime.datetime,
-    xlsx_por_turno: dict[int, str],
+    tracks_por_fecha: dict[datetime.date, str],
     videos_referencia_por_turno: dict[int, Video],
 ):
-    xlsx_info = _seleccionar_xlsx(xlsx_files, fecha_inicio)
-    if xlsx_info:
-        if turno.id not in xlsx_por_turno:
-            xlsx_por_turno[turno.id] = xlsx_info.ruta
-            videos_referencia_por_turno[turno.id] = video_ref
+    if tracks_por_fecha.get(turno.fecha):
+        videos_referencia_por_turno.setdefault(turno.id, video_ref)
         _actualizar_estado_velocidades_turno(
             turno,
             EstadoVelocidadesVideo.PENDIENTE,
@@ -544,8 +438,8 @@ def _programar_importacion_velocidades_turno(
 
     _actualizar_estado_velocidades_turno(
         turno,
-        EstadoVelocidadesVideo.SIN_XLSX,
-        error="No se encontró XLSX que cubra la fecha/hora de inicio del video.",
+        EstadoVelocidadesVideo.SIN_TRACKS,
+        error="No se encontró JSON de tracks CMSV6 para la fecha del turno.",
     )
     return False
 
@@ -931,7 +825,7 @@ def _segmento_desde_archivo_con_motivo(
         fin_raw = match.group("fin")
         ext = f".{(match.group('ext') or '').lower()}"
     else:
-        match_nuevo = _SEGMENTO_GREC_NUEVO_RE.match(nombre)
+        match_nuevo = _SEGMENTO_NUEVO_RE.match(nombre)
         if not match_nuevo:
             return None, "nombre no coincide con formatos MDVR soportados."
         fecha_archivo = _parse_fecha_yymmdd(match_nuevo.group("fecha"))
@@ -1082,7 +976,7 @@ def _archivo_listo_para_importar(ruta_archivo: str) -> tuple[bool, str | None]:
 
 def _es_extension_video_soportada(nombre: str) -> bool:
     ext = os.path.splitext(nombre)[1].lower()
-    return ext in {".mp4", ".h264", ".grec"}
+    return ext in {".mp4", ".h264"}
 
 
 def _ffprobe_ok(ruta: str) -> bool:
@@ -1126,122 +1020,6 @@ def _parsear_fraccion_ffprobe(valor: str | None) -> float | None:
     if den_f == 0:
         return None
     return num_f / den_f
-
-
-def _obtener_parametros_padding_video(ruta: str) -> tuple[int, int, str]:
-    ancho = 1280
-    alto = 720
-    fps_expr = "25"
-    try:
-        data = run_ffprobe_json(
-            ruta,
-            show_entries="stream=width,height,avg_frame_rate,r_frame_rate",
-            error_prefix="No se pudo inspeccionar video MDVR",
-        )
-    except ValidationError:
-        return ancho, alto, fps_expr
-
-    for stream in data.get("streams", []):
-        try:
-            ancho_stream = int(stream.get("width") or 0)
-            alto_stream = int(stream.get("height") or 0)
-        except (TypeError, ValueError):
-            continue
-        if ancho_stream <= 0 or alto_stream <= 0:
-            continue
-        ancho = ancho_stream
-        alto = alto_stream
-        candidato = stream.get("avg_frame_rate") or stream.get("r_frame_rate")
-        fps_val = _parsear_fraccion_ffprobe(candidato)
-        if fps_val and fps_val > 0:
-            fps_expr = candidato
-        break
-    return ancho, alto, fps_expr
-
-
-def _duracion_hueco_entre_segmentos(
-    segmento_actual: SegmentoVideo,
-    duracion_actual: float,
-    siguiente_segmento: SegmentoVideo,
-) -> float:
-    duracion_base = max(0.0, float(duracion_actual or 0.0))
-    fin_real_actual = segmento_actual.inicio_dt + datetime.timedelta(seconds=duracion_base)
-    hueco = float((siguiente_segmento.inicio_dt - fin_real_actual).total_seconds())
-    if hueco < GAP_PADDING_MIN_SEGUNDOS:
-        return 0.0
-    return hueco
-
-
-def _planificar_timeline_segmentos(segmentos: list[SegmentoVideo]) -> tuple[list[dict], float]:
-    if not segmentos:
-        return [], 0.0
-
-    duraciones = [max(1.0, _duracion_segmento_real(seg)) for seg in segmentos]
-    plan: list[dict] = []
-    cursor = 0.0
-    total = len(segmentos)
-    for idx, (segmento, duracion_seg) in enumerate(zip(segmentos, duraciones), start=1):
-        inicio_timeline = cursor
-        fin_timeline = inicio_timeline + duracion_seg
-        hueco_despues = 0.0
-        if idx < total:
-            hueco_despues = _duracion_hueco_entre_segmentos(
-                segmento,
-                duracion_seg,
-                segmentos[idx],
-            )
-        plan.append(
-            {
-                "segmento": segmento,
-                "duracion_segundos": duracion_seg,
-                "timeline_inicio": inicio_timeline,
-                "timeline_fin": fin_timeline,
-                "hueco_despues": hueco_despues,
-            }
-        )
-        cursor = fin_timeline + hueco_despues
-    return plan, cursor
-
-
-def _segmentos_contiguos_hasta_primer_hueco(
-    segmentos: list[SegmentoVideo],
-) -> tuple[list[SegmentoVideo], dict | None]:
-    if not segmentos:
-        return [], None
-
-    duraciones = [max(1.0, _duracion_segmento_real(seg)) for seg in segmentos]
-    for idx in range(len(segmentos) - 1):
-        hueco = _duracion_hueco_entre_segmentos(
-            segmentos[idx],
-            duraciones[idx],
-            segmentos[idx + 1],
-        )
-        if hueco >= GAP_PADDING_MIN_SEGUNDOS:
-            return segmentos[: idx + 1], {
-                "duracion_segundos": float(hueco),
-                "segmento_previo": segmentos[idx],
-                "segmento_siguiente": segmentos[idx + 1],
-                "segmentos_omitidos": len(segmentos) - (idx + 1),
-            }
-    return list(segmentos), None
-
-
-def _mensaje_video_cortado_en_hueco(info_hueco: dict | None) -> str:
-    if not info_hueco:
-        return ""
-    hueco = int(round(float(info_hueco.get("duracion_segundos") or 0.0)))
-    segmento_previo = info_hueco.get("segmento_previo")
-    segmento_siguiente = info_hueco.get("segmento_siguiente")
-    omitidos = int(info_hueco.get("segmentos_omitidos") or 0)
-    previo_nombre = os.path.basename(getattr(segmento_previo, "ruta", "") or "")
-    siguiente_nombre = os.path.basename(getattr(segmento_siguiente, "ruta", "") or "")
-    return (
-        "Se procesó solo el tramo continuo inicial del video: "
-        f"se detectó un hueco de aproximadamente {hueco}s entre "
-        f"'{previo_nombre}' y '{siguiente_nombre}'. "
-        f"Quedaron {omitidos} segmento(s) pendientes después del hueco; "
-        "el video se regenerará cuando aparezca continuidad."
-    )[:2000]
 
 
 def _aware_local(dt: datetime.datetime) -> datetime.datetime:
@@ -1312,188 +1090,6 @@ def _cmsv6_metadata_mapa(
     return resultado
 
 
-def _crear_padding_negro_mp4(segundos: float, referencia_ruta: str) -> str:
-    ancho, alto, fps_expr = _obtener_parametros_padding_video(referencia_ruta)
-    ruta_padding = tempfile.NamedTemporaryFile(delete=False, suffix=".mp4").name
-    run_command(
-        [
-            "ffmpeg",
-            "-y",
-            "-hide_banner",
-            "-loglevel",
-            "error",
-            "-f",
-            "lavfi",
-            "-i",
-            f"color=c=black:s={ancho}x{alto}:r={fps_expr}:d={segundos:.3f}",
-            "-an",
-            "-c:v",
-            "libx264",
-            "-preset",
-            "veryfast",
-            "-crf",
-            "23",
-            "-pix_fmt",
-            "yuv420p",
-            "-movflags",
-            "+faststart",
-            ruta_padding,
-        ],
-        error_prefix="No se pudo generar padding negro MDVR",
-    )
-    if os.path.getsize(ruta_padding) <= 0:
-        remove_if_exists(ruta_padding)
-        raise ValidationError("No se pudo generar padding negro MDVR.")
-    return ruta_padding
-
-
-def _preparar_segmentos_para_concat(
-    segmentos: list[SegmentoVideo],
-) -> tuple[list[str], list[str], bool]:
-    son_mp4 = all(seg.extension == ".mp4" for seg in segmentos)
-    temporales: list[str] = []
-    if son_mp4:
-        rutas_mp4 = [seg.ruta for seg in segmentos]
-    else:
-        rutas_mp4, temporales = _normalizar_segmentos_raw_a_mp4(segmentos)
-    return rutas_mp4, temporales, False
-
-
-def _crear_lista_concat(segmentos: list[str]) -> str:
-    with tempfile.NamedTemporaryFile(mode="w", delete=False, suffix=".txt") as archivo:
-        for ruta in segmentos:
-            ruta_esc = ruta.replace("'", r"'\''")
-            archivo.write(f"file '{ruta_esc}'\n")
-        return archivo.name
-
-
-def _concat_h264(segmentos: list[str], salida: str) -> tuple[bool, str | None]:
-    try:
-        with open(salida, "wb") as out_file:
-            for ruta in segmentos:
-                with open(ruta, "rb") as in_file:
-                    shutil.copyfileobj(in_file, out_file, length=1024 * 1024)
-        if os.path.getsize(salida) <= 0:
-            return False, "salida vacía tras concatenación binaria."
-        return True, None
-    except OSError as exc:
-        return False, str(exc)
-
-
-def _concat_mp4_copiando(segmentos: list[str], salida: str) -> tuple[bool, str | None]:
-    lista = _crear_lista_concat(segmentos)
-    try:
-        run_command(
-            build_ffmpeg_command(
-                lista,
-                salida,
-                input_args=["-hide_banner", "-loglevel", "error", "-f", "concat", "-safe", "0"],
-                output_args=["-c", "copy", "-movflags", "+faststart"],
-            )
-        )
-        if os.path.getsize(salida) <= 0:
-            return False, "salida vacía tras concatenación MP4 por copia."
-        return True, None
-    except (ValidationError, OSError) as exc:
-        return False, validation_error_message(exc)
-    finally:
-        if os.path.exists(lista):
-            os.remove(lista)
-
-
-def _concat_mp4_transcodificando(segmentos: list[str], salida: str) -> tuple[bool, str | None]:
-    lista = _crear_lista_concat(segmentos)
-    try:
-        run_command(
-            build_ffmpeg_command(
-                lista,
-                salida,
-                input_args=["-hide_banner", "-loglevel", "error", "-f", "concat", "-safe", "0"],
-                output_args=[
-                    "-c:v",
-                    "libx264",
-                    "-preset",
-                    "veryfast",
-                    "-crf",
-                    "23",
-                    "-pix_fmt",
-                    "yuv420p",
-                    "-an",
-                ],
-            )
-        )
-        return True, None
-    except (ValidationError, OSError) as exc:
-        return False, validation_error_message(exc)
-    finally:
-        if os.path.exists(lista):
-            os.remove(lista)
-
-
-_concat_h264_transcodificando = _concat_mp4_transcodificando
-
-
-def _normalizar_segmentos_raw_a_mp4(segmentos: list[SegmentoVideo]) -> tuple[list[str], list[str]]:
-    rutas_mp4 = []
-    temporales = []
-    for segmento in segmentos:
-        if segmento.extension == ".mp4":
-            rutas_mp4.append(segmento.ruta)
-            continue
-        ruta_temporal_raw = tempfile.NamedTemporaryFile(delete=False, suffix=segmento.extension).name
-        shutil.copyfile(segmento.ruta, ruta_temporal_raw)
-        fps_salida = _fps_raw_configurado(segmento)
-        fps_origen = "config" if fps_salida else "natural"
-        if MDVR_RAW_H264_FPS_MODE == "duration":
-            fps_salida = _fps_raw_desde_duracion_nombre(segmento)
-            fps_origen = "duration" if fps_salida else "natural"
-        logger.info(
-            "MDVR raw convertido [%s]: fps=%s modo=%s origen=%s",
-            os.path.basename(segmento.ruta),
-            fps_salida or "natural",
-            MDVR_RAW_H264_FPS_MODE,
-            fps_origen,
-        )
-        ruta_mp4 = envolver_h264_en_mp4(ruta_temporal_raw, fps_salida=fps_salida)
-        temporales.extend([ruta_temporal_raw, ruta_mp4])
-        rutas_mp4.append(ruta_mp4)
-    return rutas_mp4, temporales
-
-
-def _concatenar_segmentos(segmentos: list[SegmentoVideo], salida: str) -> tuple[bool, str | None]:
-    rutas = [seg.ruta for seg in segmentos]
-    if not rutas:
-        return False, "sin segmentos para concatenar."
-
-    son_mp4 = all(seg.extension == ".mp4" for seg in segmentos)
-    try:
-        rutas_preparadas, temporales, hubo_padding = _preparar_segmentos_para_concat(segmentos)
-    except Exception as exc:
-        return False, _normalizar_error(exc)
-
-    if son_mp4 and not hubo_padding:
-        ok, error = _concat_mp4_copiando(rutas_preparadas, salida)
-        if ok:
-            return True, None
-        ok, error = _concat_h264_transcodificando(rutas_preparadas, salida)
-        if ok:
-            return True, None
-        return False, error
-
-    try:
-        if not hubo_padding:
-            ok, error = _concat_mp4_copiando(rutas_preparadas, salida)
-            if ok:
-                return True, None
-        ok, error = _concat_h264_transcodificando(rutas_preparadas, salida)
-        if ok:
-            return True, None
-        return False, error
-    finally:
-        for ruta in temporales:
-            remove_if_exists(ruta)
-
-
 def _subir_archivo_temporal(ruta_local: str, nombre_base: str) -> str:
     destino = default_storage.get_available_name(os.path.join("videos", nombre_base))
     with open(ruta_local, "rb") as archivo:
@@ -1511,19 +1107,8 @@ def _archivo_tiene_ftyp_mp4(ruta: str) -> bool:
     return len(data) >= 8 and data[4:8] == b"ftyp"
 
 
-def _archivo_parece_ssy_dvr(ruta: str) -> bool:
-    try:
-        with open(ruta, "rb") as archivo:
-            data = archivo.read(4096)
-    except OSError:
-        return False
-    return b"SSY_DVR" in data
-
-
 def _mp4_directo_seguro(ruta: str) -> bool:
     if not _archivo_tiene_ftyp_mp4(ruta):
-        return False
-    if _archivo_parece_ssy_dvr(ruta):
         return False
     try:
         return math.floor(calcular_duracion_video(ruta)) > 0
@@ -1636,16 +1221,37 @@ def _fps_raw_configurado(segmento: SegmentoVideo) -> str | None:
 def _fps_raw_desde_duracion_nombre(segmento: SegmentoVideo) -> str | None:
     if segmento.extension not in RAW_VIDEO_EXTENSIONS:
         return None
-    duracion_nombre = _duracion_segmento_nombre(segmento)
-    if duracion_nombre <= 0:
+    duracion_segmento = _duracion_segmento_nombre(segmento)
+    if duracion_segmento <= 0:
         return None
     frames = _contar_frames_raw_h264(segmento.ruta)
     if frames <= 0:
         return None
-    fps = frames / float(duracion_nombre)
+    fps = frames / float(duracion_segmento)
     if fps < MDVR_TIMING_MIN_FPS or fps > MDVR_TIMING_MAX_FPS:
         return None
     return f"{fps:.8f}"
+
+
+def _resolver_conversion_raw_h264(segmento: SegmentoVideo) -> dict:
+    if segmento.extension not in RAW_VIDEO_EXTENSIONS:
+        return {"fps": None, "fuente": "no_raw_h264"}
+
+    fps_duracion = _fps_raw_desde_duracion_nombre(segmento)
+    fps_config = _fps_raw_configurado(segmento)
+
+    if MDVR_RAW_H264_FPS_MODE == "duration":
+        if fps_duracion:
+            return {"fps": fps_duracion, "fuente": "duracion_segmento"}
+        if fps_config:
+            return {"fps": fps_config, "fuente": "configuracion"}
+    else:
+        if fps_config:
+            return {"fps": fps_config, "fuente": "configuracion"}
+        if fps_duracion:
+            return {"fps": fps_duracion, "fuente": "duracion_segmento"}
+
+    return {"fps": None, "fuente": "fallback_ffmpeg"}
 
 
 def _correccion_timing_necesaria(ruta: str, duracion_esperada: int | None) -> dict | None:
@@ -1685,242 +1291,11 @@ def _correccion_timing_necesaria(ruta: str, duracion_esperada: int | None) -> di
     }
 
 
-def _duracion_archivo_segura(ruta: str) -> float:
-    try:
-        return float(calcular_duracion_video(ruta))
-    except Exception:
-        return 0.0
-
-
-_BLACKDETECT_RE = re.compile(
-    r"black_start:(?P<inicio>[0-9.]+)\s+"
-    r"black_end:(?P<fin>[0-9.]+)\s+"
-    r"black_duration:(?P<duracion>[0-9.]+)"
-)
-
-
-def _analizar_video_negro_completo_blackdetect(ruta: str, duracion: float) -> dict:
-    filtro = (
-        "blackdetect="
-        f"d=0.5:pic_th={MDVR_BLACK_PIC_TH:.6f}:pix_th={MDVR_BLACK_PIX_TH:.6f}"
-    )
-    try:
-        result = subprocess.run(
-            [
-                "ffmpeg",
-                "-hide_banner",
-                "-nostats",
-                "-i",
-                ruta,
-                "-vf",
-                filtro,
-                "-an",
-                "-f",
-                "null",
-                "-",
-            ],
-            check=False,
-            capture_output=True,
-            text=True,
-        )
-    except OSError as exc:
-        return {
-            "negro_total": False,
-            "habilitado": True,
-            "duracion": duracion,
-            "modo": "full",
-            "error": str(exc),
-        }
-
-    texto = f"{result.stderr or ''}\n{result.stdout or ''}"
-    total_negro = 0.0
-    for match in _BLACKDETECT_RE.finditer(texto):
-        try:
-            total_negro += float(match.group("duracion") or 0.0)
-        except (TypeError, ValueError):
-            continue
-    ratio = total_negro / duracion if duracion > 0 else 0.0
-    return {
-        "negro_total": ratio >= MDVR_BLACK_MAX_RATIO,
-        "habilitado": True,
-        "modo": "full",
-        "duracion": duracion,
-        "segundos_negros": round(total_negro, 3),
-        "ratio_negro": round(ratio, 6),
-        "returncode": result.returncode,
-    }
-
-
-def _puntos_muestreo_negro(duracion: float) -> list[float]:
-    cantidad = min(MDVR_BLACK_SAMPLE_COUNT, max(3, int(duracion // 300) + 3))
-    cantidad = min(cantidad, MDVR_BLACK_SAMPLE_COUNT)
-    return [
-        max(0.5, min(duracion - 0.5, duracion * (indice + 1) / (cantidad + 1)))
-        for indice in range(cantidad)
-    ]
-
-
-def _ratio_negro_frame_muestreado(ruta: str, segundo: float) -> dict:
-    ancho = MDVR_BLACK_SAMPLE_WIDTH
-    alto = MDVR_BLACK_SAMPLE_HEIGHT
-    try:
-        result = subprocess.run(
-            [
-                "ffmpeg",
-                "-hide_banner",
-                "-loglevel",
-                "error",
-                "-ss",
-                f"{segundo:.3f}",
-                "-i",
-                ruta,
-                "-frames:v",
-                "1",
-                "-vf",
-                f"scale={ancho}:{alto}:flags=fast_bilinear,format=gray",
-                "-f",
-                "rawvideo",
-                "-",
-            ],
-            check=False,
-            capture_output=True,
-            timeout=MDVR_BLACK_FRAME_TIMEOUT_SECONDS,
-        )
-    except subprocess.TimeoutExpired:
-        return {"segundo": round(segundo, 3), "error": "timeout"}
-    except OSError as exc:
-        return {"segundo": round(segundo, 3), "error": str(exc)}
-
-    data = result.stdout or b""
-    if result.returncode != 0 or len(data) < ancho * alto:
-        detalle = (result.stderr or b"").decode("utf-8", errors="replace").strip()
-        return {
-            "segundo": round(segundo, 3),
-            "error": detalle or f"frame incompleto ({len(data)} bytes)",
-            "returncode": result.returncode,
-        }
-
-    umbral_pixel = int(round(MDVR_BLACK_PIX_TH * 255))
-    pixeles_negros = sum(1 for pixel in data[: ancho * alto] if pixel <= umbral_pixel)
-    ratio_pixeles_negros = pixeles_negros / float(ancho * alto)
-    return {
-        "segundo": round(segundo, 3),
-        "ratio_pixeles_negros": round(ratio_pixeles_negros, 6),
-        "negro": ratio_pixeles_negros >= MDVR_BLACK_PIC_TH,
-    }
-
-
-def _analizar_video_negro_por_muestras(ruta: str, duracion: float) -> dict:
-    muestras = [_ratio_negro_frame_muestreado(ruta, punto) for punto in _puntos_muestreo_negro(duracion)]
-    muestras_validas = [muestra for muestra in muestras if "negro" in muestra]
-    min_validas = min(MDVR_BLACK_MIN_VALID_SAMPLES, len(muestras))
-    if len(muestras_validas) < min_validas:
-        return {
-            "negro_total": False,
-            "habilitado": True,
-            "modo": "sample",
-            "duracion": duracion,
-            "motivo": "muestras_validas_insuficientes",
-            "muestras_total": len(muestras),
-            "muestras_validas": len(muestras_validas),
-            "muestras_minimas": min_validas,
-            "muestras": muestras,
-        }
-
-    muestras_negras = sum(1 for muestra in muestras_validas if muestra.get("negro"))
-    ratio = muestras_negras / float(len(muestras_validas))
-    return {
-        "negro_total": ratio >= MDVR_BLACK_MAX_RATIO,
-        "habilitado": True,
-        "modo": "sample",
-        "duracion": duracion,
-        "muestras_total": len(muestras),
-        "muestras_validas": len(muestras_validas),
-        "muestras_negras": muestras_negras,
-        "ratio_negro": round(ratio, 6),
-        "muestras": muestras,
-    }
-
-
-def _analizar_video_totalmente_negro(ruta: str) -> dict:
-    if not MDVR_RECHAZAR_VIDEO_NEGRO:
-        return {"negro_total": False, "habilitado": False}
-    duracion = _duracion_archivo_segura(ruta)
-    if duracion < MDVR_BLACK_MIN_DURATION_SECONDS:
-        return {
-            "negro_total": False,
-            "habilitado": True,
-            "duracion": duracion,
-            "motivo": "duracion_menor_al_minimo",
-        }
-    if MDVR_BLACK_ANALYSIS_MODE == "full":
-        return _analizar_video_negro_completo_blackdetect(ruta, duracion)
-    return _analizar_video_negro_por_muestras(ruta, duracion)
-
-
-def _validar_video_con_imagen_util(ruta: str, *, contexto: str = "video") -> dict:
-    info = _analizar_video_totalmente_negro(ruta)
-    if info.get("negro_total"):
-        ratio = float(info.get("ratio_negro") or 0.0) * 100
-        unidad = "muestras" if info.get("modo") == "sample" else "duracion"
-        raise VideoSinImagenUtilError(
-            f"{contexto}: el video resultante quedo practicamente negro "
-            f"({ratio:.1f}% de {unidad}). Se rechaza para no publicar un MP4 sin imagen util."
-        )
-    return info
-
-
 def _estirar_mp4_a_duracion(
     ruta_origen: str,
     ruta_destino: str,
     factor: float,
-    *,
-    duracion_original: float = 0.0,
 ):
-    ruta_remux = None
-    with tempfile.NamedTemporaryFile(
-        delete=False,
-        suffix=".mp4",
-        dir=os.path.dirname(ruta_destino) or ".",
-    ) as tmp:
-        ruta_remux = tmp.name
-    try:
-        run_command(
-            [
-                "ffmpeg",
-                "-y",
-                "-hide_banner",
-                "-loglevel",
-                "error",
-                "-itsscale",
-                f"{factor:.8f}",
-                "-i",
-                ruta_origen,
-                "-map",
-                "0:v:0",
-                "-map",
-                "0:a?",
-                "-c",
-                "copy",
-                "-movflags",
-                "+faststart",
-                ruta_remux,
-            ],
-            error_prefix="No se pudo corregir timing/FPS MDVR por remux",
-        )
-        if (
-            os.path.exists(ruta_remux)
-            and os.path.getsize(ruta_remux) > 0
-            and _duracion_archivo_segura(ruta_remux) > max(float(duracion_original or 0.0), 0.0)
-        ):
-            os.replace(ruta_remux, ruta_destino)
-            asegurar_permisos_archivo(ruta_destino)
-            return
-    except Exception:
-        pass
-    finally:
-        remove_if_exists(ruta_remux)
-
     filtro = f"setpts={factor:.8f}*PTS"
     run_command(
         [
@@ -2099,7 +1474,6 @@ def _corregir_timing_video_si_corresponde(
                 ruta,
                 ruta_corregida,
                 float(plan["factor"]),
-                duracion_original=float(plan["duracion"] or 0.0),
             )
         duracion_corregida = math.floor(calcular_duracion_video(ruta_corregida))
         if (
@@ -2116,21 +1490,6 @@ def _corregir_timing_video_si_corresponde(
                 "La reconstruccion de timeline no alcanzo la duracion esperada "
                 f"({duracion_corregida}s vs {plan['duracion_esperada']}s)."
             )
-        validacion_negro = _analizar_video_totalmente_negro(ruta_corregida)
-        if validacion_negro.get("negro_total"):
-            return {
-                "aplicada": False,
-                "omitida": True,
-                "motivo": "correccion_timing_genero_video_negro",
-                "duracion_original": round(float(plan["duracion"]), 3),
-                "duracion_corregida": duracion_corregida,
-                "duracion_esperada": plan["duracion_esperada"],
-                "fps_declarado": round(float(plan.get("fps_declarado") or 0.0), 3),
-                "fps_timeline": round(float(plan["fps_timeline"]), 3),
-                "factor": round(float(plan["factor"]), 6),
-                "modo": modo,
-                "validacion_negro": validacion_negro,
-            }
         os.replace(ruta_corregida, ruta)
         asegurar_permisos_archivo(ruta)
         _actualizar_estado_video_por_duracion(
@@ -2192,7 +1551,7 @@ def _registrar_mp4_directo(
     nombre_video: str,
     duracion_esperada: int | None,
     ruta_previa: str = "",
-):
+) -> Video:
     inicio_procesamiento = video.procesamiento_iniciado_en or timezone.now()
     destino_rel = _subir_archivo_temporal(segmento.ruta, f"{nombre_video}.mp4")
     try:
@@ -2200,7 +1559,6 @@ def _registrar_mp4_directo(
         duracion_real = math.floor(calcular_duracion_video(ruta_final))
         if duracion_real <= 0:
             raise ValidationError("No se pudo calcular una duración válida para el MP4.")
-        _validar_video_con_imagen_util(ruta_final, contexto=nombre_video)
     except Exception:
         try:
             default_storage.delete(destino_rel)
@@ -2327,106 +1685,22 @@ def _construir_mapa_segmentos(
     if not segmentos or total_video <= 0:
         return []
 
-    if len(segmentos) == 1 and not usar_duracion_nombre:
-        seg = segmentos[0]
-        inicio_real, fin_real = _rango_real_segmento(seg, float(total_video))
-        item = {
-            "orden": 1,
-            "archivo": os.path.basename(seg.ruta),
-            "video_inicio_segundo": 0,
-            "video_fin_segundo": int(total_video - 1),
-            "real_inicio": inicio_real.isoformat(),
-            "real_fin": fin_real.isoformat(),
-            "duracion_video_segundos": int(total_video),
-            "duracion_real_segundos": round((fin_real - inicio_real).total_seconds(), 3),
-        }
-        cmsv6 = _cmsv6_metadata_mapa(seg, duracion_video_segundos=float(total_video))
-        if cmsv6:
-            item["cmsv6"] = cmsv6
-        return [item]
-
-    if usar_duracion_nombre:
-        plan = []
-        cursor = 0.0
-        total = len(segmentos)
-        for idx, segmento in enumerate(segmentos, start=1):
-            duracion_seg = max(1.0, _duracion_segmento_nombre(segmento))
-            inicio_timeline = cursor
-            fin_timeline = inicio_timeline + duracion_seg
-            hueco_despues = 0.0
-            if idx < total:
-                siguiente = segmentos[idx]
-                hueco_despues = max(
-                    0.0,
-                    float((siguiente.inicio_dt - segmento.fin_dt).total_seconds()),
-                )
-                if hueco_despues < GAP_PADDING_MIN_SEGUNDOS:
-                    hueco_despues = 0.0
-            plan.append(
-                {
-                    "segmento": segmento,
-                    "duracion_segundos": duracion_seg,
-                    "timeline_inicio": inicio_timeline,
-                    "timeline_fin": fin_timeline,
-                    "hueco_despues": hueco_despues,
-                }
-            )
-            cursor = fin_timeline + hueco_despues
-        total_real = cursor
-    else:
-        plan, total_real = _planificar_timeline_segmentos(segmentos)
-    if not plan or total_real <= 0:
-        return []
-
-    mapa: list[dict] = []
-    cantidad = len(plan)
-    ultimo_fin_exclusivo = 0
-
-    for idx, item in enumerate(plan, start=1):
-        seg = item["segmento"]
-        duracion_seg = float(item["duracion_segundos"])
-        inicio_video = int(round((float(item["timeline_inicio"]) / total_real) * total_video))
-        inicio_video = max(ultimo_fin_exclusivo, inicio_video)
-        if inicio_video >= total_video:
-            break
-        if idx == cantidad:
-            fin_video_exclusivo = total_video
-        else:
-            ideal = int(round((float(item["timeline_fin"]) / total_real) * total_video))
-            restantes = cantidad - idx
-            minimo = inicio_video + 1
-            maximo = max(minimo, total_video - restantes)
-            fin_video_exclusivo = min(maximo, max(minimo, ideal))
-        if fin_video_exclusivo <= inicio_video:
-            fin_video_exclusivo = min(total_video, inicio_video + 1)
-        if fin_video_exclusivo <= inicio_video:
-            continue
-
-        inicio_real, fin_real = _rango_real_segmento(seg, duracion_seg)
-
-        item_mapa = {
-            "orden": idx,
-            "archivo": os.path.basename(seg.ruta),
-            "video_inicio_segundo": int(inicio_video),
-            "video_fin_segundo": int(fin_video_exclusivo - 1),
-            "real_inicio": inicio_real.isoformat(),
-            "real_fin": fin_real.isoformat(),
-            "duracion_video_segundos": round(
-                max(0.0, float(fin_video_exclusivo - inicio_video)),
-                3,
-            ),
-            "duracion_real_segundos": round((fin_real - inicio_real).total_seconds(), 3),
-        }
-        cmsv6 = _cmsv6_metadata_mapa(
-            seg,
-            duracion_video_segundos=max(0.0, float(fin_video_exclusivo - inicio_video)),
-        )
-        if cmsv6:
-            item_mapa["cmsv6"] = cmsv6
-        mapa.append(item_mapa)
-        ultimo_fin_exclusivo = fin_video_exclusivo
-
-    return mapa
+    seg = segmentos[0]
+    inicio_real, fin_real = _rango_real_segmento(seg, float(total_video))
+    item = {
+        "orden": 1,
+        "archivo": os.path.basename(seg.ruta),
+        "video_inicio_segundo": 0,
+        "video_fin_segundo": int(total_video - 1),
+        "real_inicio": inicio_real.isoformat(),
+        "real_fin": fin_real.isoformat(),
+        "duracion_video_segundos": int(total_video),
+        "duracion_real_segundos": round((fin_real - inicio_real).total_seconds(), 3),
+    }
+    cmsv6 = _cmsv6_metadata_mapa(seg, duracion_video_segundos=float(total_video))
+    if cmsv6:
+        item["cmsv6"] = cmsv6
+    return [item]
 
 
 def _recortar_mapa_segmentos(
@@ -2739,7 +2013,7 @@ def _importar_camion_mdvr(
             "errores": [f"No se encontró carpeta MDVR para {carpeta_id}."],
         }
 
-    xlsx_files = _listar_xlsx(base_dir, carpeta_id)
+    tracks_por_fecha = _listar_tracks_json(base_dir, carpeta_id)
 
     detalles = {
         "camion_id": camion.id,
@@ -2833,19 +2107,22 @@ def _importar_camion_mdvr(
         turnos_creados = {}
         videos_turno: dict[str, list[Video]] = {}
         videos_referencia_por_turno: dict[int, Video] = {}
-        xlsx_por_turno: dict[int, str] = {}
 
         for (tipo_turno, camara), lista in grupos.items():
             lista.sort(key=lambda s: s.inicio_dt)
-            lista_procesable, info_hueco = _segmentos_contiguos_hasta_primer_hueco(lista)
-            if not lista_procesable:
+            nombre_video = f"MDVR_{carpeta_id}_{fecha.isoformat()}_{tipo_turno}_C{camara}"
+            if len(lista) != 1:
                 _registrar_omision(
                     detalles,
-                    motivo="sin segmentos continuos procesables para turno y cámara.",
-                    nombre_video=f"MDVR_{carpeta_id}_{fecha.isoformat()}_{tipo_turno}_C{camara}",
+                    motivo=(
+                        f"varios segmentos detectados ({len(lista)}); "
+                        "no se juntan videos que vienen en partes."
+                    ),
+                    nombre_video=nombre_video,
                     omision_video=True,
                 )
                 continue
+            lista_procesable = [lista[0]]
             turno = turnos_creados.get(tipo_turno)
             if turno is None:
                 turno = _obtener_o_crear_turno(
@@ -2856,7 +2133,6 @@ def _importar_camion_mdvr(
                 )
                 turnos_creados[tipo_turno] = turno
 
-            nombre_video = f"MDVR_{carpeta_id}_{fecha.isoformat()}_{tipo_turno}_C{camara}"
             duracion_esperada = sum(
                 max(1, int((segmento.fin_dt - segmento.inicio_dt).total_seconds()))
                 for segmento in lista_procesable
@@ -2967,19 +2243,10 @@ def _importar_camion_mdvr(
                     importar_velocidades
                     and video_listo.estado_velocidades == EstadoVelocidadesVideo.PENDIENTE
                 ):
-                    inicio_para_xlsx = lista_procesable[0].inicio_dt
-                    if video_listo.fecha_inicio is not None:
-                        inicio_para_xlsx = video_listo.fecha_inicio
-                        if timezone.is_aware(inicio_para_xlsx):
-                            inicio_para_xlsx = timezone.localtime(inicio_para_xlsx).replace(
-                                tzinfo=None
-                            )
                     _programar_importacion_velocidades_turno(
                         turno=turno,
                         video_ref=video_listo,
-                        xlsx_files=xlsx_files,
-                        fecha_inicio=inicio_para_xlsx,
-                        xlsx_por_turno=xlsx_por_turno,
+                        tracks_por_fecha=tracks_por_fecha,
                         videos_referencia_por_turno=videos_referencia_por_turno,
                     )
                     continue
@@ -3031,19 +2298,10 @@ def _importar_camion_mdvr(
                     importar_velocidades
                     and video_incompleto.estado_velocidades == EstadoVelocidadesVideo.PENDIENTE
                 ):
-                    inicio_para_xlsx = lista_procesable[0].inicio_dt
-                    if video_incompleto.fecha_inicio is not None:
-                        inicio_para_xlsx = video_incompleto.fecha_inicio
-                        if timezone.is_aware(inicio_para_xlsx):
-                            inicio_para_xlsx = timezone.localtime(
-                                inicio_para_xlsx
-                            ).replace(tzinfo=None)
                     _programar_importacion_velocidades_turno(
                         turno=turno,
                         video_ref=video_incompleto,
-                        xlsx_files=xlsx_files,
-                        fecha_inicio=inicio_para_xlsx,
-                        xlsx_por_turno=xlsx_por_turno,
+                        tracks_por_fecha=tracks_por_fecha,
                         videos_referencia_por_turno=videos_referencia_por_turno,
                     )
                 _registrar_omision(
@@ -3095,7 +2353,6 @@ def _importar_camion_mdvr(
             video = video_existente
             tmp_dir = tempfile.mkdtemp(prefix="mdvr_")
             ruta_previa = ""
-            ruta_generada_en_intento = ""
             try:
                 ext_salida = ".mp4"
                 inicio_dt = lista_procesable[0].inicio_dt
@@ -3188,7 +2445,7 @@ def _importar_camion_mdvr(
                 preservar_timeline_mp4 = _debe_preservar_timeline_mp4(lista_procesable)
                 segmento_directo = _segmento_mp4_directo(lista_procesable)
                 if segmento_directo is not None:
-                    _registrar_mp4_directo(
+                    video = _registrar_mp4_directo(
                         video,
                         segmento_directo,
                         nombre_video=nombre_video,
@@ -3205,16 +2462,12 @@ def _importar_camion_mdvr(
                             inicio_procesamiento=video.procesamiento_iniciado_en,
                         )
                 else:
-                    ruta_salida = os.path.join(tmp_dir, f"{nombre_video}{ext_salida}")
-                    ok, error = _concatenar_segmentos(lista_procesable, ruta_salida)
-                    if not ok:
-                        raise ValidationError(f"No se pudo concatenar segmentos ({error}).")
-                    _validar_video_con_imagen_util(ruta_salida, contexto=nombre_video)
-
+                    segmento_unico = lista_procesable[0]
+                    conversion_raw_h264 = _resolver_conversion_raw_h264(segmento_unico)
                     destino_rel = _subir_archivo_temporal(
-                        ruta_salida, f"{nombre_video}{ext_salida}"
+                        segmento_unico.ruta,
+                        f"{nombre_video}{segmento_unico.extension}",
                     )
-                    ruta_generada_en_intento = destino_rel
                     video.ruta_archivo = destino_rel
                     video.save(update_fields=["ruta_archivo"])
 
@@ -3223,8 +2476,20 @@ def _importar_camion_mdvr(
                         video.ruta_archivo,
                         duracion_esperada=duracion_esperada,
                         normalizar_mp4=False,
+                        h264_fps_salida=conversion_raw_h264.get("fps"),
                     )
-                    if preservar_timeline_mp4:
+                    if (
+                        segmento_unico.extension in RAW_VIDEO_EXTENSIONS
+                        and conversion_raw_h264.get("fps")
+                    ):
+                        correccion_timing = {
+                            "aplicada": False,
+                            "omitida": True,
+                            "motivo": "raw_h264_reencode_con_fps_efectivo",
+                            "fps_salida": round(float(conversion_raw_h264["fps"]), 8),
+                            "fuente_fps": conversion_raw_h264.get("fuente") or "",
+                        }
+                    elif preservar_timeline_mp4:
                         correccion_timing = _correccion_timing_omitida_por_timeline_mp4()
                     else:
                         correccion_timing = _corregir_timing_video_si_corresponde(
@@ -3240,29 +2505,6 @@ def _importar_camion_mdvr(
                 if mapa_segmentos:
                     video.mapa_segmentos = mapa_segmentos
                     video.save(update_fields=["mapa_segmentos"])
-                if info_hueco and video.estado == EstadoVideo.LISTO:
-                    mensaje_hueco = _mensaje_video_cortado_en_hueco(info_hueco)
-                    video.estado = EstadoVideo.INCOMPLETO
-                    video.error_tipo = "incompleto"
-                    video.detalle_error = mensaje_hueco
-                    video.ultimo_error = mensaje_hueco
-                    video.reintentos = 0
-                    video.proximo_reintento_en = None
-                    video.save(
-                        update_fields=[
-                            "estado",
-                            "error_tipo",
-                            "detalle_error",
-                            "ultimo_error",
-                            "reintentos",
-                            "proximo_reintento_en",
-                        ]
-                    )
-                if video.estado in {EstadoVideo.LISTO, EstadoVideo.INCOMPLETO}:
-                    _validar_video_con_imagen_util(
-                        video.ruta_archivo.path,
-                        contexto=nombre_video,
-                    )
                 if (
                     video_existente
                     and ruta_previa
@@ -3300,25 +2542,11 @@ def _importar_camion_mdvr(
                     }
                 )
                 if video.estado == EstadoVideo.INCOMPLETO:
-                    if info_hueco:
-                        detalles["errores"].append(
-                            f"{nombre_video}: se procesó hasta el primer hueco detectado; "
-                            "se regenerará si aparece continuidad."
-                        )
                     if importar_velocidades:
-                        inicio_para_xlsx = inicio_dt
-                        if video.fecha_inicio is not None:
-                            inicio_para_xlsx = video.fecha_inicio
-                            if timezone.is_aware(inicio_para_xlsx):
-                                inicio_para_xlsx = timezone.localtime(
-                                    inicio_para_xlsx
-                                ).replace(tzinfo=None)
                         programado = _programar_importacion_velocidades_turno(
                             turno=turno,
                             video_ref=video,
-                            xlsx_files=xlsx_files,
-                            fecha_inicio=inicio_para_xlsx,
-                            xlsx_por_turno=xlsx_por_turno,
+                            tracks_por_fecha=tracks_por_fecha,
                             videos_referencia_por_turno=videos_referencia_por_turno,
                         )
                         if programado:
@@ -3333,9 +2561,7 @@ def _importar_camion_mdvr(
                     _programar_importacion_velocidades_turno(
                         turno=turno,
                         video_ref=video,
-                        xlsx_files=xlsx_files,
-                        fecha_inicio=inicio_dt,
-                        xlsx_por_turno=xlsx_por_turno,
+                        tracks_por_fecha=tracks_por_fecha,
                         videos_referencia_por_turno=videos_referencia_por_turno,
                     )
             except SoftTimeLimitExceeded as exc:
@@ -3345,23 +2571,6 @@ def _importar_camion_mdvr(
                 raise
             except Exception as exc:
                 if video is not None:
-                    if isinstance(exc, VideoSinImagenUtilError):
-                        ruta_actual = (video.ruta_archivo.name or "").strip()
-                        if ruta_previa:
-                            if ruta_actual and ruta_actual != ruta_previa:
-                                try:
-                                    default_storage.delete(ruta_actual)
-                                except Exception:
-                                    pass
-                            video.ruta_archivo.name = ruta_previa
-                            video.save(update_fields=["ruta_archivo"])
-                        elif ruta_actual and ruta_actual == ruta_generada_en_intento:
-                            try:
-                                default_storage.delete(ruta_actual)
-                            except Exception:
-                                pass
-                            video.ruta_archivo.name = ""
-                            video.save(update_fields=["ruta_archivo"])
                     estado_error = _marcar_video_para_reintento(video, timezone.now(), exc)
                     detalles["errores"].append(f"{nombre_video}: {estado_error}.")
                 else:
@@ -3391,19 +2600,20 @@ def _importar_camion_mdvr(
             continue
 
         for turno_id, video_ref in videos_referencia_por_turno.items():
-            ruta_xlsx = xlsx_por_turno.get(turno_id)
-            if not ruta_xlsx:
+            turno = video_ref.id_turno
+            ruta_tracks = tracks_por_fecha.get(turno.fecha)
+            if not ruta_tracks:
                 _actualizar_estado_velocidades_turno(
-                    video_ref.id_turno,
-                    EstadoVelocidadesVideo.SIN_XLSX,
-                    error="No se encontró XLSX asociado para este turno.",
+                    turno,
+                    EstadoVelocidadesVideo.SIN_TRACKS,
+                    error="No se encontró JSON de tracks CMSV6 asociado para este turno.",
                 )
                 continue
             try:
-                with open(ruta_xlsx, "rb") as archivo:
-                    importar_velocidades_xlsx(video_ref, archivo)
+                tracks = _leer_tracks_json(ruta_tracks)
+                importar_velocidades_cmsv6_tracks(turno, tracks)
                 _actualizar_estado_velocidades_turno(
-                    video_ref.id_turno,
+                    turno,
                     EstadoVelocidadesVideo.IMPORTADA,
                     actualizado_en=timezone.now(),
                 )
@@ -3411,12 +2621,12 @@ def _importar_camion_mdvr(
                 raise
             except Exception as exc:
                 _actualizar_estado_velocidades_turno(
-                    video_ref.id_turno,
+                    turno,
                     EstadoVelocidadesVideo.ERROR,
                     error=_normalizar_error(exc),
                 )
                 detalles["errores"].append(
-                    f"{video_ref.nombre}: error importando velocidades ({exc})."
+                    f"{video_ref.nombre}: error importando tracks CMSV6 ({exc})."
                 )
 
     return detalles

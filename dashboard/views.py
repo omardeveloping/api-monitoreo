@@ -4,20 +4,18 @@ import shutil
 from celery import current_app
 from celery.result import AsyncResult
 from datetime import datetime, timedelta
+from django.http import HttpResponse
 from rest_framework import viewsets, status
 from rest_framework.exceptions import ValidationError
-from rest_framework.parsers import FormParser, MultiPartParser
 from rest_framework.permissions import DjangoModelPermissions, IsAuthenticated
 from rest_framework.response import Response
 from rest_framework.decorators import action
 from django.conf import settings
-from django.core.files import File
 from django.core.files.storage import default_storage
 from django.utils import timezone
 from django.utils.text import get_valid_filename
 from .models import (
     Camion,
-    EstadoVelocidadesVideo,
     Turno,
     Video,
     Incidente,
@@ -27,33 +25,29 @@ from .serializers import (
     CamionSerializer,
     TurnoSerializer,
     VideoSerializer,
-    VideoImportSerializer,
     VelocidadTurnoSerializer,
     IncidenteSerializer,
 )
 from dashboard.services.calcular_duracion_video import (
     procesar_video_subida,
 )
-from dashboard.services.importar_velocidades_csv import importar_velocidades_csv
-from dashboard.services.importar_velocidades_xlsx import importar_velocidades_xlsx
 from dashboard.services.mdvr_weekly_status import resumen_semana_mdvr
 from dashboard.services.monitor_mdvr_state import (
     guardar_task_id_monitor_mdvr,
     limpiar_task_id_monitor_mdvr,
     obtener_task_id_monitor_mdvr,
 )
-from dashboard.services.preview_video import obtener_preview_video
-from dashboard.services.video_importacion import (
-    crear_video_desde_serializer,
-    crear_video_pendiente_desde_ruta_servidor,
-    listar_archivos_servidor,
-    obtener_base_importacion,
-    resolver_ruta_importacion,
+from dashboard.sync_test.service import (
+    estado_descarga_prueba_payload,
+    iniciar_descarga_prueba_payload,
+    servir_archivo_prueba,
+    sync_test_html,
+    sync_test_payload,
+    validar_sync_test_habilitado,
 )
 from dashboard.tasks import (
     CMSV6_MONITOR_MDVR_SEMANAL_TASK_ID,
     cmsv6_monitor_mdvr_semanal_task,
-    importar_video_desde_servidor_task,
     importar_videos_mdvr_task,
 )
 
@@ -593,7 +587,17 @@ class VideoViewSet(viewsets.ModelViewSet):
     permission_classes = [IsAuthenticated, DjangoModelPermissions]
 
     def perform_create(self, serializer):
-        return crear_video_desde_serializer(serializer)
+        video = serializer.save(procesamiento_iniciado_en=timezone.now())
+        archivo = serializer.validated_data.get("ruta_archivo")
+        try:
+            procesar_video_subida(video, archivo)
+        except Exception:
+            if getattr(video, "ruta_archivo", None):
+                default_storage.delete(video.ruta_archivo.name)
+            if video.pk:
+                video.delete()
+            raise
+        return video
 
     def create(self, request, *args, **kwargs):
         serializer = self.get_serializer(data=request.data)
@@ -603,121 +607,39 @@ class VideoViewSet(viewsets.ModelViewSet):
         headers = self.get_success_headers(response_serializer.data)
         return Response(response_serializer.data, status=status.HTTP_201_CREATED, headers=headers)
 
-    @action(detail=False, methods=["post"], url_path="importar-desde-servidor")
-    def importar_desde_servidor(self, request):
-        serializer = VideoImportSerializer(data=request.data)
-        serializer.is_valid(raise_exception=True)
-        base_dir_real = obtener_base_importacion()
-        ruta_origen, origen_real = resolver_ruta_importacion(
-            base_dir_real,
-            serializer.validated_data["ruta_origen"],
-        )
-        video = crear_video_pendiente_desde_ruta_servidor(
-            serializer.validated_data,
-            origen_real,
-            ruta_origen=ruta_origen,
-        )
-        task = importar_video_desde_servidor_task.delay(
-            video.pk,
-            ruta_origen,
-            serializer.validated_data.get("duracion_esperada_segundos"),
-        )
-        response_serializer = VideoSerializer(video, context={"request": request})
-        data = dict(response_serializer.data)
-        data["task_id"] = task.id
-        data["encolado"] = True
-        return Response(data, status=status.HTTP_202_ACCEPTED)
+    @action(detail=False, methods=["get"], url_path="test-sync-data")
+    def test_sync_data(self, request):
+        """Datos agrupados por dia/turno/camara para diagnosticar sincronizacion."""
+        validar_sync_test_habilitado()
+        return Response(sync_test_payload(request))
 
-    @action(detail=False, methods=["get"], url_path="archivos-servidor")
-    def archivos_servidor(self, request):
-        base_dir_real = obtener_base_importacion()
-
-        include_all = request.query_params.get("todo", "").lower() in {"1", "true", "yes"}
-        exts_param = (request.query_params.get("extensiones") or "").strip()
-        if exts_param:
-            extensiones = {
-                ext.strip().lower()
-                for ext in exts_param.split(",")
-                if ext.strip()
-            }
-        else:
-            extensiones = {".mp4", ".h264", ".grec"}
-
-        try:
-            limit = int(request.query_params.get("limit", 500))
-            offset = int(request.query_params.get("offset", 0))
-        except ValueError as exc:
-            raise ValidationError("Los parámetros 'limit' y 'offset' deben ser enteros.") from exc
-
-        if limit < 0 or offset < 0:
-            raise ValidationError("Los parámetros 'limit' y 'offset' deben ser >= 0.")
-
-        limit = min(limit, 5000)
-        return Response(
-            listar_archivos_servidor(
-                base_dir_real,
-                include_all=include_all,
-                extensiones=extensiones,
-                limit=limit,
-                offset=offset,
-            )
+    @action(detail=False, methods=["get"], url_path="test-sync")
+    def test_sync(self, request):
+        """Pagina HTML backend-only para probar sincronizacion de 4 camaras."""
+        validar_sync_test_habilitado()
+        payload = sync_test_payload(request)
+        data_url = request.build_absolute_uri("../test-sync-data/")
+        download_url = request.build_absolute_uri("../test-sync-descargar/")
+        download_status_url = request.build_absolute_uri("../test-sync-descarga-status/")
+        return HttpResponse(
+            sync_test_html(payload, data_url, download_url, download_status_url),
+            content_type="text/html; charset=utf-8",
         )
 
-    @action(detail=False, methods=["get"], url_path="preview-servidor")
-    def preview_servidor(self, request):
-        base_dir_real = obtener_base_importacion()
-        ruta_origen, origen_real = resolver_ruta_importacion(
-            base_dir_real,
-            request.query_params.get("ruta_origen"),
-        )
+    @action(detail=False, methods=["get"], url_path="test-sync-descargar")
+    def test_sync_descargar(self, request):
+        """Descarga local aislada de 2+ camaras para diagnosticar sincronizacion."""
+        return Response(iniciar_descarga_prueba_payload(request))
 
-        preview_rel, cached = obtener_preview_video(origen_real, ruta_origen)
+    @action(detail=False, methods=["get"], url_path="test-sync-descarga-status")
+    def test_sync_descarga_status(self, request):
+        """Estado/logs de una descarga local de test."""
+        return Response(estado_descarga_prueba_payload(request))
 
-        media_url = settings.MEDIA_URL or "/media/"
-        if not media_url.endswith("/"):
-            media_url = f"{media_url}/"
-        preview_url = request.build_absolute_uri(f"{media_url}{preview_rel}")
-
-        return Response(
-            {
-                "ruta_origen": ruta_origen.replace(os.sep, "/"),
-                "preview_rel": preview_rel,
-                "preview_url": preview_url,
-                "cached": cached,
-                "duracion_segundos": 5,
-            }
-        )
-
-    @action(
-        detail=True,
-        methods=["post"],
-        url_path="velocidades-csv",
-        parser_classes=[MultiPartParser, FormParser],
-    )
-    def cargar_velocidades_csv(self, request, pk=None):
-        video = self.get_object()
-        archivo = request.FILES.get("archivo") or request.FILES.get("csv")
-        if not archivo:
-            raise ValidationError("Debe adjuntar un archivo CSV o XLSX en 'archivo'.")
-        try:
-            ext = os.path.splitext(getattr(archivo, "name", "") or "")[1].lower()
-            if ext in {".xlsx", ".xls"}:
-                resultado = importar_velocidades_xlsx(video, archivo)
-            else:
-                resultado = importar_velocidades_csv(video, archivo)
-        except Exception as exc:
-            Video.objects.filter(id_turno=video.id_turno).update(
-                estado_velocidades=EstadoVelocidadesVideo.ERROR,
-                velocidades_actualizadas_en=None,
-                velocidades_error=(str(exc) or exc.__class__.__name__).strip()[:2000],
-            )
-            raise
-        Video.objects.filter(id_turno=video.id_turno).update(
-            estado_velocidades=EstadoVelocidadesVideo.IMPORTADA,
-            velocidades_actualizadas_en=timezone.now(),
-            velocidades_error="",
-        )
-        return Response(resultado, status=status.HTTP_201_CREATED)
+    @action(detail=False, methods=["get"], url_path="test-sync-file")
+    def test_sync_file(self, request):
+        """Sirve archivos MP4 de la carpeta local de test."""
+        return servir_archivo_prueba(request)
 
     @action(detail=True, methods=["get"], url_path="velocidades")
     def velocidades(self, request, pk=None):

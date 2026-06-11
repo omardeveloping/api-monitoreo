@@ -8,12 +8,7 @@ from django.shortcuts import redirect, render
 from django.urls import reverse
 from django.views.decorators.http import require_GET, require_POST
 
-from dashboard.tasks import (
-    cmsv6_analizar_mp4_task,
-    cmsv6_descargar_task,
-    cmsv6_recortar_mp4_task,
-    cmsv6_reparar_mp4_task,
-)
+from dashboard.tasks import cmsv6_descargar_task
 
 
 def _bool_post(post, name: str, default=False) -> bool:
@@ -90,7 +85,6 @@ def cmsv6_panel(request):
         "dashboard/cmsv6_panel.html",
         {
             "task_id": request.GET.get("task_id", ""),
-            "mp4_task_id": request.GET.get("mp4_task_id", ""),
             "cmsv6_output_dir": settings.CMSV6_OUTPUT_DIR,
             "cmsv6_device_id": settings.CMSV6_DEVICE_ID,
             "cmsv6_base_url": settings.CMSV6_BASE_URL,
@@ -118,19 +112,3 @@ def cmsv6_cancelar(request, task_id):
     current_app.control.revoke(task_id, terminate=True, signal="SIGTERM")
     messages.warning(request, f"Cancelacion solicitada para {task_id}")
     return redirect(f"{reverse('cmsv6-panel')}?task_id={task_id}")
-
-
-@login_required
-@require_POST
-def cmsv6_mp4(request):
-    ruta = (request.POST.get("ruta_mp4") or "").strip()
-    output_dir = (request.POST.get("output_dir") or "").strip() or settings.CMSV6_OUTPUT_DIR
-    accion = request.POST.get("accion_mp4") or "analizar"
-    if accion == "reparar":
-        task = cmsv6_reparar_mp4_task.delay(ruta, output_dir=output_dir)
-    elif accion == "recortar":
-        task = cmsv6_recortar_mp4_task.delay(ruta, output_dir=output_dir)
-    else:
-        task = cmsv6_analizar_mp4_task.delay(ruta, output_dir=output_dir)
-    messages.success(request, f"Tarea MP4 encolada: {task.id}")
-    return redirect(f"{reverse('cmsv6-panel')}?mp4_task_id={task.id}")

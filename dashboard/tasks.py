@@ -7,15 +7,11 @@ import time
 from django.conf import settings
 from django.utils import timezone
 
-from .models import EstadoVideo, Turno, Video
+from .models import Turno
 from dashboard.services.cmsv6_downloader import (
     CMSV6Config,
-    analizar_mp4_reporte,
     ejecutar_job_cmsv6,
     ejecutar_rango,
-    recortar_mp4_en_salida,
-    reparar_mp4_en_salida,
-    resolver_ruta_cmsv6_output,
 )
 from dashboard.services.programar_turnos import (
     crear_turnos_diarios,
@@ -27,14 +23,6 @@ from dashboard.services.monitor_mdvr_state import (
     obtener_task_id_monitor_mdvr,
 )
 from dashboard.services.turnos_tiempo import esta_activo, esta_completado
-from dashboard.services.video_importacion import (
-    _validated_data_desde_video,
-    crear_video_desde_ruta_servidor,
-    marcar_video_con_error,
-    obtener_base_importacion,
-    resolver_ruta_importacion,
-)
-
 
 CMSV6_MONITOR_MDVR_SEMANAL_TASK_ID = MONITOR_MDVR_SEMANAL_ID_LOGICO
 
@@ -92,38 +80,6 @@ def importar_videos_mdvr_task(
         fecha_objetivo=fecha_objetivo,
         forzar_reproceso=forzar_reproceso,
     )
-
-
-@shared_task(bind=True)
-def importar_video_desde_servidor_task(
-    self,
-    video_id: int,
-    ruta_origen: str,
-    duracion_esperada_segundos: int | None = None,
-):
-    video = Video.objects.select_related("id_turno").get(pk=video_id)
-    try:
-        base_dir_real = obtener_base_importacion()
-        ruta_origen, origen_real = resolver_ruta_importacion(base_dir_real, ruta_origen)
-        validated_data = _validated_data_desde_video(
-            video,
-            duracion_esperada_segundos=duracion_esperada_segundos,
-        )
-        resultado = crear_video_desde_ruta_servidor(
-            validated_data,
-            origen_real,
-            ruta_origen=ruta_origen,
-            video_obj=video,
-        )
-    except Exception as exc:
-        video.refresh_from_db(fields=["estado", "detalle_error"])
-        if video.estado != EstadoVideo.ERROR or not video.detalle_error:
-            marcar_video_con_error(video, exc)
-        raise
-
-    if resultado.pk != video.pk:
-        Video.objects.filter(pk=video.pk).exclude(estado=EstadoVideo.LISTO).delete()
-    return {"video_id": resultado.pk, "estado": resultado.estado}
 
 
 class _TaskReporter:
@@ -395,9 +351,9 @@ def cmsv6_monitor_mdvr_semanal_task(self, params: dict | None = None):
     """
     Mantiene una descarga cíclica CMSV6 para la semana actual.
 
-    La tarea descarga videos y XLSX de ruta GPS en la estructura MDVR esperada,
-    luego importa a modelos Django por día para evitar recorrer material histórico
-    fuera de la ventana monitoreada.
+    La tarea descarga videos y tracks CMSV6 en la estructura MDVR esperada, luego
+    importa a modelos Django por día para evitar recorrer material histórico fuera
+    de la ventana monitoreada.
     """
     params = dict(params or {})
     max_logs = _param_int(params, "max_logs", 500, minimum=50)
@@ -562,39 +518,3 @@ def asegurar_monitor_mdvr_semanal_task(params: dict | None = None):
         "task_id": task.id,
         "monitor_id": CMSV6_MONITOR_MDVR_SEMANAL_TASK_ID,
     }
-
-
-@shared_task(bind=True)
-def cmsv6_analizar_mp4_task(self, ruta: str, output_dir: str | None = None):
-    reporter = _TaskReporter(self)
-    reporter.progress_cb(5, "Resolviendo archivo...")
-    path = resolver_ruta_cmsv6_output(ruta, output_dir=output_dir)
-    reporter.log(f"Analizando {path}")
-    reporter.progress_cb(20, "Analizando MP4...")
-    reporte = analizar_mp4_reporte(path)
-    reporter.progress_cb(100, "Completado")
-    return reporter.final_payload(reporte=reporte, archivo=str(path))
-
-
-@shared_task(bind=True)
-def cmsv6_reparar_mp4_task(self, ruta: str, output_dir: str | None = None):
-    reporter = _TaskReporter(self)
-    reporter.progress_cb(5, "Resolviendo archivo...")
-    reporter.log(f"Reparando {ruta}")
-    reporter.progress_cb(20, "Reparando MP4...")
-    resultado = reparar_mp4_en_salida(ruta, output_dir=output_dir)
-    reporter.logs.extend(resultado.get("logs") or [])
-    reporter.progress_cb(100, "Completado" if resultado.get("ok") else "Reparacion fallida")
-    return reporter.final_payload(resultado=resultado)
-
-
-@shared_task(bind=True)
-def cmsv6_recortar_mp4_task(self, ruta: str, output_dir: str | None = None):
-    reporter = _TaskReporter(self)
-    reporter.progress_cb(5, "Resolviendo archivo...")
-    reporter.log(f"Recortando {ruta}")
-    reporter.progress_cb(20, "Recortando MP4...")
-    resultado = recortar_mp4_en_salida(ruta, output_dir=output_dir)
-    reporter.logs.extend(resultado.get("logs") or [])
-    reporter.progress_cb(100, "Completado" if resultado.get("ok") else "Recorte fallido")
-    return reporter.final_payload(resultado=resultado)

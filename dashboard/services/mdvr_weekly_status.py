@@ -11,11 +11,11 @@ from dashboard.models import Camion, EstadoVideo, Turno, Video
 
 _ID_PREFIX_RE = re.compile(r"^(?P<id>\d+)")
 _SEGMENTO_RE = re.compile(
-    r"^(?P<equipo>\d+)-(?P<camara>\d{2})-(?P<inicio>\d{6})-(?P<fin>\d{6})-.*\.(?P<ext>h264|grec|mp4)$",
+    r"^(?P<equipo>\d+)-(?P<camara>\d{2})-(?P<inicio>\d{6})-(?P<fin>\d{6})-.*\.(?P<ext>h264|mp4)$",
     re.IGNORECASE,
 )
 _SEGMENTO_NUEVO_RE = re.compile(
-    r"^(?P<equipo>\d+)-(?P<fecha>\d{6})-(?P<inicio>\d{6})-(?P<fin>\d{6})-(?P<codigo>\d+)\.(?P<ext>grec|mp4)$",
+    r"^(?P<equipo>\d+)-(?P<fecha>\d{6})-(?P<inicio>\d{6})-(?P<fin>\d{6})-(?P<codigo>\d+)\.(?P<ext>mp4)$",
     re.IGNORECASE,
 )
 

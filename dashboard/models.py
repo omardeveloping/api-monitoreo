@@ -73,7 +73,7 @@ class EstadoVideo(models.TextChoices):
 class EstadoVelocidadesVideo(models.TextChoices):
     PENDIENTE = "pendiente", "Pendiente"
     IMPORTADA = "importada", "Importada"
-    SIN_XLSX = "sin_xlsx", "Sin XLSX"
+    SIN_TRACKS = "sin_xlsx", "Sin tracks CMSV6"
     ERROR = "error", "Error"
 
 

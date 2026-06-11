@@ -1,6 +1,5 @@
 import datetime
 import os
-import subprocess
 import tempfile
 from collections import namedtuple
 from types import SimpleNamespace
@@ -24,19 +23,15 @@ from dashboard.models import (
 )
 from dashboard.serializers import VideoSerializer
 from dashboard.services.cmsv6_downloader import nombre_video_cmsv6
-from dashboard.services.importar_velocidades_csv import importar_velocidades_tabulares
+from dashboard.services.importar_velocidades_cmsv6 import importar_velocidades_cmsv6_tracks
 from dashboard.services.importar_videos_mdvr import (
-    SegmentoVideo,
     _archivo_listo_para_importar,
     _actualizar_estado_velocidades,
     _importar_camion_mdvr,
     _calcular_backoff_reintento,
     _alinear_duraciones,
-    _concat_h264_transcodificando,
-    _concatenar_segmentos,
     _es_error_transitorio,
     _puede_reprocesarse,
-    _segmentos_contiguos_hasta_primer_hueco,
     _segmento_desde_archivo,
 )
 from dashboard.views import (
@@ -243,7 +238,7 @@ class SegmentoDesdeArchivoTests(SimpleTestCase):
     def test_nombre_cmsv6_sintetico_es_compatible_con_parser_mdvr(self):
         nombre = nombre_video_cmsv6(
             {
-                "file": "/mnt/mdvr/4462510196-260202-041706-051706-00000000.grec",
+                "file": "/mnt/mdvr/4462510196-260202-041706-051706-00000000.h264",
                 "chn": 2,
                 "beg": 41706,
                 "end": 51706,
@@ -267,15 +262,12 @@ class SegmentoDesdeArchivoTests(SimpleTestCase):
         self.assertEqual(segmento.inicio_dt.time(), datetime.time(11, 46, 14))
         self.assertEqual(segmento.fin_dt.time(), datetime.time(12, 1, 14))
 
-    def test_soporta_formato_grec_nuevo_con_datos_completos(self):
+    def test_descarta_formato_grec_nuevo(self):
         segmento = _segmento_desde_archivo(
             "/tmp/4462510196-260202-041706-051706-20010300.grec",
             datetime.date(2026, 2, 2),
         )
-        self.assertIsNotNone(segmento)
-        self.assertEqual(segmento.camara, 3)
-        self.assertEqual(segmento.inicio_dt.time(), datetime.time(4, 17, 6))
-        self.assertEqual(segmento.fin_dt.time(), datetime.time(5, 17, 6))
+        self.assertIsNone(segmento)
 
     def test_soporta_formato_mdvr_legacy_en_mp4(self):
         segmento = _segmento_desde_archivo(
@@ -287,7 +279,7 @@ class SegmentoDesdeArchivoTests(SimpleTestCase):
         self.assertEqual(segmento.inicio_dt.time(), datetime.time(11, 46, 14))
         self.assertEqual(segmento.fin_dt.time(), datetime.time(12, 1, 14))
 
-    def test_soporta_formato_grec_nuevo_en_mp4(self):
+    def test_soporta_formato_nuevo_en_mp4(self):
         segmento = _segmento_desde_archivo(
             "/tmp/4462510196-260202-041706-051706-20010300.mp4",
             datetime.date(2026, 2, 2),
@@ -297,16 +289,16 @@ class SegmentoDesdeArchivoTests(SimpleTestCase):
         self.assertEqual(segmento.inicio_dt.time(), datetime.time(4, 17, 6))
         self.assertEqual(segmento.fin_dt.time(), datetime.time(5, 17, 6))
 
-    def test_formato_grec_nuevo_se_descarta_si_fecha_no_coincide(self):
+    def test_formato_nuevo_mp4_se_descarta_si_fecha_no_coincide(self):
         segmento = _segmento_desde_archivo(
-            "/tmp/4462510196-260202-041706-051706-20010300.grec",
+            "/tmp/4462510196-260202-041706-051706-20010300.mp4",
             datetime.date(2026, 2, 3),
         )
         self.assertIsNone(segmento)
 
-    def test_formato_grec_nuevo_se_descarta_si_camara_no_es_valida(self):
+    def test_formato_nuevo_mp4_se_descarta_si_camara_no_es_valida(self):
         segmento = _segmento_desde_archivo(
-            "/tmp/4462510196-260202-041706-051706-20019900.grec",
+            "/tmp/4462510196-260202-041706-051706-20019900.mp4",
             datetime.date(2026, 2, 2),
         )
         self.assertIsNone(segmento)
@@ -356,7 +348,7 @@ class ArchivoListoMdvrTests(SimpleTestCase):
 
 
 class ImportarMdvrBackfillVelocidadesTests(TestCase):
-    def test_video_listo_pendiente_reintenta_carga_xlsx(self):
+    def test_video_listo_pendiente_reintenta_carga_tracks(self):
         camion = Camion.objects.create(
             patente="BKCD11",
             carpeta_id="4462510196",
@@ -392,12 +384,12 @@ class ImportarMdvrBackfillVelocidadesTests(TestCase):
             with open(segmento, "wb") as fh:
                 fh.write(b"dummy-segment")
 
-            ruta_xlsx = os.path.join(
+            ruta_tracks = os.path.join(
                 base_dir,
-                "4462510196 2026-02-18 00-00-00~2026-02-18 23-59-59.xlsx",
+                "4462510196 2026-02-18_tracks.json",
             )
-            with open(ruta_xlsx, "wb") as fh:
-                fh.write(b"dummy-xlsx")
+            with open(ruta_tracks, "w", encoding="utf-8") as fh:
+                fh.write('{"tracks":[{"gpsTime":"2026-02-18 08:00:47","speed":1}]}')
 
             with patch(
                 "dashboard.services.importar_videos_mdvr.MIN_ANTIGUEDAD_ARCHIVO_SEGUNDOS",
@@ -406,7 +398,7 @@ class ImportarMdvrBackfillVelocidadesTests(TestCase):
                 "dashboard.services.importar_videos_mdvr.default_storage.exists",
                 return_value=True,
             ), patch(
-                "dashboard.services.importar_videos_mdvr.importar_velocidades_xlsx",
+                "dashboard.services.importar_videos_mdvr.importar_velocidades_cmsv6_tracks",
                 return_value={"guardadas": 1},
             ) as importar_mock, patch(
                 "dashboard.services.importar_videos_mdvr.procesar_video_subida"
@@ -420,7 +412,7 @@ class ImportarMdvrBackfillVelocidadesTests(TestCase):
 
         self.assertEqual(detalle["videos_creados"], 0)
         self.assertEqual(importar_mock.call_count, 1)
-        self.assertEqual(importar_mock.call_args.args[0].id, video.id)
+        self.assertEqual(importar_mock.call_args.args[0].id, turno.id)
         procesar_video_mock.assert_not_called()
 
         video.refresh_from_db()
@@ -428,7 +420,7 @@ class ImportarMdvrBackfillVelocidadesTests(TestCase):
         self.assertEqual(video.velocidades_error, "")
         self.assertIsNotNone(video.velocidades_actualizadas_en)
 
-    def test_video_incompleto_pendiente_reintenta_carga_xlsx(self):
+    def test_video_incompleto_pendiente_reintenta_carga_tracks(self):
         camion = Camion.objects.create(
             patente="BKCD10",
             carpeta_id="4462510195",
@@ -464,12 +456,12 @@ class ImportarMdvrBackfillVelocidadesTests(TestCase):
             with open(segmento, "wb") as fh:
                 fh.write(b"dummy-segment")
 
-            ruta_xlsx = os.path.join(
+            ruta_tracks = os.path.join(
                 base_dir,
-                "4462510195 2026-02-18 00-00-00~2026-02-18 23-59-59.xlsx",
+                "4462510195 2026-02-18_tracks.json",
             )
-            with open(ruta_xlsx, "wb") as fh:
-                fh.write(b"dummy-xlsx")
+            with open(ruta_tracks, "w", encoding="utf-8") as fh:
+                fh.write('{"tracks":[{"gpsTime":"2026-02-18 08:00:47","speed":1}]}')
 
             with patch(
                 "dashboard.services.importar_videos_mdvr.MIN_ANTIGUEDAD_ARCHIVO_SEGUNDOS",
@@ -484,7 +476,7 @@ class ImportarMdvrBackfillVelocidadesTests(TestCase):
                 "dashboard.services.importar_videos_mdvr.calcular_duracion_video",
                 return_value=654.0,
             ), patch(
-                "dashboard.services.importar_videos_mdvr.importar_velocidades_xlsx",
+                "dashboard.services.importar_videos_mdvr.importar_velocidades_cmsv6_tracks",
                 return_value={"guardadas": 1},
             ) as importar_mock, patch(
                 "dashboard.services.importar_videos_mdvr.procesar_video_subida"
@@ -498,7 +490,7 @@ class ImportarMdvrBackfillVelocidadesTests(TestCase):
 
         self.assertEqual(detalle["videos_creados"], 0)
         self.assertEqual(importar_mock.call_count, 1)
-        self.assertEqual(importar_mock.call_args.args[0].id, video.id)
+        self.assertEqual(importar_mock.call_args.args[0].id, turno.id)
         procesar_video_mock.assert_not_called()
 
         video.refresh_from_db()
@@ -509,7 +501,7 @@ class ImportarMdvrBackfillVelocidadesTests(TestCase):
         self.assertEqual(video.velocidades_error, "")
         self.assertIsNotNone(video.velocidades_actualizadas_en)
 
-    def test_video_listo_sin_xlsx_no_reintenta(self):
+    def test_video_listo_sin_tracks_no_reintenta(self):
         camion = Camion.objects.create(
             patente="BKCD12",
             carpeta_id="4462510197",
@@ -529,8 +521,8 @@ class ImportarMdvrBackfillVelocidadesTests(TestCase):
             fecha_subida=datetime.date(2026, 2, 19),
             inicio_timestamp=datetime.time(8, 0, 47),
             estado=EstadoVideo.LISTO,
-            estado_velocidades=EstadoVelocidadesVideo.SIN_XLSX,
-            velocidades_error="No se encontró XLSX asociado para este video.",
+            estado_velocidades=EstadoVelocidadesVideo.SIN_TRACKS,
+            velocidades_error="No se encontró JSON de tracks CMSV6 asociado para este video.",
             id_turno=turno,
         )
 
@@ -550,7 +542,7 @@ class ImportarMdvrBackfillVelocidadesTests(TestCase):
                 "dashboard.services.importar_videos_mdvr.MIN_ANTIGUEDAD_ARCHIVO_SEGUNDOS",
                 0,
             ), patch(
-                "dashboard.services.importar_videos_mdvr.importar_velocidades_xlsx",
+                "dashboard.services.importar_videos_mdvr.importar_velocidades_cmsv6_tracks",
                 return_value={"guardadas": 1},
             ) as importar_mock:
                 detalle = _importar_camion_mdvr(
@@ -563,9 +555,9 @@ class ImportarMdvrBackfillVelocidadesTests(TestCase):
         self.assertEqual(detalle["videos_creados"], 0)
         self.assertEqual(importar_mock.call_count, 0)
         video.refresh_from_db()
-        self.assertEqual(video.estado_velocidades, EstadoVelocidadesVideo.SIN_XLSX)
+        self.assertEqual(video.estado_velocidades, EstadoVelocidadesVideo.SIN_TRACKS)
 
-    def test_mp4_unico_se_registra_directo_sin_concatenar_ni_procesar(self):
+    def test_mp4_unico_se_registra_directo_sin_unir_ni_procesar(self):
         camion = Camion.objects.create(
             patente="BKCD13",
             carpeta_id="4462510198",
@@ -596,8 +588,6 @@ class ImportarMdvrBackfillVelocidadesTests(TestCase):
                 "dashboard.services.importar_videos_mdvr.calcular_duracion_video",
                 return_value=3602.0,
             ) as duracion_mock, patch(
-                "dashboard.services.importar_videos_mdvr._concatenar_segmentos"
-            ) as concat_mock, patch(
                 "dashboard.services.importar_videos_mdvr.procesar_video_subida"
             ) as procesar_video_mock:
                 detalle = _importar_camion_mdvr(
@@ -616,7 +606,6 @@ class ImportarMdvrBackfillVelocidadesTests(TestCase):
         self.assertEqual(video.segmentos_origen, ["201-02-000000-010002-17p000.mp4"])
         self.assertEqual(video.fecha_fin.time(), datetime.time(1, 0, 2))
         self.assertGreaterEqual(duracion_mock.call_count, 1)
-        concat_mock.assert_not_called()
         procesar_video_mock.assert_not_called()
 
 
@@ -746,202 +735,6 @@ class AlineacionVideosMdvrTests(SimpleTestCase):
         self.assertEqual(recortar_mock.call_args.kwargs, {})
 
 
-class ConcatenacionSegmentosMdvrTests(SimpleTestCase):
-    def _segmento(
-        self,
-        ruta: str,
-        extension: str,
-        *,
-        base: datetime.datetime | None = None,
-    ) -> SegmentoVideo:
-        if base is None:
-            base = datetime.datetime(2026, 2, 15, 8, 0, 0)
-        return SegmentoVideo(
-            ruta=ruta,
-            camara=1,
-            inicio_dt=base,
-            fin_dt=base + datetime.timedelta(minutes=10),
-            extension=extension,
-        )
-
-    def test_segmentos_mp4_omiten_concat_binaria(self):
-        segmentos = [self._segmento("/tmp/a.mp4", ".mp4")]
-        with patch(
-            "dashboard.services.importar_videos_mdvr._concat_h264",
-            return_value=(True, None),
-        ) as concat_raw, patch(
-            "dashboard.services.importar_videos_mdvr._concat_mp4_copiando",
-            return_value=(True, None),
-        ) as concat_copy, patch(
-            "dashboard.services.importar_videos_mdvr._concat_h264_transcodificando",
-            return_value=(True, None),
-        ) as concat_ffmpeg:
-            ok, _error = _concatenar_segmentos(segmentos, "/tmp/salida.mp4")
-
-        self.assertTrue(ok)
-        concat_raw.assert_not_called()
-        concat_copy.assert_called_once_with(["/tmp/a.mp4"], "/tmp/salida.mp4")
-        concat_ffmpeg.assert_not_called()
-
-    def test_segmentos_mp4_caen_a_transcode_si_copy_falla(self):
-        segmentos = [self._segmento("/tmp/a.mp4", ".mp4")]
-        with patch(
-            "dashboard.services.importar_videos_mdvr._concat_h264",
-            return_value=(True, None),
-        ) as concat_raw, patch(
-            "dashboard.services.importar_videos_mdvr._concat_mp4_copiando",
-            return_value=(False, "fallo copy"),
-        ) as concat_copy, patch(
-            "dashboard.services.importar_videos_mdvr._concat_h264_transcodificando",
-            return_value=(True, None),
-        ) as concat_ffmpeg:
-            ok, _error = _concatenar_segmentos(segmentos, "/tmp/salida.mp4")
-
-        self.assertTrue(ok)
-        concat_raw.assert_not_called()
-        concat_copy.assert_called_once_with(["/tmp/a.mp4"], "/tmp/salida.mp4")
-        concat_ffmpeg.assert_called_once_with(["/tmp/a.mp4"], "/tmp/salida.mp4")
-
-    def test_segmentos_con_hueco_no_fuerzan_padding(self):
-        base = datetime.datetime(2026, 3, 30, 16, 0, 0)
-        segmentos = [
-            self._segmento("/tmp/a.mp4", ".mp4", base=base),
-            self._segmento("/tmp/b.mp4", ".mp4", base=base + datetime.timedelta(hours=1)),
-        ]
-        with patch(
-            "dashboard.services.importar_videos_mdvr._preparar_segmentos_para_concat",
-            return_value=(["/tmp/a.mp4", "/tmp/b.mp4"], [], False),
-        ) as preparar, patch(
-            "dashboard.services.importar_videos_mdvr._concat_mp4_copiando",
-            return_value=(True, None),
-        ) as concat_copy, patch(
-            "dashboard.services.importar_videos_mdvr._concat_h264_transcodificando",
-            return_value=(True, None),
-        ) as concat_ffmpeg:
-            ok, _error = _concatenar_segmentos(segmentos, "/tmp/salida.mp4")
-
-        self.assertTrue(ok)
-        preparar.assert_called_once()
-        concat_copy.assert_called_once_with(["/tmp/a.mp4", "/tmp/b.mp4"], "/tmp/salida.mp4")
-        concat_ffmpeg.assert_not_called()
-
-    def test_segmentos_contiguos_hasta_primer_hueco_cortan_en_salto(self):
-        base = datetime.datetime(2026, 3, 30, 16, 0, 0)
-        segmentos = [
-            SegmentoVideo(
-                ruta="/tmp/c2_a.mp4",
-                camara=2,
-                inicio_dt=base,
-                fin_dt=base + datetime.timedelta(minutes=23),
-                extension=".mp4",
-            ),
-            SegmentoVideo(
-                ruta="/tmp/c2_b.mp4",
-                camara=2,
-                inicio_dt=base + datetime.timedelta(hours=1, minutes=29),
-                fin_dt=base + datetime.timedelta(hours=1, minutes=59),
-                extension=".mp4",
-            ),
-            SegmentoVideo(
-                ruta="/tmp/c2_c.mp4",
-                camara=2,
-                inicio_dt=base + datetime.timedelta(hours=2, minutes=21),
-                fin_dt=base + datetime.timedelta(hours=3),
-                extension=".mp4",
-            ),
-        ]
-
-        with patch(
-            "dashboard.services.importar_videos_mdvr._duracion_segmento_real",
-            side_effect=[23 * 60, 30 * 60, 39 * 60],
-        ):
-            continuos, info_hueco = _segmentos_contiguos_hasta_primer_hueco(segmentos)
-
-        self.assertEqual([seg.ruta for seg in continuos], ["/tmp/c2_a.mp4"])
-        self.assertIsNotNone(info_hueco)
-        self.assertEqual(info_hueco["segmentos_omitidos"], 2)
-        self.assertGreater(info_hueco["duracion_segundos"], 0)
-
-    def test_construir_mapa_segmentos_preserva_huecos_reales(self):
-        from dashboard.services import importar_videos_mdvr as mdvr
-
-        base = datetime.datetime(2026, 3, 30, 16, 0, 0)
-        segmentos = [
-            SegmentoVideo(
-                ruta="/tmp/c2_a.mp4",
-                camara=2,
-                inicio_dt=base,
-                fin_dt=base + datetime.timedelta(minutes=23),
-                extension=".mp4",
-            ),
-            SegmentoVideo(
-                ruta="/tmp/c2_b.mp4",
-                camara=2,
-                inicio_dt=base + datetime.timedelta(hours=1, minutes=29),
-                fin_dt=base + datetime.timedelta(hours=1, minutes=59),
-                extension=".mp4",
-            ),
-            SegmentoVideo(
-                ruta="/tmp/c2_c.mp4",
-                camara=2,
-                inicio_dt=base + datetime.timedelta(hours=2, minutes=21),
-                fin_dt=base + datetime.timedelta(hours=3),
-                extension=".mp4",
-            ),
-        ]
-
-        with patch(
-            "dashboard.services.importar_videos_mdvr._duracion_segmento_real",
-            side_effect=[23 * 60, 30 * 60, 39 * 60],
-        ):
-            mapa = mdvr._construir_mapa_segmentos(segmentos, 3 * 3600)
-
-        self.assertEqual(len(mapa), 3)
-        self.assertEqual(mapa[0]["video_inicio_segundo"], 0)
-        self.assertEqual(mapa[0]["video_fin_segundo"], 1379)
-        self.assertEqual(mapa[1]["video_inicio_segundo"], 5340)
-        self.assertEqual(mapa[1]["video_fin_segundo"], 7139)
-        self.assertEqual(mapa[2]["video_inicio_segundo"], 8460)
-        self.assertEqual(mapa[2]["video_fin_segundo"], 10799)
-
-    def test_segmentos_raw_intentan_concat_binaria_primero(self):
-        segmentos = [self._segmento("/tmp/a.h264", ".h264")]
-        with patch(
-            "dashboard.services.importar_videos_mdvr._concat_h264",
-            return_value=(True, None),
-        ) as concat_raw, patch(
-            "dashboard.services.importar_videos_mdvr._concat_h264_transcodificando",
-            return_value=(True, None),
-        ) as concat_ffmpeg:
-            ok, _error = _concatenar_segmentos(segmentos, "/tmp/salida.h264")
-
-        self.assertTrue(ok)
-        concat_raw.assert_called_once_with(["/tmp/a.h264"], "/tmp/salida.h264")
-        concat_ffmpeg.assert_not_called()
-
-    def test_concat_transcodificando_propagates_ffmpeg_stderr(self):
-        exc = subprocess.CalledProcessError(
-            returncode=183,
-            cmd=["ffmpeg", "-f", "concat"],
-            stderr="Impossible to open '/tmp/broken_segment.mp4'",
-        )
-        with patch(
-            "dashboard.services.importar_videos_mdvr._crear_lista_concat",
-            return_value="/tmp/concat_lista.txt",
-        ), patch(
-            "dashboard.services.importar_videos_mdvr.subprocess.run",
-            side_effect=exc,
-        ), patch(
-            "dashboard.services.importar_videos_mdvr.os.path.exists",
-            return_value=False,
-        ):
-            ok, error = _concat_h264_transcodificando(["/tmp/a.mp4"], "/tmp/salida.mp4")
-
-        self.assertFalse(ok)
-        self.assertIn("código 183", error)
-        self.assertIn("Impossible to open", error)
-
-
 class ReintentosMdvrTests(SimpleTestCase):
     def test_detecta_error_transitorio_por_timeout(self):
         self.assertTrue(_es_error_transitorio(TimeoutError("timeout")))
@@ -1016,7 +809,7 @@ class EstadoVelocidadesMdvrTests(SimpleTestCase):
     def test_no_guarda_si_no_hay_cambios(self):
         class VideoMock:
             def __init__(self):
-                self.estado_velocidades = EstadoVelocidadesVideo.SIN_XLSX
+                self.estado_velocidades = EstadoVelocidadesVideo.SIN_TRACKS
                 self.velocidades_error = "sin archivo"
                 self.velocidades_actualizadas_en = None
                 self.guardados = []
@@ -1027,7 +820,7 @@ class EstadoVelocidadesMdvrTests(SimpleTestCase):
         video = VideoMock()
         _actualizar_estado_velocidades(
             video,
-            EstadoVelocidadesVideo.SIN_XLSX,
+            EstadoVelocidadesVideo.SIN_TRACKS,
             error="sin archivo",
             actualizado_en=None,
         )
@@ -1067,7 +860,7 @@ class ImportarVelocidadesTabularesTests(TestCase):
             {"Hora": "2026-02-18 08:03:00", "Velocidad(km / h)": "30"},
         ]
 
-        resultado = importar_velocidades_tabulares(video, fieldnames, filas)
+        resultado = importar_velocidades_cmsv6_tracks(turno, filas)
         self.assertEqual(resultado["guardadas"], 240)
 
         velocidad_110 = VelocidadTurno.objects.get(turno=turno, segundo=110)
@@ -1108,7 +901,7 @@ class ImportarVelocidadesTabularesTests(TestCase):
             {"Hora": "2026-02-18 08:03:00", "Velocidad(km / h)": "60"},
         ]
 
-        resultado = importar_velocidades_tabulares(video, fieldnames, filas)
+        resultado = importar_velocidades_cmsv6_tracks(turno, filas)
         self.assertEqual(resultado["guardadas"], 240)
 
         velocidad_180 = VelocidadTurno.objects.get(turno=turno, segundo=180)
@@ -1140,7 +933,7 @@ class ImportarVelocidadesTabularesTests(TestCase):
             {"Hora": "2026-02-18 08:56:40", "Velocidad(km / h)": "65"},
         ]
 
-        resultado = importar_velocidades_tabulares(video, fieldnames, filas)
+        resultado = importar_velocidades_cmsv6_tracks(turno, filas)
         self.assertEqual(resultado["guardadas"], 4000)
 
         # No debe compactar: la muestra de 08:46:40 queda en segundo 2800.
@@ -1172,11 +965,7 @@ class ImportarVelocidadesTabularesTests(TestCase):
             {"Hora": "2026-02-18 08:03:00", "Velocidad(km / h)": "60"},
         ]
 
-        with patch(
-            "dashboard.services.importar_velocidades_csv.PASO_SALTO_RELOJ_FIJO_SEGUNDOS",
-            1,
-        ):
-            resultado = importar_velocidades_tabulares(video, fieldnames, filas)
+        resultado = importar_velocidades_cmsv6_tracks(turno, filas)
 
         self.assertEqual(resultado["guardadas"], 240)
         velocidad_180 = VelocidadTurno.objects.get(turno=turno, segundo=180)
@@ -1222,7 +1011,7 @@ class ImportarVelocidadesTabularesTests(TestCase):
             {"Hora": "2026-02-18 08:10:00", "Velocidad(km / h)": "60"},
         ]
 
-        resultado = importar_velocidades_tabulares(video, fieldnames, filas)
+        resultado = importar_velocidades_cmsv6_tracks(turno, filas)
         self.assertEqual(resultado["guardadas"], 720)
         self.assertEqual(resultado["descartadas"], 0)
 
@@ -1268,7 +1057,7 @@ class ImportarVelocidadesTabularesTests(TestCase):
             {"Hora": "2026-02-18 08:00:10", "Velocidad(km / h)": "42"},
         ]
 
-        resultado = importar_velocidades_tabulares(video, fieldnames, filas)
+        resultado = importar_velocidades_cmsv6_tracks(turno, filas)
 
         self.assertEqual(resultado["guardadas"], 120)
         velocidad_10 = VelocidadTurno.objects.get(turno=turno, segundo=10)

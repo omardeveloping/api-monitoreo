@@ -343,28 +343,6 @@
         </form>
       </section>
 
-      <section>
-        <h2>Analizar MP4</h2>
-        <form method="post" action="{% url 'cmsv6-mp4' %}">
-          {% csrf_token %}
-          <div class="grid two">
-            <label>Carpeta base
-              <input name="output_dir" value="{{ cmsv6_output_dir }}">
-            </label>
-            <label>Archivo MP4
-              <input name="ruta_mp4" placeholder="4462510196(4462510196)/2026-05-06/archivo.mp4">
-            </label>
-          </div>
-          <div class="choice-row">
-            <label class="choice"><input type="radio" name="accion_mp4" value="analizar" checked> Analizar</label>
-            <label class="choice"><input type="radio" name="accion_mp4" value="reparar"> Reparar copia</label>
-            <label class="choice"><input type="radio" name="accion_mp4" value="recortar"> Extraer 1 de 3</label>
-          </div>
-          <div class="actions">
-            <button type="submit" class="secondary">Ejecutar</button>
-          </div>
-        </form>
-      </section>
     </div>
 
     <aside class="stack">
@@ -386,18 +364,6 @@
       <section>
         <h2>Registro</h2>
         <div class="log"><pre id="task-log"></pre></div>
-      </section>
-
-      <section>
-        <h2>Estado MP4</h2>
-        {% if mp4_task_id %}
-          <div class="meta">Task ID: <span id="mp4-task-id">{{ mp4_task_id }}</span></div>
-          <div class="progress"><div class="bar" id="mp4-bar"></div></div>
-          <div class="meta" id="mp4-message">Consultando...</div>
-          <div class="result"><pre id="mp4-result"></pre></div>
-        {% else %}
-          <div class="meta">Sin tarea MP4 activa.</div>
-        {% endif %}
       </section>
     </aside>
   </main>
@@ -463,12 +429,6 @@
       bar: 'task-bar',
       message: 'task-message',
       log: 'task-log'
-    }, "{% url 'cmsv6-estado' '__TASK__' %}");
-    pollTask('{{ mp4_task_id|escapejs }}', {
-      bar: 'mp4-bar',
-      message: 'mp4-message',
-      log: 'task-log',
-      result: 'mp4-result'
     }, "{% url 'cmsv6-estado' '__TASK__' %}");
   </script>
 </body>

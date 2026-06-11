@@ -22,7 +22,7 @@ from dashboard.services.video_commands import (
 
 ### Tengo que acordarme de poner constantes en mayusculas
 FORMATO_VIDEO_VALIDO = {"video/mp4", "video/h264", "video/x-h264"}
-H264_EXTENSIONS = {".h264", ".grec"}
+H264_EXTENSIONS = {".h264"}
 EXTENSIONES_VALIDAS = {".mp4", *H264_EXTENSIONS}
 _MAX_BYTES_START_CODES_DEFAULT = 4 * 1024 * 1024
 _MAX_TAMANO_NAL_DEFAULT = 50 * 1024 * 1024
@@ -424,9 +424,7 @@ def validar_formato(video):
     permitido_por_extension = extension in EXTENSIONES_VALIDAS
 
     if not video or not (permitido_por_content_type or permitido_por_extension):
-        raise ValidationError(
-            "Formato de video no válido. Solo se permiten archivos MP4, H264 o GREC."
-        )
+        raise ValidationError("Formato de video no válido. Solo se permiten archivos MP4 o H264.")
 
 
 def _extension_video(nombre_archivo: str) -> str:
@@ -447,9 +445,7 @@ def _raw_h264_parece_valido(ruta_h264: str) -> bool:
 def prevalidar_video_origen(ruta_video: str) -> None:
     extension = _extension_video(ruta_video)
     if extension not in EXTENSIONES_VALIDAS:
-        raise ValidationError(
-            "Formato de video no válido. Solo se permiten archivos MP4, H264 o GREC."
-        )
+        raise ValidationError("Formato de video no válido. Solo se permiten archivos MP4 o H264.")
     try:
         if os.path.getsize(ruta_video) <= 0:
             raise ValidationError("El archivo de video está vacío o aún no terminó de subirse.")
@@ -469,7 +465,7 @@ def prevalidar_video_origen(ruta_video: str) -> None:
         return
 
     if not _raw_h264_parece_valido(ruta_video):
-        raise ValidationError("El archivo H264/GREC origen no parece contener un stream válido.")
+        raise ValidationError("El archivo H264 origen no parece contener un stream válido.")
 
 
 def envolver_h264_en_mp4(ruta_h264, fps_salida=None):
@@ -479,76 +475,52 @@ def envolver_h264_en_mp4(ruta_h264, fps_salida=None):
     ruta_salida = os.path.splitext(ruta_h264)[0] + ".mp4"
     fps_salida = str(fps_salida or MP4_TARGET_FPS or _H264_OUTPUT_FPS_DEFAULT)
 
+    def construir_comando_reencode_h264(ruta_entrada, *, forzar_formato: bool):
+        cmd = [
+            "ffmpeg",
+            "-y",
+            "-hide_banner",
+            "-loglevel",
+            "error",
+            "-probesize",
+            "100M",
+            "-analyzeduration",
+            "100M",
+            "-fflags",
+            "+genpts+discardcorrupt",
+            "-err_detect",
+            "ignore_err",
+            "-r",
+            fps_salida,
+        ]
+        if forzar_formato:
+            cmd.extend(["-f", "h264"])
+        cmd.extend(
+            [
+                "-i",
+                ruta_entrada,
+                "-an",
+                "-c:v",
+                "libx264",
+                "-preset",
+                "veryfast",
+                "-crf",
+                "23",
+                "-pix_fmt",
+                "yuv420p",
+                "-r",
+                fps_salida,
+                "-movflags",
+                "+faststart",
+                ruta_salida,
+            ]
+        )
+        return cmd
+
     def construir_comandos_ffmpeg(ruta_entrada):
         return [
-            [
-                "ffmpeg",
-                "-y",
-                "-hide_banner",
-                "-loglevel",
-                "error",
-                "-probesize",
-                "100M",
-                "-analyzeduration",
-                "100M",
-                "-fflags",
-                "+genpts+discardcorrupt",
-                "-err_detect",
-                "ignore_err",
-                "-r",
-                fps_salida,
-                "-f",
-                "h264",
-                "-i",
-                ruta_entrada,
-                "-an",
-                "-c:v",
-                "libx264",
-                "-preset",
-                "veryfast",
-                "-crf",
-                "23",
-                "-pix_fmt",
-                "yuv420p",
-                "-r",
-                fps_salida,
-                "-movflags",
-                "+faststart",
-                ruta_salida,
-            ],
-            [
-                "ffmpeg",
-                "-y",
-                "-hide_banner",
-                "-loglevel",
-                "error",
-                "-probesize",
-                "100M",
-                "-analyzeduration",
-                "100M",
-                "-fflags",
-                "+genpts+discardcorrupt",
-                "-err_detect",
-                "ignore_err",
-                "-r",
-                fps_salida,
-                "-i",
-                ruta_entrada,
-                "-an",
-                "-c:v",
-                "libx264",
-                "-preset",
-                "veryfast",
-                "-crf",
-                "23",
-                "-pix_fmt",
-                "yuv420p",
-                "-r",
-                fps_salida,
-                "-movflags",
-                "+faststart",
-                ruta_salida,
-            ],
+            construir_comando_reencode_h264(ruta_entrada, forzar_formato=True),
+            construir_comando_reencode_h264(ruta_entrada, forzar_formato=False),
         ]
 
     def intentar_conversion(ruta_entrada, etiqueta):
@@ -666,6 +638,7 @@ def procesar_video_subida(
     *,
     duracion_esperada: int | None = None,
     normalizar_mp4: bool = True,
+    h264_fps_salida: str | float | None = None,
 ):
     """
     Valida, convierte H264 a MP4 si es necesario, calcula duración y persiste cambios.
@@ -684,7 +657,10 @@ def procesar_video_subida(
     try:
         extension = os.path.splitext(ruta_original)[1].lower()
         if content_type in {"video/h264", "video/x-h264"} or extension in H264_EXTENSIONS:
-            ruta_convertida = envolver_h264_en_mp4(ruta_original)
+            ruta_convertida = envolver_h264_en_mp4(
+                ruta_original,
+                fps_salida=h264_fps_salida,
+            )
             video_obj.ruta_archivo.name = os.path.relpath(ruta_convertida, settings.MEDIA_ROOT)
             convertido_desde_h264 = True
 

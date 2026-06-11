@@ -233,7 +233,6 @@ CMSV6_ACCOUNT = os.environ.get("CMSV6_ACCOUNT", "")
 CMSV6_PASSWORD = os.environ.get("CMSV6_PASSWORD", "")
 CMSV6_DEVICE_ID = os.environ.get("CMSV6_DEVICE_ID", "")
 CMSV6_CANALES = os.environ.get("CMSV6_CANALES", "-1")
-CMSV6_TIPO_VIDEO = os.environ.get("CMSV6_TIPO_VIDEO", "0")
 CMSV6_TASK_PREPARE_WAIT_SECS = os.environ.get("CMSV6_TASK_PREPARE_WAIT_SECS", "180")
 CMSV6_TASK_POLL_INTERVAL_SECS = os.environ.get("CMSV6_TASK_POLL_INTERVAL_SECS", "10")
 CMSV6_MIN_SPEED_KBPS = os.environ.get("CMSV6_MIN_SPEED_KBPS", "0")
@@ -277,9 +276,6 @@ CELERY_TASK_ROUTES = {
     "dashboard.tasks.asegurar_monitor_mdvr_semanal_task": {"queue": "cmsv6"},
     "dashboard.tasks.cmsv6_monitor_mdvr_semanal_task": {"queue": "cmsv6"},
     "dashboard.tasks.cmsv6_descargar_task": {"queue": "cmsv6"},
-    "dashboard.tasks.cmsv6_analizar_mp4_task": {"queue": "cmsv6"},
-    "dashboard.tasks.cmsv6_reparar_mp4_task": {"queue": "cmsv6"},
-    "dashboard.tasks.cmsv6_recortar_mp4_task": {"queue": "cmsv6"},
 }
 CELERY_TASK_ANNOTATIONS = {
     "dashboard.tasks.importar_videos_mdvr_task": {
@@ -302,11 +298,6 @@ CELERY_BEAT_SCHEDULE = {
         "task": "dashboard.tasks.generar_turnos_diarios",
         # 00:05 L-S (no domingos)
         "schedule": crontab(minute=5, hour=0, day_of_week="mon,tue,wed,thu,fri,sat"),
-    },
-    "importar-videos-mdvr": {
-        "task": "dashboard.tasks.importar_videos_mdvr_task",
-        "schedule": 60.0 * 15,  # cada 15 minutos
-        "kwargs": {"omitir_si_monitor_activo": True},
     },
     "asegurar-monitor-mdvr-semanal": {
         "task": "dashboard.tasks.asegurar_monitor_mdvr_semanal_task",

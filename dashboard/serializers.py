@@ -10,7 +10,6 @@ from .models import (
     Incidente,
     VelocidadTurno,
     VelocidadVideo,
-    NumeroCamara,
 )
 
 
@@ -161,21 +160,6 @@ class VideoSerializer(serializers.ModelSerializer):
             'ultimo_error',
             'proximo_reintento_en',
         ]
-
-
-class VideoImportSerializer(serializers.Serializer):
-    ruta_origen = serializers.CharField(max_length=500)
-    nombre = serializers.CharField(max_length=100, required=False, allow_blank=True)
-    camara = serializers.ChoiceField(choices=NumeroCamara.choices)
-    id_turno = serializers.PrimaryKeyRelatedField(queryset=Turno.objects.all())
-    fecha_inicio = serializers.DateTimeField(required=False, allow_null=True)
-    fecha_subida = serializers.DateField(required=False, allow_null=True)
-    inicio_timestamp = serializers.TimeField(required=False, allow_null=True)
-    duracion_esperada_segundos = serializers.IntegerField(
-        required=False,
-        allow_null=True,
-        min_value=1,
-    )
 
 
 class VelocidadVideoSerializer(serializers.ModelSerializer):

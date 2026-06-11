@@ -2,12 +2,10 @@ import base64
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import datetime
 import json
-import mmap
 import os
 import re
 import shutil
 import socket
-import struct
 import subprocess
 import threading
 import time
@@ -105,7 +103,6 @@ class CMSV6Config:
     device_id: str
     output_dir: str
     canales: int = -1
-    tipo_video: int = 0
     task_prepare_wait_secs: int = 180
     task_poll_interval_secs: int = 10
     min_speed_kbps: float = 0.0
@@ -124,9 +121,6 @@ class CMSV6Config:
     small_response_bytes: int = 4096
     download_workers: int = 1
     serial_downloads_per_device: bool = True
-    media_query_port: int = 6603
-    company_id: str = ""
-    user_id: str = ""
 
     @classmethod
     def from_settings(cls, output_dir: str | None = None):
@@ -144,7 +138,6 @@ class CMSV6Config:
             device_id=str(_setting("CMSV6_DEVICE_ID", "") or ""),
             output_dir=str(default_output),
             canales=_setting_int("CMSV6_CANALES", -1),
-            tipo_video=_setting_int("CMSV6_TIPO_VIDEO", 0),
             task_prepare_wait_secs=_setting_int("CMSV6_TASK_PREPARE_WAIT_SECS", 180, minimum=0),
             task_poll_interval_secs=_setting_int("CMSV6_TASK_POLL_INTERVAL_SECS", 10, minimum=1),
             min_speed_kbps=_setting_float("CMSV6_MIN_SPEED_KBPS", 0.0, minimum=0.0),
@@ -170,9 +163,6 @@ class CMSV6Config:
                 minimum=0,
             )
             != 0,
-            media_query_port=_setting_int("CMSV6_MEDIA_QUERY_PORT", 6603, minimum=1),
-            company_id=str(_setting("CMSV6_COMPANY_ID", "") or ""),
-            user_id=str(_setting("CMSV6_USER_ID", "") or ""),
         )
 
     def validate(self):
@@ -205,6 +195,15 @@ class DownloadTimeLimitError(Exception):
 
 class CMSV6AuthError(Exception):
     pass
+
+
+def _result_code(result) -> int | None:
+    if not isinstance(result, dict):
+        return None
+    try:
+        return int(result.get("result"))
+    except (TypeError, ValueError):
+        return None
 
 
 def _cmsv6_url_int_param(url: str, name: str) -> int | None:
@@ -284,34 +283,6 @@ def _dec(value: str) -> str:
     data = base64.b64decode(value.replace(" ", "+"))
     return unpad(AES.new(AES_KEY, AES.MODE_ECB).decrypt(data), AES.block_size).decode("utf-8")
 
-
-def _buscar_valor_anidado(data, nombres):
-    nombres_norm = {str(nombre).lower() for nombre in nombres}
-    if isinstance(data, dict):
-        for key, value in data.items():
-            if str(key).lower() in nombres_norm and value not in (None, ""):
-                return value
-        for value in data.values():
-            encontrado = _buscar_valor_anidado(value, nombres_norm)
-            if encontrado not in (None, ""):
-                return encontrado
-    elif isinstance(data, list):
-        for item in data:
-            encontrado = _buscar_valor_anidado(item, nombres_norm)
-            if encontrado not in (None, ""):
-                return encontrado
-    return None
-
-
-def _normalizar_id_texto(value) -> str:
-    if value in (None, ""):
-        return ""
-    try:
-        return str(int(value))
-    except (TypeError, ValueError):
-        return str(value).strip()
-
-
 def _parse_response(response):
     if isinstance(response, dict) and response.get("encry") == 1 and "data" in response:
         try:
@@ -329,19 +300,15 @@ def _ffprobe_exe() -> str:
     return shutil.which("ffprobe") or "ffprobe"
 
 
+RAW_H264_MIN_FPS = 5.0
+RAW_H264_MAX_FPS = 30.0
+
+
 def is_mp4(path: Path) -> bool:
     try:
         with open(path, "rb") as archivo:
             data = archivo.read(12)
         return len(data) >= 8 and data[4:8] == b"ftyp"
-    except OSError:
-        return False
-
-
-def is_flv(path: Path) -> bool:
-    try:
-        with open(path, "rb") as archivo:
-            return archivo.read(3) == b"FLV"
     except OSError:
         return False
 
@@ -353,76 +320,6 @@ def is_h264(path: Path) -> bool:
         return header[:4] == b"\x00\x00\x00\x01" or header[:3] == b"\x00\x00\x01"
     except OSError:
         return False
-
-
-def is_ssy_dvr(path: Path) -> bool:
-    try:
-        with open(path, "rb") as archivo:
-            data = archivo.read(4096)
-        return b"SSY_DVR" in data
-    except OSError:
-        return False
-
-
-def ssy_dvr_has_h264(path: Path) -> bool:
-    try:
-        with open(path, "rb") as archivo:
-            while True:
-                chunk = archivo.read(1024 * 1024)
-                if not chunk:
-                    return False
-                if b"iph264" in chunk:
-                    return True
-    except OSError:
-        return False
-
-
-def extract_ssy_dvr_h264(src: Path, dst: Path, log_fn) -> bool:
-    if dst.exists():
-        dst.unlink()
-    try:
-        records = []
-        marker = b"\x1b\x00\x00\x00"
-        with open(src, "rb") as archivo:
-            if archivo.seek(0, os.SEEK_END) == 0:
-                return False
-            archivo.seek(0)
-            mm = mmap.mmap(archivo.fileno(), 0, access=mmap.ACCESS_READ)
-            try:
-                pos = 0
-                while True:
-                    idx = mm.find(marker, pos)
-                    if idx < 0:
-                        break
-                    magic = mm[idx + 4 : idx + 12]
-                    if len(magic) == 8 and magic[2:] == b"iph264" and idx + 28 <= len(mm):
-                        pkt_len = struct.unpack_from("<I", mm, idx + 12)[0]
-                        extra_len = struct.unpack_from("<I", mm, idx + 16)[0]
-                        start = idx + 28 + extra_len
-                        end = idx + 28 + pkt_len
-                        if 0 <= extra_len <= pkt_len and end <= len(mm):
-                            if mm[start : start + 4] == b"\x00\x00\x00\x01":
-                                records.append((start, end, mm[start + 4] & 0x1F))
-                            elif mm[start : start + 3] == b"\x00\x00\x01":
-                                records.append((start, end, mm[start + 3] & 0x1F))
-                    pos = idx + 1
-
-                if not records:
-                    return False
-                first = next((i for i, (_, _, nal) in enumerate(records) if nal == 7), 0)
-                with open(dst, "wb") as salida:
-                    for start, end, _nal in records[first:]:
-                        salida.write(mm[start:end])
-            finally:
-                mm.close()
-        ok = dst.exists() and dst.stat().st_size > 4096
-        if ok:
-            log_fn(f"    SSY_DVR extraido a H264 ({dst.stat().st_size / 1048576:.2f} MB)")
-        return ok
-    except Exception as exc:
-        log_fn(f"    No se pudo extraer SSY_DVR: {exc}")
-        return False
-
 
 def _mp4_duration_secs(path: Path):
     try:
@@ -449,22 +346,67 @@ def _mp4_duration_secs(path: Path):
         return None
 
 
-def _expected_secs_from_name(path: Path):
+def _count_raw_h264_frames(path: Path) -> int:
+    variantes = (
+        ["-f", "h264"],
+        [],
+    )
+    for input_args in variantes:
+        try:
+            result = subprocess.run(
+                [
+                    _ffprobe_exe(),
+                    "-v",
+                    "error",
+                    *input_args,
+                    "-count_frames",
+                    "-select_streams",
+                    "v:0",
+                    "-show_entries",
+                    "stream=nb_read_frames,nb_frames",
+                    "-of",
+                    "json",
+                    str(path),
+                ],
+                capture_output=True,
+                timeout=120,
+                check=False,
+            )
+        except (subprocess.TimeoutExpired, FileNotFoundError):
+            continue
+        if result.returncode != 0:
+            continue
+        try:
+            data = json.loads(result.stdout.decode("utf-8", "replace") or "{}")
+        except json.JSONDecodeError:
+            continue
+        stream = next(iter(data.get("streams") or []), {})
+        for key in ("nb_read_frames", "nb_frames"):
+            try:
+                frames = int(stream.get(key) or 0)
+            except (TypeError, ValueError):
+                frames = 0
+            if frames > 0:
+                return frames
+    return 0
+
+
+def _effective_raw_h264_fps(path: Path, expected_secs) -> tuple[float | None, int]:
     try:
-        match = re.search(r"-(\d{6})-(\d{6})-", Path(path).name)
-        if not match:
-            return None
+        duracion_esperada = float(expected_secs or 0)
+    except (TypeError, ValueError):
+        return None, 0
+    if duracion_esperada <= 0:
+        return None, 0
 
-        def _to_secs(value):
-            return int(value[:2]) * 3600 + int(value[2:4]) * 60 + int(value[4:6])
+    frames = _count_raw_h264_frames(path)
+    if frames <= 0:
+        return None, 0
 
-        start = _to_secs(match.group(1))
-        end = _to_secs(match.group(2))
-        if end < start:
-            end += 24 * 3600
-        return max(0, end - start)
-    except Exception:
-        return None
+    fps = frames / duracion_esperada
+    if fps < RAW_H264_MIN_FPS or fps > RAW_H264_MAX_FPS:
+        return None, frames
+    return fps, frames
 
 
 def _mp4_duration_ok(path: Path, expected_secs, log_fn) -> bool:
@@ -483,236 +425,92 @@ def _mp4_duration_ok(path: Path, expected_secs, log_fn) -> bool:
     return True
 
 
-def repair_mp4_timestamps(src: Path, dst: Path, log_fn, expected_secs=None, fps=25) -> bool:
-    src = Path(src)
-    dst = Path(dst)
-    tmp_h264 = dst.with_suffix(".retime.h264")
-    if dst.exists():
-        dst.unlink()
-    if tmp_h264.exists():
-        tmp_h264.unlink()
-    try:
-        log_fn("    Reparacion: extrayendo H264 del MP4...")
-        result = subprocess.run(
-            [
-                _ffmpeg_exe(),
-                "-y",
-                "-i",
-                str(src),
-                "-map",
-                "0:v:0",
-                "-c:v",
-                "copy",
-                "-bsf:v",
-                "h264_mp4toannexb",
-                "-f",
-                "h264",
-                str(tmp_h264),
-            ],
-            capture_output=True,
-            timeout=900,
-            check=False,
-        )
-        if result.returncode != 0 or not tmp_h264.exists() or tmp_h264.stat().st_size <= 4096:
-            return False
-
-        log_fn(f"    Reparacion: rearmando MP4 a {fps} FPS...")
-        result = subprocess.run(
-            [
-                _ffmpeg_exe(),
-                "-y",
-                "-fflags",
-                "+genpts",
-                "-f",
-                "h264",
-                "-framerate",
-                str(fps),
-                "-i",
-                str(tmp_h264),
-                "-c:v",
-                "copy",
-                "-movflags",
-                "+faststart",
-                str(dst),
-            ],
-            capture_output=True,
-            timeout=900,
-            check=False,
-        )
-        if result.returncode == 0 and dst.exists() and dst.stat().st_size > 4096:
-            if _mp4_duration_ok(dst, expected_secs, log_fn):
-                return True
-
-        log_fn("    Reparacion: probando reencode con tiempos nuevos...")
-        if dst.exists():
-            dst.unlink()
-        result = subprocess.run(
-            [
-                _ffmpeg_exe(),
-                "-y",
-                "-fflags",
-                "+genpts",
-                "-i",
-                str(src),
-                "-map",
-                "0:v:0",
-                "-vf",
-                f"setpts=N/({fps}*TB)",
-                "-r",
-                str(fps),
-                "-c:v",
-                "libx264",
-                "-preset",
-                "fast",
-                "-crf",
-                "22",
-                "-an",
-                "-movflags",
-                "+faststart",
-                str(dst),
-            ],
-            capture_output=True,
-            timeout=1800,
-            check=False,
-        )
-        return result.returncode == 0 and dst.exists() and dst.stat().st_size > 4096
-    except (subprocess.TimeoutExpired, FileNotFoundError) as exc:
-        log_fn(f"    Reparacion fallo: {exc}")
-        return False
-    finally:
-        if tmp_h264.exists():
-            try:
-                tmp_h264.unlink()
-            except OSError:
-                pass
+def _build_raw_h264_reencode_commands(
+    ffmpeg: str,
+    src_str: str,
+    dst_str: str,
+    fps_expr: str,
+) -> list[list[str]]:
+    common = [
+        ffmpeg,
+        "-y",
+        "-hide_banner",
+        "-loglevel",
+        "error",
+        "-probesize",
+        "100M",
+        "-analyzeduration",
+        "100M",
+        "-fflags",
+        "+genpts+discardcorrupt",
+        "-err_detect",
+        "ignore_err",
+        "-framerate",
+        fps_expr,
+        "-i",
+        src_str,
+        "-an",
+        "-c:v",
+        "libx264",
+        "-preset",
+        "fast",
+        "-crf",
+        "18",
+        "-pix_fmt",
+        "yuv420p",
+        "-r",
+        fps_expr,
+        "-movflags",
+        "+faststart",
+        dst_str,
+    ]
+    return [
+        [
+            ffmpeg,
+            "-y",
+            "-hide_banner",
+            "-loglevel",
+            "error",
+            "-probesize",
+            "100M",
+            "-analyzeduration",
+            "100M",
+            "-fflags",
+            "+genpts+discardcorrupt",
+            "-err_detect",
+            "ignore_err",
+            "-f",
+            "h264",
+            *common[13:],
+        ],
+        common,
+    ]
 
 
-def cut_mp4_first_fraction(src: Path, dst: Path, log_fn, denominator=3) -> bool:
-    src = Path(src)
-    dst = Path(dst)
-    if dst.exists():
-        dst.unlink()
-    try:
-        duration = _mp4_duration_secs(src)
-        if not duration or duration <= 0:
-            log_fn("    No se pudo leer duracion del MP4.")
-            return False
-        keep = duration / max(2, int(denominator))
-        result = subprocess.run(
-            [
-                _ffmpeg_exe(),
-                "-y",
-                "-i",
-                str(src),
-                "-t",
-                f"{keep:.3f}",
-                "-map",
-                "0:v:0",
-                "-c",
-                "copy",
-                "-movflags",
-                "+faststart",
-                str(dst),
-            ],
-            capture_output=True,
-            timeout=900,
-            check=False,
-        )
-        return result.returncode == 0 and dst.exists() and dst.stat().st_size > 4096
-    except (subprocess.TimeoutExpired, FileNotFoundError) as exc:
-        log_fn(f"    Recorte fallo: {exc}")
-        return False
-
-
-def convert_to_mp4(src: Path, dst: Path, log_fn, expected_secs=None) -> bool:
+def convert_to_mp4(src: Path, dst: Path, log_fn, expected_secs=None, *, raw_h264: bool | None = None) -> bool:
     if dst.exists():
         dst.unlink()
 
-    cleanup_src = None
-    h264_input = False
     src = Path(src)
-    if is_ssy_dvr(src):
-        extracted = src.with_suffix(".h264")
-        log_fn("    Formato SSY_DVR: extrayendo H264 interno...")
-        if not extract_ssy_dvr_h264(src, extracted, log_fn):
-            return False
-        src_str = str(extracted)
-        cleanup_src = extracted
-        h264_input = True
-    else:
-        src_str = str(src)
-
+    src_str = str(src)
     dst_str = str(dst)
     ffmpeg = _ffmpeg_exe()
-    if is_flv(src):
-        commands = [
-            [
-                ffmpeg,
-                "-y",
-                "-fflags",
-                "+genpts",
-                "-i",
-                src_str,
-                "-vf",
-                "setpts=N/(25*TB)",
-                "-r",
-                "25",
-                "-c:v",
-                "libx264",
-                "-preset",
-                "fast",
-                "-crf",
-                "22",
-                "-an",
-                "-movflags",
-                "+faststart",
-                dst_str,
-            ],
-            [ffmpeg, "-y", "-i", src_str, "-c", "copy", "-movflags", "+faststart", dst_str],
-        ]
-    elif h264_input or is_h264(src):
-        commands = [
-            [
-                ffmpeg,
-                "-y",
-                "-fflags",
-                "+genpts",
-                "-f",
-                "h264",
-                "-framerate",
-                "25",
-                "-i",
-                src_str,
-                "-c:v",
-                "copy",
-                "-vsync",
-                "0",
-                dst_str,
-            ],
-            [
-                ffmpeg,
-                "-y",
-                "-f",
-                "h264",
-                "-framerate",
-                "25",
-                "-i",
-                src_str,
-                "-c:v",
-                "libx264",
-                "-preset",
-                "fast",
-                "-crf",
-                "18",
-                "-r",
-                "25",
-                "-movflags",
-                "+faststart",
-                dst_str,
-            ],
-        ]
+    treat_as_raw_h264 = is_h264(src) if raw_h264 is None else raw_h264
+    if treat_as_raw_h264:
+        fps_value, frames = _effective_raw_h264_fps(src, expected_secs)
+        if fps_value is None:
+            fps_value = 25.0
+            log_fn("    H264 crudo: reencode con FPS fallback 25.")
+        else:
+            log_fn(
+                "    H264 crudo: reencode con FPS efectivo "
+                f"{fps_value:.8f} ({frames} frames / {int(expected_secs)}s CMSV6)."
+            )
+        fps_expr = f"{fps_value:.8f}".rstrip("0").rstrip(".")
+        commands = _build_raw_h264_reencode_commands(ffmpeg, src_str, dst_str, fps_expr)
     else:
         commands = [
+            [ffmpeg, "-y", "-i", src_str, "-c", "copy", "-movflags", "+faststart", dst_str],
             [
                 ffmpeg,
                 "-y",
@@ -735,7 +533,6 @@ def convert_to_mp4(src: Path, dst: Path, log_fn, expected_secs=None) -> bool:
                 "+faststart",
                 dst_str,
             ],
-            [ffmpeg, "-y", "-i", src_str, "-c", "copy", "-movflags", "+faststart", dst_str],
         ]
 
     for index, command in enumerate(commands, start=1):
@@ -745,8 +542,6 @@ def convert_to_mp4(src: Path, dst: Path, log_fn, expected_secs=None) -> bool:
             result = subprocess.run(command, capture_output=True, timeout=1800, check=False)
             if result.returncode == 0 and dst.exists() and dst.stat().st_size > 4096:
                 if _mp4_duration_ok(dst, expected_secs, log_fn):
-                    if cleanup_src and cleanup_src.exists():
-                        cleanup_src.unlink()
                     return True
             if index < len(commands):
                 log_fn(f"    Intento ffmpeg {index} fallo; probando metodo {index + 1}...")
@@ -807,8 +602,7 @@ def _normalizar_vel(raw):
         value = float(raw)
     except (TypeError, ValueError):
         return 0
-    if value > 300:
-        value = value / 10.0
+    value = value / 10.0
     return round(value, 1)
 
 
@@ -907,7 +701,7 @@ def detectar_eventos_ruta(tracks, device_id):
     for track in tracks or []:
         gps_time = track.get("gpsTime", track.get("gt", ""))
         server_time = track.get("serverTime", track.get("rt", ""))
-        speed = float(track.get("speed", track.get("sp", track.get("gpsSpeed", 0))) or 0)
+        speed = _normalizar_vel(track.get("speed", track.get("sp", track.get("gpsSpeed", 0))))
         lat = track.get("mlat", track.get("latitude", ""))
         lng = track.get("mlng", track.get("longitude", ""))
         if not lat and track.get("lat"):
@@ -1127,6 +921,30 @@ def _escribir_hoja(wb, title, columns, rows):
     return ws
 
 
+def guardar_tracks_json(
+    carpeta_base: Path,
+    device_id: str,
+    fecha: datetime.date,
+    tracks: list,
+    log_fn,
+) -> Path | None:
+    if not tracks:
+        return None
+
+    carpeta_base.mkdir(parents=True, exist_ok=True)
+    path = carpeta_base / f"{device_id} {fecha.isoformat()}_tracks.json"
+    payload = {
+        "device_id": device_id,
+        "fecha": fecha.isoformat(),
+        "generado_en": datetime.datetime.now().isoformat(timespec="seconds"),
+        "tracks": tracks,
+    }
+    with open(path, "w", encoding="utf-8") as archivo:
+        json.dump(payload, archivo, ensure_ascii=False, default=str)
+    log_fn(f"  [OK] Tracks CMSV6 guardados: {path.name} ({len(tracks)} puntos)")
+    return path
+
+
 def exportar_excel(
     carpeta_base: Path,
     device_id: str,
@@ -1328,6 +1146,7 @@ class CMSV6Session:
     def get_track(self, fecha):
         begin = fecha.strftime("%Y-%m-%d") + " 00:00:00"
         end = fecha.strftime("%Y-%m-%d") + " 23:59:59"
+        page_size = 5000
         attempts = [
             (
                 "StandardApiAction_queryTrackDetail.action",
@@ -1335,8 +1154,7 @@ class CMSV6Session:
                     "devIdno": self.config.device_id,
                     "begintime": begin,
                     "endtime": end,
-                    "currentPage": 1,
-                    "pageRecords": 5000,
+                    "pageRecords": page_size,
                 },
             ),
             (
@@ -1345,17 +1163,39 @@ class CMSV6Session:
                     "devIdno": self.config.device_id,
                     "begintime": begin,
                     "endtime": end,
-                    "currentPage": 1,
-                    "pageRecords": 5000,
+                    "pageRecords": page_size,
                 },
             ),
         ]
         for endpoint, params in attempts:
             try:
-                result = self._post_api(endpoint, params)
-                rows = result.get("trackDetails") or result.get("tracks") or result.get("rows") or []
-                if rows:
-                    return rows
+                rows_total = []
+                page = 1
+                while page <= 100:
+                    page_params = dict(params)
+                    page_params["currentPage"] = page
+                    result = self._post_api(endpoint, page_params)
+                    rows = (
+                        result.get("trackDetails")
+                        or result.get("tracks")
+                        or result.get("rows")
+                        or []
+                    )
+                    if isinstance(rows, list) and rows:
+                        rows_total.extend(rows)
+                    pagination = result.get("pagination") or {}
+                    try:
+                        total_pages = int(pagination.get("totalPages") or 0)
+                    except (TypeError, ValueError):
+                        total_pages = 0
+                    has_next = pagination.get("hasNextPage") in (True, "true", "True", 1, "1")
+                    if total_pages:
+                        has_next = page < total_pages
+                    if not has_next or not rows:
+                        break
+                    page += 1
+                if rows_total:
+                    return rows_total
             except Exception:
                 pass
         return []
@@ -1426,25 +1266,118 @@ class CMSV6Session:
         self.sid = None
         self.login()
 
+    def _archivo_video_datetime(self, archivo, fecha, key):
+        fecha_base = fecha.date() if isinstance(fecha, datetime.datetime) else fecha
+        segundos = _segundos_video(archivo, key)
+        return datetime.datetime.combine(fecha_base, datetime.time.min) + datetime.timedelta(
+            seconds=segundos
+        )
+
+    def _download_task_status(self, task):
+        for key in ("stu", "status", "st"):
+            try:
+                return int(task.get(key))
+            except (TypeError, ValueError):
+                continue
+        return None
+
+    def _download_task_matches(self, task, archivo):
+        archivo_chn = _video_channel_idx(archivo)
+        try:
+            task_chn = int(task.get("chn", task.get("channel", task.get("ch", -999))))
+        except (TypeError, ValueError):
+            task_chn = -999
+        if task_chn not in {-999, archivo_chn, archivo_chn + 1}:
+            return False
+
+        archivo_nombre = Path(str(archivo.get("file", "") or "")).name
+        task_path = str(
+            task.get("fph")
+            or task.get("filePath")
+            or task.get("filename")
+            or task.get("file")
+            or ""
+        )
+        task_nombre = Path(task_path).name
+        if archivo_nombre and task_nombre and archivo_nombre != task_nombre:
+            return False
+        return True
+
+    def get_download_tasks(self, archivo, fecha, timeout=30):
+        begin = self._archivo_video_datetime(archivo, fecha, "beg")
+        end = self._archivo_video_datetime(archivo, fecha, "end")
+        if end <= begin:
+            end = begin + datetime.timedelta(seconds=1)
+        result = self._post_api(
+            "StandardApiAction_downloadTasklist.action",
+            {
+                "devIdno": self.config.device_id,
+                "begintime": begin.strftime("%Y-%m-%d %H:%M:%S"),
+                "endtime": end.strftime("%Y-%m-%d %H:%M:%S"),
+                "currentPage": 1,
+                "pageRecords": 50,
+            },
+            timeout=timeout,
+        )
+        rows = (
+            result.get("infos")
+            or result.get("tasks")
+            or result.get("rows")
+            or result.get("list")
+            or []
+        )
+        return rows if isinstance(rows, list) else []
+
+    def wait_download_task(self, archivo, fecha, log_fn=None):
+        log = log_fn or (lambda _msg: None)
+        wait_secs = max(0, int(self.config.task_prepare_wait_secs or 0))
+        if wait_secs <= 0:
+            return None
+
+        deadline = time.monotonic() + wait_secs
+        last_status = None
+        last_match = None
+        log(f"    Esperando tarea CMSV6 ({wait_secs}s max)...")
+        while True:
+            try:
+                tasks = self.get_download_tasks(archivo, fecha, timeout=30)
+                matches = [task for task in tasks if self._download_task_matches(task, archivo)]
+                if matches:
+                    last_match = matches[0]
+                    last_status = self._download_task_status(last_match)
+                    log(f"    Tarea CMSV6 status={last_status} ({len(matches)} coincidencia/s)")
+                    if last_status == 4:
+                        return last_match
+                    if last_status in {3, 5, 6, 7}:
+                        return last_match
+            except Exception as exc:
+                log(f"    No se pudo consultar downloadTasklist: {exc}")
+
+            if time.monotonic() >= deadline:
+                if last_status is not None:
+                    log(f"    Tarea CMSV6 sin completar; ultimo status={last_status}")
+                return last_match
+            time.sleep(min(self.config.task_poll_interval_secs, max(1, int(deadline - time.monotonic()))))
+
     def get_video_files(self, fecha, log_fn=None):
         log = log_fn or (lambda _msg: None)
         user_agent = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) CMSV6Client/4.0"
+        fecha_base = fecha.date() if isinstance(fecha, datetime.datetime) else fecha
 
-        def _query(endpoint, down_type=2, fileattr=0, rectype=0, timeout=20, session_kind="api"):
+        def _query(endpoint, *, fileattr=2, rectype=-1, timeout=20, session_kind="api"):
             session_token = self.sid if session_kind == "web" else self.jsession
             params = {
                 "DevIDNO": self.config.device_id,
                 "LOC": 1,
                 "CHN": self.config.canales,
-                "YEAR": fecha.year,
-                "MON": fecha.month,
-                "DAY": fecha.day,
+                "YEAR": fecha_base.year,
+                "MON": fecha_base.month,
+                "DAY": fecha_base.day,
                 "RECTYPE": rectype,
                 "FILEATTR": fileattr,
-                "BEG": "00:00:00",
-                "END": "23:59:59",
+                "BEG": 0,
+                "END": 86399,
                 "jsession": session_token,
-                "DownType": down_type,
                 "ARM1": 0,
                 "ARM2": 0,
                 "RES": 0,
@@ -1474,156 +1407,28 @@ class CMSV6Session:
                             return subvalue
             return []
 
-        def _media_direct_ids():
-            user_id = _normalizar_id_texto(self.config.user_id) or _normalizar_id_texto(
-                _buscar_valor_anidado(
-                    [self.web_login_response, self.api_login_response],
-                    ("userid", "userId", "userID", "uid", "id"),
-                )
-            )
-            company_id = _normalizar_id_texto(self.config.company_id) or _normalizar_id_texto(
-                _buscar_valor_anidado(
-                    [self.web_login_response, self.api_login_response],
-                    (
-                        "companyid",
-                        "companyId",
-                        "companyID",
-                        "company",
-                        "companyNo",
-                        "companyno",
-                    ),
-                )
-            )
-            return company_id, user_id
+        auth_results = (5,)
 
-        def _media_direct_base():
-            parsed = urllib.parse.urlparse(self.config.base_url)
-            scheme = parsed.scheme or "http"
-            host = parsed.hostname or parsed.netloc.split(":")[0]
-            if not host:
-                raise Exception(f"CMSV6_BASE_URL invalida para media directo: {self.config.base_url}")
-            return f"{scheme}://{host}:{self.config.media_query_port}", host
-
-        def _normalizar_canal_query():
-            try:
-                canales = int(self.config.canales)
-            except (TypeError, ValueError):
-                return ""
-            return "" if canales < 0 else canales
-
-        def _filtrar_device(files):
-            filtrados = []
-            for item in files:
-                dev_id = str(item.get("devIdno", item.get("DevIDNO", "")) or "").strip()
-                if not dev_id or dev_id == self.config.device_id:
-                    filtrados.append(item)
-            return filtrados
-
-        def _query_media_directo(timeout=25):
-            company_id, user_id = _media_direct_ids()
-            if not company_id or not user_id:
-                raise Exception(
-                    "faltan CMSV6_COMPANY_ID/CMSV6_USER_ID para media directo "
-                    "y no se pudieron inferir desde el login"
-                )
-            media_base, host = _media_direct_base()
-            params = {
-                "DownType": 2,
-                "LOC": 2,
-                "CHN": _normalizar_canal_query(),
-                "YEAR": fecha.year,
-                "MON": fecha.month,
-                "DAY": fecha.day,
-                "RECTYPE": -1,
-                "FILEATTR": 2,
-                "BEG": 0,
-                "END": 86399,
-                "ARM1": 0,
-                "ARM2": 0,
-                "RES": 0,
-                "STREAM": -1,
-                "STORE": 0,
-                "host": host,
-                "jsession": self.jsession,
-                "YEARE": fecha.year,
-                "MONE": fecha.month,
-                "DAYE": fecha.day,
-                "COMPANYID": company_id,
-                "USERID": user_id,
-            }
-            url = f"{media_base}/3/5?{urllib.parse.urlencode(params)}"
-            request = urllib.request.Request(url, method="GET")
-            request.add_header("User-Agent", user_agent)
-            with self.opener.open(request, timeout=timeout) as response:
-                return _parse_response(json.loads(response.read()))
-
-        def _query_media_directo_valid(timeout=25):
-            last_auth = ""
-            for attempt in range(1, 4):
-                try:
-                    result = _query_media_directo(timeout=timeout)
-                except urllib.error.HTTPError as exc:
-                    if exc.code not in (401, 403):
-                        raise
-                    last_auth = f"HTTP {exc.code}"
-                    log(f"  Media directo rechazo sesion ({last_auth}), renovando...")
-                    try:
-                        self.relogin_api() if attempt == 1 else self.full_relogin()
-                    except Exception as relogin_exc:
-                        last_auth = str(relogin_exc)
-                        log(f"  Re-login media directo intento {attempt}/3 fallo: {relogin_exc}")
-                    time.sleep(1)
-                    continue
-                if result.get("result") not in auth_results:
-                    if attempt > 1:
-                        log("  Sesion renovada correctamente para media directo.")
-                    return result
-                last_auth = f"result={result.get('result')}"
-                log(f"  Media directo rechazo sesion ({last_auth}), renovando...")
-                try:
-                    self.relogin_api() if attempt == 1 else self.full_relogin()
-                except Exception as exc:
-                    last_auth = str(exc)
-                    log(f"  Re-login media directo intento {attempt}/3 fallo: {exc}")
-                time.sleep(1)
-            raise CMSV6AuthError(f"sesion CMSV6 rechazada en media directo ({last_auth})")
-
-        def _probar_media_directo():
-            log("  Probando media directo LOC=2 FA=2 RT=-1...")
-            result = _query_media_directo_valid(timeout=25)
-            files = _filtrar_device(_extract_files(result))
-            if files:
-                log(f"  OK: {len(files)} archivos (media directo)")
-                return files
-            if result.get("result") == 0 or "files" in result:
-                log("  Sin grabaciones (media directo)")
-                return []
-            else:
-                log(f"  result={result.get('result')} (media directo)")
-            return None
-
-        auth_results = (32, 3)
-
-        try:
-            media_files = _probar_media_directo()
-            if media_files is not None:
-                return media_files
-        except Exception as exc:
-            log(f"  Error media directo: {exc}; probando endpoints antiguos...")
-
-        def _query_valid(endpoint, down_type=2, fileattr=0, rectype=0, timeout=20):
+        def _query_valid(endpoint, *, fileattr=2, rectype=-1, timeout=20):
             session_kinds = ["api"]
             if self.sid:
                 session_kinds.append("web")
 
             last_auth = ""
             for session_kind in session_kinds:
-                result = _query(endpoint, down_type, fileattr, rectype, timeout, session_kind=session_kind)
-                if result.get("result") not in auth_results:
+                result = _query(
+                    endpoint,
+                    fileattr=fileattr,
+                    rectype=rectype,
+                    timeout=timeout,
+                    session_kind=session_kind,
+                )
+                code = _result_code(result)
+                if code not in auth_results:
                     if session_kind == "web":
                         log("  Consulta de video aceptada usando sesion web.")
                     return result
-                last_auth = f"{session_kind}: result={result.get('result')}"
+                last_auth = f"{session_kind}: result={code}"
 
             log(f"  Sesion expirada/rechazada ({last_auth}), renovando...")
             for attempt in range(1, 4):
@@ -1635,19 +1440,19 @@ class CMSV6Session:
                     for session_kind in session_kinds:
                         result = _query(
                             endpoint,
-                            down_type,
-                            fileattr,
-                            rectype,
-                            timeout,
+                            fileattr=fileattr,
+                            rectype=rectype,
+                            timeout=timeout,
                             session_kind=session_kind,
                         )
-                        if result.get("result") not in auth_results:
+                        code = _result_code(result)
+                        if code not in auth_results:
                             log(
                                 "  Sesion renovada correctamente"
                                 + (" usando sesion web." if session_kind == "web" else ".")
                             )
                             return result
-                        last_auth = f"{session_kind}: result={result.get('result')}"
+                        last_auth = f"{session_kind}: result={code}"
                 except Exception as exc:
                     last_auth = str(exc)
                     log(f"  Re-login intento {attempt}/3 fallo: {exc}")
@@ -1655,44 +1460,31 @@ class CMSV6Session:
             raise CMSV6AuthError(f"sesion CMSV6 rechazada ({last_auth})")
 
         ep1 = "StandardApiAction_getVideoFileInfo.action"
-        ep2 = "StandardApiAction_queryVideoFile.action"
-        combos = [
-            (ep1, 2, 0, 0),
-            (ep1, 1, 0, 0),
-            (ep1, 0, 0, 0),
-            (ep2, 2, 0, 0),
-            (ep1, 2, 15, 0),
-            (ep1, 3, 0, 0),
-            (ep1, 2, 0, 1),
-            (ep1, 2, 0, 2),
-        ]
-        result0_count = 0
-        ep2_available = True
+        combos = [(ep1, 2, -1)]
         auth_errors = []
-        for endpoint, down_type, fileattr, rectype in combos:
-            if endpoint == ep2 and not ep2_available:
-                continue
-            combo = f"{'EP1' if endpoint == ep1 else 'EP2'} DT={down_type} FA={fileattr} RT={rectype}"
+        for endpoint, fileattr, rectype in combos:
+            combo = f"LOC=1 FA={fileattr} RT={rectype}"
             try:
                 log(f"  Probando {combo}...")
-                result = _query_valid(endpoint, down_type, fileattr, rectype, timeout=25)
-                if result.get("result") == 0:
+                result = _query_valid(endpoint, fileattr=fileattr, rectype=rectype, timeout=25)
+                code = _result_code(result)
+                if code == 0:
                     files = _extract_files(result)
                     if files:
                         log(f"  OK: {len(files)} archivos ({combo})")
                         return files
-                    result0_count += 1
                     log(f"  Sin grabaciones ({combo})")
-                    if endpoint == ep1 and result0_count >= 3:
-                        return []
+                    return []
+                if code == 32:
+                    log(f"  Equipo offline para consulta de video ({combo}); no hay descarga directa MDVR.")
+                    return []
+                if code == 3:
+                    log(f"  Parametros rechazados por CMSV6 ({combo}); revisar LOC/FILEATTR/RECTYPE.")
+                    return []
                 else:
-                    log(f"  result={result.get('result')} ({combo})")
+                    log(f"  result={code} ({combo})")
             except urllib.error.HTTPError as exc:
-                if exc.code == 404 and endpoint == ep2:
-                    ep2_available = False
-                    log("  EP2 no disponible (404); se omite.")
-                else:
-                    log(f"  Error HTTP {exc.code} ({combo})")
+                log(f"  Error HTTP {exc.code} ({combo})")
             except CMSV6AuthError as exc:
                 auth_errors.append(f"{combo}: {exc}")
                 log(f"  Error auth ({combo}): {exc}; probando siguiente combinacion...")
@@ -1890,11 +1682,11 @@ class CMSV6Session:
 
 
 _CMSV6_MDVR_LEGACY_NAME_RE = re.compile(
-    r"^\d+-(?P<camara>\d{2})-\d{6}-\d{6}-.+\.(?:h264|grec|mp4)$",
+    r"^\d+-(?P<camara>\d{2})-\d{6}-\d{6}-.+\.(?:h264|mp4)$",
     re.IGNORECASE,
 )
 _CMSV6_MDVR_NEW_NAME_RE = re.compile(
-    r"^\d+-\d{6}-\d{6}-\d{6}-(?P<codigo>\d+)\.(?:grec|mp4)$",
+    r"^\d+-\d{6}-\d{6}-\d{6}-(?P<codigo>\d+)\.(?:mp4)$",
     re.IGNORECASE,
 )
 
@@ -2367,22 +2159,20 @@ def _descargar_video_archivo(
         expected_secs = None
 
     if dest_mp4.exists() and dest_mp4.stat().st_size > 4096 and is_mp4(dest_mp4):
-        if _mp4_duration_ok(dest_mp4, expected_secs, log_fn):
-            _guardar_metadata_cmsv6_video(
-                dest_mp4,
-                archivo,
-                fecha=fecha,
-                nombre_mp4=nombre_mp4,
-                descarga_usada="existente",
-            )
-            log_fn(
-                f"  [{index}/{total}] EXISTE {contexto['fecha']} "
-                f"{contexto['turno_label']} CH{channel}: {nombre_mp4}"
-            )
-            tracker.update(index, contexto, pct_file=100, estado="ya existe", active=False)
-            resumen["omitidos"] += 1
-            return resumen
-        dest_mp4.unlink()
+        _guardar_metadata_cmsv6_video(
+            dest_mp4,
+            archivo,
+            fecha=fecha,
+            nombre_mp4=nombre_mp4,
+            descarga_usada="existente",
+        )
+        log_fn(
+            f"  [{index}/{total}] EXISTE {contexto['fecha']} "
+            f"{contexto['turno_label']} CH{channel}: {nombre_mp4}"
+        )
+        tracker.update(index, contexto, pct_file=100, estado="ya existe", active=False)
+        resumen["omitidos"] += 1
+        return resumen
 
     fpath = str(archivo.get("file", "") or "").strip()
     down_task_url = str(archivo.get("DownTaskUrl", "") or "").strip()
@@ -2426,14 +2216,14 @@ def _descargar_video_archivo(
                 f"    Tarea CMSV6: result={task_response.get('result', '?')} "
                 f"id={task_response.get('taskId', task_response.get('id', '?'))}"
             )
-            if config.task_prepare_wait_secs:
-                log_fn(f"    Esperando preparacion ({config.task_prepare_wait_secs}s max)...")
-                waited = 0
-                while waited < config.task_prepare_wait_secs:
-                    step = min(config.task_poll_interval_secs, config.task_prepare_wait_secs - waited)
-                    time.sleep(step)
-                    waited += step
-                    log_fn(f"    Preparando... {waited}/{config.task_prepare_wait_secs}s")
+            if _result_code(task_response) in (None, 0):
+                task_info = session.wait_download_task(archivo, fecha, log_fn)
+                if task_info:
+                    status = session._download_task_status(task_info)
+                    if status == 4:
+                        log_fn("    Tarea CMSV6 lista para descarga.")
+                    else:
+                        log_fn(f"    Tarea CMSV6 no quedo lista; status={status}.")
         except Exception as exc:
             log_fn(f"    Tarea CMSV6 ignorada por error: {exc}")
 
@@ -2498,10 +2288,6 @@ def _descargar_video_archivo(
                     stall_secs=stall_secs,
                 )
                 if dest_tmp.exists() and _descarga_suficiente(dest_tmp, file_len, config):
-                    if is_ssy_dvr(dest_tmp) and not ssy_dvr_has_h264(dest_tmp):
-                        last_error = "SSY_DVR sin paquetes H264"
-                        log_fn(f"    [{label}] sin video util; probando otra URL...")
-                        continue
                     download_ok = True
                     download_label = label
                     break
@@ -2529,37 +2315,35 @@ def _descargar_video_archivo(
         log_fn(f"    Header: {fmt_hex} | Tamaño: {dest_tmp.stat().st_size / 1048576:.2f} MB")
 
         if is_mp4(dest_tmp):
-            if _mp4_duration_ok(dest_tmp, expected_secs, log_fn):
-                if dest_mp4.exists():
-                    dest_mp4.unlink()
-                dest_tmp.rename(dest_mp4)
-                _guardar_metadata_cmsv6_video(
-                    dest_mp4,
-                    archivo,
-                    fecha=fecha,
-                    nombre_mp4=nombre_mp4,
-                    descarga_usada=download_label,
-                )
-                log_fn(f"    MP4 nativo: {nombre_mp4}")
-                tracker.update(index, contexto, pct_file=100, estado="completo", active=False)
-                resumen["descargados"] += 1
-                return resumen
-            log_fn("    MP4 nativo con timestamps sospechosos; reparando...")
-            if repair_mp4_timestamps(dest_tmp, dest_mp4, log_fn, expected_secs=expected_secs):
-                dest_tmp.unlink(missing_ok=True)
-                _guardar_metadata_cmsv6_video(
-                    dest_mp4,
-                    archivo,
-                    fecha=fecha,
-                    nombre_mp4=nombre_mp4,
-                    descarga_usada=f"{download_label}:reparado" if download_label else "reparado",
-                )
-                tracker.update(index, contexto, pct_file=100, estado="completo", active=False)
-                resumen["descargados"] += 1
-                return resumen
+            if dest_mp4.exists():
+                dest_mp4.unlink()
+            dest_tmp.rename(dest_mp4)
+            _guardar_metadata_cmsv6_video(
+                dest_mp4,
+                archivo,
+                fecha=fecha,
+                nombre_mp4=nombre_mp4,
+                descarga_usada=download_label,
+            )
+            log_fn(f"    MP4 nativo directo: {nombre_mp4}")
+            tracker.update(index, contexto, pct_file=100, estado="completo", active=False)
+            resumen["descargados"] += 1
+            return resumen
 
         tracker.update(index, contexto, pct_file=99, estado="convirtiendo")
-        if convert_to_mp4(dest_tmp, dest_mp4, log_fn, expected_secs=expected_secs):
+        fuente_original = str(archivo.get("file") or "").lower()
+        raw_h264 = (
+            fuente_original.endswith(".h264")
+            or fuente_original.endswith(".264")
+            or is_h264(dest_tmp)
+        )
+        if convert_to_mp4(
+            dest_tmp,
+            dest_mp4,
+            log_fn,
+            expected_secs=expected_secs,
+            raw_h264=raw_h264,
+        ):
             dest_tmp.unlink(missing_ok=True)
             _guardar_metadata_cmsv6_video(
                 dest_mp4,
@@ -2784,7 +2568,7 @@ def ejecutar_rango(
                         "ID Dispositivo": gps.get("id", ""),
                         "Latitud": float(gps.get("mlat", 0)),
                         "Longitud": float(gps.get("mlng", 0)),
-                        "Velocidad km/h": gps.get("sp", 0),
+                        "Velocidad km/h": _normalizar_vel(gps.get("sp", 0)),
                         "Direccion °": gps.get("hx", 0),
                         "En linea": "Si" if gps.get("ol") else "No",
                         "Hora GPS": gps.get("gt", ""),
@@ -2807,6 +2591,7 @@ def ejecutar_rango(
         try:
             tracks = session.get_track(fecha)
             log_fn(f"  Ruta: {len(tracks)} puntos obtenidos")
+            guardar_tracks_json(carpeta_base, config.device_id, day, tracks, log_fn)
         except Exception as exc:
             tracks = []
             log_fn(f"  ERROR ruta: {exc}")
@@ -2986,137 +2771,3 @@ def ejecutar_job_cmsv6(params, log_fn, set_progress):
         )
 
     return {"resultados_descarga": results, "importacion_django": import_result, "salida": output_dir}
-
-
-def resolver_ruta_cmsv6_output(path_value: str, *, output_dir: str | None = None, must_exist=True) -> Path:
-    config = CMSV6Config.from_settings(output_dir)
-    base = Path(config.output_dir).resolve()
-    value = str(path_value or "").strip().strip('"')
-    if not value:
-        raise ValidationError("Debe indicar una ruta de archivo.")
-    path = Path(value)
-    if not path.is_absolute():
-        path = base / path
-    path = path.resolve()
-    if not (path == base or str(path).startswith(str(base) + os.sep)):
-        raise ValidationError("La ruta indicada debe estar dentro de CMSV6_OUTPUT_DIR.")
-    if must_exist and not path.is_file():
-        raise ValidationError("El archivo indicado no existe.")
-    return path
-
-
-def _ffprobe_json(path: Path, args, timeout=60):
-    command = [_ffprobe_exe(), "-v", "error", "-print_format", "json", *list(args), str(path)]
-    try:
-        result = subprocess.run(command, capture_output=True, timeout=timeout, check=False)
-    except FileNotFoundError:
-        return None, "ffprobe no encontrado"
-    except subprocess.TimeoutExpired:
-        return None, f"ffprobe timeout ({timeout}s)"
-    if result.returncode != 0:
-        error = result.stderr.decode("utf-8", "replace").strip()
-        return None, error or f"ffprobe retorno {result.returncode}"
-    try:
-        return json.loads(result.stdout.decode("utf-8", "replace") or "{}"), None
-    except ValueError as exc:
-        return None, f"JSON ffprobe invalido: {exc}"
-
-
-def _fmt_duration(seconds):
-    try:
-        seconds = float(seconds)
-    except (TypeError, ValueError):
-        return "-"
-    hours, rem = divmod(int(round(seconds)), 3600)
-    minutes, secs = divmod(rem, 60)
-    if hours:
-        return f"{hours}h {minutes:02d}m {secs:02d}s"
-    if minutes:
-        return f"{minutes}m {secs:02d}s"
-    return f"{secs}s"
-
-
-def analizar_mp4_reporte(path_like):
-    path = Path(path_like)
-    lines = ["=== Archivo ===", f"Ruta: {path}"]
-    if not path.exists():
-        lines.append("ERROR: archivo no existe.")
-        return "\n".join(lines)
-    stat = path.stat()
-    lines.append(f"Tamano: {stat.st_size} bytes ({stat.st_size / 1048576:.2f} MB)")
-    lines.append(f"Modificado: {datetime.datetime.fromtimestamp(stat.st_mtime).strftime('%Y-%m-%d %H:%M:%S')}")
-    expected = _expected_secs_from_name(path)
-    if expected:
-        lines.append(f"Duracion esperada por nombre: {expected}s ({_fmt_duration(expected)})")
-    try:
-        with open(path, "rb") as archivo:
-            lines.append(f"Primeros 16 bytes: {archivo.read(16).hex(' ')}")
-    except OSError as exc:
-        lines.append(f"No se pudo leer header: {exc}")
-
-    lines.extend(["", "=== ffprobe format/streams ==="])
-    probe, error = _ffprobe_json(path, ["-show_format", "-show_streams"], timeout=60)
-    if error:
-        lines.append(f"ERROR ffprobe: {error}")
-    else:
-        fmt = probe.get("format", {})
-        duration = fmt.get("duration")
-        lines.append(
-            f"format={fmt.get('format_name', '?')} duration={duration} "
-            f"({_fmt_duration(duration)}) bit_rate={fmt.get('bit_rate', '?')}"
-        )
-        for index, stream in enumerate(probe.get("streams", [])):
-            lines.append(
-                f"stream#{index} type={stream.get('codec_type')} codec={stream.get('codec_name')} "
-                f"duration={stream.get('duration')} ({_fmt_duration(stream.get('duration'))}) "
-                f"avg_fps={stream.get('avg_frame_rate')} r_fps={stream.get('r_frame_rate')} "
-                f"frames={stream.get('nb_frames', '?')}"
-            )
-
-    lines.extend(["", "=== ffprobe count_frames video ==="])
-    frames, error = _ffprobe_json(
-        path,
-        [
-            "-count_frames",
-            "-select_streams",
-            "v:0",
-            "-show_entries",
-            "stream=nb_read_frames,nb_read_packets,avg_frame_rate,r_frame_rate,duration,time_base",
-        ],
-        timeout=120,
-    )
-    if error:
-        lines.append(f"ERROR count_frames: {error}")
-    else:
-        for stream in frames.get("streams", []):
-            lines.append(
-                f"video frames_leidos={stream.get('nb_read_frames', '?')} "
-                f"packets={stream.get('nb_read_packets', '?')} "
-                f"duration={stream.get('duration')} avg={stream.get('avg_frame_rate')} "
-                f"r={stream.get('r_frame_rate')}"
-            )
-    return "\n".join(lines)
-
-
-def reparar_mp4_en_salida(path_value: str, *, output_dir: str | None = None) -> dict:
-    src = resolver_ruta_cmsv6_output(path_value, output_dir=output_dir)
-    out = src.with_name(src.stem + "_reparado.mp4")
-    index = 2
-    while out.exists():
-        out = src.with_name(f"{src.stem}_reparado_{index}.mp4")
-        index += 1
-    logs = []
-    ok = repair_mp4_timestamps(src, out, logs.append, expected_secs=_expected_secs_from_name(src))
-    return {"ok": ok, "origen": str(src), "salida": str(out), "logs": logs}
-
-
-def recortar_mp4_en_salida(path_value: str, *, output_dir: str | None = None, denominator=3) -> dict:
-    src = resolver_ruta_cmsv6_output(path_value, output_dir=output_dir)
-    out = src.with_name(src.stem + "_primer_tercio.mp4")
-    index = 2
-    while out.exists():
-        out = src.with_name(f"{src.stem}_primer_tercio_{index}.mp4")
-        index += 1
-    logs = []
-    ok = cut_mp4_first_fraction(src, out, logs.append, denominator=denominator)
-    return {"ok": ok, "origen": str(src), "salida": str(out), "logs": logs}
