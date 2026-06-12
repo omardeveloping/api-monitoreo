@@ -425,6 +425,92 @@ def _mp4_duration_ok(path: Path, expected_secs, log_fn) -> bool:
     return True
 
 
+def _duration_close_to_expected(path: Path, expected_secs, *, tolerance_ratio=0.01, tolerance_secs=3.0) -> bool:
+    if not expected_secs:
+        return True
+    duration = _mp4_duration_secs(path)
+    if duration is None:
+        return False
+    tolerance = max(float(tolerance_secs), float(expected_secs) * float(tolerance_ratio))
+    return abs(duration - float(expected_secs)) <= tolerance
+
+
+def _retime_mp4_to_expected_duration(path: Path, expected_secs, log_fn) -> bool:
+    if not expected_secs:
+        return True
+
+    duration = _mp4_duration_secs(path)
+    if duration is None or duration <= 0:
+        log_fn("    No se pudo medir duracion para ajustar timing CMSV6.")
+        return False
+
+    expected = float(expected_secs)
+    if _duration_close_to_expected(path, expected):
+        return True
+
+    factor = expected / duration
+    tmp_path = path.with_name(f"{path.stem}.retime_tmp{path.suffix}")
+    if tmp_path.exists():
+        tmp_path.unlink()
+
+    log_fn(
+        "    Ajustando duracion a timeline CMSV6: "
+        f"{duration:.2f}s -> {expected:.2f}s (factor {factor:.6f})."
+    )
+    command = [
+        _ffmpeg_exe(),
+        "-y",
+        "-hide_banner",
+        "-loglevel",
+        "error",
+        "-i",
+        str(path),
+        "-vf",
+        f"setpts=PTS*{factor:.12f}",
+        "-an",
+        "-c:v",
+        "libx264",
+        "-preset",
+        "fast",
+        "-crf",
+        "18",
+        "-pix_fmt",
+        "yuv420p",
+        "-movflags",
+        "+faststart",
+        str(tmp_path),
+    ]
+    try:
+        result = subprocess.run(command, capture_output=True, timeout=1800, check=False)
+    except subprocess.TimeoutExpired:
+        log_fn("    Timeout ajustando duracion a timeline CMSV6.")
+        return False
+    except FileNotFoundError:
+        log_fn("    ffmpeg no encontrado.")
+        return False
+
+    if result.returncode != 0 or not tmp_path.exists() or tmp_path.stat().st_size <= 4096:
+        log_fn("    Fallo ajuste de duracion a timeline CMSV6.")
+        if tmp_path.exists():
+            tmp_path.unlink()
+        return False
+
+    if not _duration_close_to_expected(tmp_path, expected):
+        adjusted = _mp4_duration_secs(tmp_path)
+        if adjusted is None:
+            log_fn("    Duracion ajustada ilegible.")
+        else:
+            log_fn(
+                "    Duracion ajustada aun no coincide con CMSV6: "
+                f"{adjusted:.2f}s vs {expected:.2f}s."
+            )
+        tmp_path.unlink(missing_ok=True)
+        return False
+
+    tmp_path.replace(path)
+    return True
+
+
 def _build_raw_h264_reencode_commands(
     ffmpeg: str,
     src_str: str,
@@ -541,7 +627,10 @@ def convert_to_mp4(src: Path, dst: Path, log_fn, expected_secs=None, *, raw_h264
         try:
             result = subprocess.run(command, capture_output=True, timeout=1800, check=False)
             if result.returncode == 0 and dst.exists() and dst.stat().st_size > 4096:
-                if _mp4_duration_ok(dst, expected_secs, log_fn):
+                if treat_as_raw_h264 and expected_secs:
+                    if _retime_mp4_to_expected_duration(dst, expected_secs, log_fn):
+                        return True
+                elif _mp4_duration_ok(dst, expected_secs, log_fn):
                     return True
             if index < len(commands):
                 log_fn(f"    Intento ffmpeg {index} fallo; probando metodo {index + 1}...")
@@ -2402,6 +2491,7 @@ def _descargar_videos_dia(
     base_pct,
     end_pct,
     download_workers=1,
+    on_file_complete=None,
 ):
     resumen = {"descargados": 0, "omitidos": 0, "errores": 0, "total": len(archivos or [])}
     if not archivos:
@@ -2437,11 +2527,16 @@ def _descargar_videos_dia(
                 total=total,
             )
             _merge_resumen_descarga(resumen, parcial)
+            if on_file_complete:
+                try:
+                    on_file_complete(fecha, archivo, parcial)
+                except Exception as exc:
+                    log_fn(f"    ERROR notificando archivo completado: {exc}")
     else:
         def _run(index, archivo):
             worker_session = CMSV6Session(config)
             worker_session.login()
-            return _descargar_video_archivo(
+            parcial = _descargar_video_archivo(
                 worker_session,
                 archivo,
                 fecha=fecha,
@@ -2452,6 +2547,7 @@ def _descargar_videos_dia(
                 index=index,
                 total=total,
             )
+            return archivo, parcial
 
         with ThreadPoolExecutor(max_workers=workers) as executor:
             futures = [
@@ -2460,7 +2556,13 @@ def _descargar_videos_dia(
             ]
             for future in as_completed(futures):
                 try:
-                    _merge_resumen_descarga(resumen, future.result())
+                    archivo, parcial = future.result()
+                    _merge_resumen_descarga(resumen, parcial)
+                    if on_file_complete:
+                        try:
+                            on_file_complete(fecha, archivo, parcial)
+                        except Exception as exc:
+                            log_fn(f"    ERROR notificando archivo completado: {exc}")
                 except Exception as exc:
                     log_fn(f"    ERROR descarga paralela: {exc}")
                     resumen["errores"] += 1
@@ -2481,6 +2583,7 @@ def ejecutar_rango(
     opts=None,
     config=None,
     on_day_complete=None,
+    on_file_complete=None,
 ):
     config = config or CMSV6Config.from_settings(carpeta_base)
     config.validate()
@@ -2674,6 +2777,7 @@ def ejecutar_rango(
             base_pct,
             end_pct,
             download_workers=download_workers,
+            on_file_complete=on_file_complete,
         )
         resumen_total["videos_descargados"] += resumen_dia["descargados"]
         resumen_total["videos_omitidos"] += resumen_dia["omitidos"]

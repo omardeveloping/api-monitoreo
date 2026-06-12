@@ -38,6 +38,7 @@ from dashboard.services.monitor_mdvr_state import (
     obtener_task_id_monitor_mdvr,
 )
 from dashboard.sync_test.service import (
+    cancelar_descarga_prueba_payload,
     estado_descarga_prueba_payload,
     iniciar_descarga_prueba_payload,
     servir_archivo_prueba,
@@ -635,6 +636,11 @@ class VideoViewSet(viewsets.ModelViewSet):
     def test_sync_descarga_status(self, request):
         """Estado/logs de una descarga local de test."""
         return Response(estado_descarga_prueba_payload(request))
+
+    @action(detail=False, methods=["get", "post"], url_path="test-sync-descarga-cancelar")
+    def test_sync_descarga_cancelar(self, request):
+        """Cancela una descarga local de test en curso o en cola."""
+        return Response(cancelar_descarga_prueba_payload(request))
 
     @action(detail=False, methods=["get"], url_path="test-sync-file")
     def test_sync_file(self, request):

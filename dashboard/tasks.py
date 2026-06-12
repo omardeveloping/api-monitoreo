@@ -12,6 +12,7 @@ from dashboard.services.cmsv6_downloader import (
     CMSV6Config,
     ejecutar_job_cmsv6,
     ejecutar_rango,
+    nombre_video_cmsv6,
 )
 from dashboard.services.programar_turnos import (
     crear_turnos_diarios,
@@ -409,9 +410,14 @@ def cmsv6_monitor_mdvr_semanal_task(self, params: dict | None = None):
 
         importaciones_encoladas = []
 
-        def encolar_importacion_dia(fecha_dia, resumen_dia):
-            fecha_iso = fecha_dia.isoformat()
-            resumen = dict(resumen_dia or {})
+        def encolar_importacion_archivo(fecha_dia, archivo, resumen_archivo):
+            resumen = dict(resumen_archivo or {})
+            if int(resumen.get("descargados", 0) or 0) <= 0:
+                return
+
+            fecha_base = fecha_dia.date() if isinstance(fecha_dia, datetime.datetime) else fecha_dia
+            fecha_iso = fecha_base.isoformat()
+            nombre_archivo = nombre_video_cmsv6(archivo, config.device_id, fecha_base)
             task = importar_videos_mdvr_task.apply_async(
                 kwargs={
                     "base_dir": output_dir,
@@ -422,14 +428,18 @@ def cmsv6_monitor_mdvr_semanal_task(self, params: dict | None = None):
             )
             registro = {
                 "fecha": fecha_iso,
+                "archivo": nombre_archivo,
                 "task_id": task.id,
                 "videos_descargados": resumen.get("descargados", 0),
                 "videos_omitidos": resumen.get("omitidos", 0),
                 "videos_errores": resumen.get("errores", 0),
-                "videos_total": resumen.get("total", 0),
+                "videos_total": resumen.get("total", 1),
             }
             importaciones_encoladas.append(registro)
-            reporter.log(f"Importación MDVR encolada para {fecha_iso}: {task.id}")
+            reporter.log(
+                "Importación MDVR encolada para "
+                f"{fecha_iso} tras {nombre_archivo}: {task.id}"
+            )
 
             monitor_actual = dict(monitor_base)
             monitor_actual["importaciones_encoladas"] = importaciones_encoladas[-50:]
@@ -451,17 +461,17 @@ def cmsv6_monitor_mdvr_semanal_task(self, params: dict | None = None):
                 reporter.progress_cb,
                 opts,
                 config,
-                on_day_complete=encolar_importacion_dia,
+                on_file_complete=encolar_importacion_archivo,
             )
             resultado_ciclo["descarga"] = descarga
             resultado_ciclo["importacion_django"] = {
-                "modo": "asincronico_por_dia",
+                "modo": "asincronico_por_archivo_descargado",
                 "total_tareas": len(importaciones_encoladas),
                 "tareas": list(importaciones_encoladas),
             }
             reporter.log(
                 "Descarga semanal finalizada; "
-                f"{len(importaciones_encoladas)} importaciones por dia encoladas."
+                f"{len(importaciones_encoladas)} importaciones por archivo encoladas."
             )
             monitor_base.update(
                 {

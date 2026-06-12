@@ -36,8 +36,13 @@ TURNOS = {
 
 _DOWNLOAD_EXECUTOR = ThreadPoolExecutor(max_workers=1)
 _DOWNLOAD_JOBS: dict[str, dict] = {}
+_DOWNLOAD_FUTURES: dict[str, object] = {}
 _DOWNLOAD_LOCK = threading.Lock()
 _MAX_DOWNLOAD_JOBS = 20
+
+
+class _SyncTestCancelled(BaseException):
+    pass
 
 
 def sync_test_habilitado() -> bool:
@@ -123,6 +128,7 @@ def _prune_jobs_locked():
     )
     for job_id, _job in ordered[: max(0, len(ordered) - _MAX_DOWNLOAD_JOBS)]:
         _DOWNLOAD_JOBS.pop(job_id, None)
+        _DOWNLOAD_FUTURES.pop(job_id, None)
 
 
 def _create_job(params: dict) -> dict:
@@ -139,6 +145,7 @@ def _create_job(params: dict) -> dict:
         "updated_at": now,
         "result": None,
         "error": "",
+        "cancel_requested": False,
     }
     with _DOWNLOAD_LOCK:
         _DOWNLOAD_JOBS[job_id] = job
@@ -155,6 +162,12 @@ def _update_job(job_id: str, **fields):
         job["updated_at"] = timezone.now().isoformat()
 
 
+def _attach_job_future(job_id: str, future):
+    with _DOWNLOAD_LOCK:
+        if job_id in _DOWNLOAD_JOBS:
+            _DOWNLOAD_FUTURES[job_id] = future
+
+
 def _append_job_log(job_id: str, message: str):
     line = f"[{_job_timestamp()}] {message}"
     with _DOWNLOAD_LOCK:
@@ -168,7 +181,19 @@ def _append_job_log(job_id: str, message: str):
         job["updated_at"] = timezone.now().isoformat()
 
 
+def _assert_job_not_cancelled(job_id: str | None):
+    if not job_id:
+        return
+    with _DOWNLOAD_LOCK:
+        job = _DOWNLOAD_JOBS.get(job_id)
+        if not job:
+            return
+        if job.get("cancel_requested"):
+            raise _SyncTestCancelled("Descarga cancelada por el usuario.")
+
+
 def _job_progress(job_id: str, progress: int, message: str, extra=None):
+    _assert_job_not_cancelled(job_id)
     fields = {
         "status": "running",
         "progress": max(0, min(100, int(progress or 0))),
@@ -187,6 +212,40 @@ def _job_snapshot(job_id: str) -> dict:
         if not job:
             raise NotFound("Trabajo de descarga no encontrado.")
         return dict(job, logs=list(job.get("logs", [])))
+
+
+def cancelar_descarga_prueba_payload(request):
+    validar_sync_test_habilitado()
+    job_id = (_valor_request(request, "job_id", "") or "").strip()
+    if not job_id:
+        raise ValidationError("Parametro 'job_id' requerido.")
+
+    with _DOWNLOAD_LOCK:
+        job = _DOWNLOAD_JOBS.get(job_id)
+        if not job:
+            raise NotFound("Trabajo de descarga no encontrado.")
+
+        if job.get("status") in {"success", "failed", "cancelled"}:
+            return dict(job, logs=list(job.get("logs", [])))
+
+        job["cancel_requested"] = True
+        job["updated_at"] = timezone.now().isoformat()
+        future = _DOWNLOAD_FUTURES.get(job_id)
+        cancelled_now = bool(future and future.cancel())
+        if cancelled_now or job.get("status") == "queued":
+            job["status"] = "cancelled"
+            job["progress"] = 100
+            job["message"] = "Descarga cancelada"
+            job["error"] = "Cancelada por el usuario."
+        else:
+            job["status"] = "cancelling"
+            job["message"] = "Cancelacion solicitada"
+        logs = job.setdefault("logs", [])
+        logs.append(f"[{_job_timestamp()}] Cancelacion solicitada por el usuario.")
+        del logs[:-500]
+        snapshot = dict(job, logs=list(logs))
+
+    return snapshot
 
 
 def _fecha_desde_request(request):
@@ -691,16 +750,22 @@ def _descargar_set_prueba(params: dict, base_file_url: str, *, job_id: str | Non
     session = CMSV6Session(config)
     logs = []
 
+    def check_cancel():
+        _assert_job_not_cancelled(job_id)
+
     def log(msg):
+        check_cancel()
         logs.append(str(msg))
         if job_id:
             _append_job_log(job_id, str(msg))
 
+    check_cancel()
     log("Login CMSV6...")
     session.login()
     log("Login CMSV6 exitoso.")
 
     for fecha in _dias_scan(params):
+        check_cancel()
         log(f"Consultando {fecha.isoformat()}...")
         files = session.get_video_files(fecha, log_fn=log)
         log(f"Archivos encontrados: {len(files)}")
@@ -798,6 +863,7 @@ def descargar_set_prueba_payload(request):
 
 
 def _run_download_job(job_id: str, params: dict, base_file_url: str):
+    _assert_job_not_cancelled(job_id)
     _update_job(job_id, status="running", progress=0, message="Iniciando descarga")
     try:
         result = _descargar_set_prueba(params, base_file_url, job_id=job_id)
@@ -810,6 +876,15 @@ def _run_download_job(job_id: str, params: dict, base_file_url: str):
             result=result,
             error="" if result.get("ok") else result.get("detalle", ""),
         )
+    except _SyncTestCancelled as exc:
+        _append_job_log(job_id, str(exc))
+        _update_job(
+            job_id,
+            status="cancelled",
+            progress=100,
+            message="Descarga cancelada",
+            error=str(exc),
+        )
     except Exception as exc:
         _append_job_log(job_id, f"ERROR: {exc}")
         _update_job(
@@ -819,6 +894,9 @@ def _run_download_job(job_id: str, params: dict, base_file_url: str):
             message=str(exc),
             error=str(exc),
         )
+    finally:
+        with _DOWNLOAD_LOCK:
+            _DOWNLOAD_FUTURES.pop(job_id, None)
 
 
 def iniciar_descarga_prueba_payload(request):
@@ -826,7 +904,8 @@ def iniciar_descarga_prueba_payload(request):
     params = _request_params(request)
     job = _create_job(params)
     base_file_url = request.build_absolute_uri("../test-sync-file/")
-    _DOWNLOAD_EXECUTOR.submit(_run_download_job, job["job_id"], params, base_file_url)
+    future = _DOWNLOAD_EXECUTOR.submit(_run_download_job, job["job_id"], params, base_file_url)
+    _attach_job_future(job["job_id"], future)
     return _job_snapshot(job["job_id"])
 
 
