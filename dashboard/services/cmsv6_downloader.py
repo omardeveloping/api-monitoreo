@@ -347,6 +347,7 @@ def _mp4_duration_secs(path: Path):
 
 
 def _count_raw_h264_frames(path: Path) -> int:
+    timeout_secs = _setting_int("CMSV6_RAW_H264_FRAME_COUNT_TIMEOUT_SECS", 600, minimum=30)
     variantes = (
         ["-f", "h264"],
         [],
@@ -366,12 +367,12 @@ def _count_raw_h264_frames(path: Path) -> int:
                     "stream=nb_read_frames,nb_frames",
                     "-of",
                     "json",
-                    str(path),
-                ],
-                capture_output=True,
-                timeout=120,
-                check=False,
-            )
+                str(path),
+            ],
+            capture_output=True,
+            timeout=timeout_secs,
+            check=False,
+        )
         except (subprocess.TimeoutExpired, FileNotFoundError):
             continue
         if result.returncode != 0:
