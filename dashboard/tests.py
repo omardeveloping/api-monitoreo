@@ -837,6 +837,21 @@ class ImportarVelocidadesTabularesTests(TestCase):
             hora_fin=fin,
         )
 
+    def test_tracks_cmsv6_dividen_velocidad_por_10(self):
+        camion = Camion.objects.create(patente="BKCD12")
+        turno = self._crear_turno(camion, datetime.time(8, 0), datetime.time(8, 1))
+        filas = [
+            {"gpsTime": "2026-02-18 08:00:10", "speed": 253},
+        ]
+
+        resultado = importar_velocidades_cmsv6_tracks(turno, filas)
+
+        self.assertEqual(resultado["guardadas"], 60)
+        velocidad_10 = VelocidadTurno.objects.get(turno=turno, segundo=10)
+        self.assertEqual(velocidad_10.velocidad_kmh, 25.3)
+        self.assertFalse(velocidad_10.sin_datos)
+        self.assertFalse(velocidad_10.interpolado)
+
     def test_hueco_largo_no_arrastra_ultimo_valor(self):
         camion = Camion.objects.create(patente="BKCD13")
         turno = self._crear_turno(camion, datetime.time(8, 0), datetime.time(8, 4))

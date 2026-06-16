@@ -14,6 +14,8 @@ _FORMATOS_FECHA = (
     "%d/%m/%Y %H:%M:%S",
 )
 _MAX_GAP_INTERPOLACION_DEFAULT = 90
+_VELOCIDAD_CMSV6_DIVISOR_DEFAULT = 10.0
+_VELOCIDAD_CMSV6_KEYS_DECIMALES = {"speed", "sp", "gpsspeed", "gs"}
 try:
     MAX_GAP_INTERPOLACION_SEGUNDOS = int(
         os.environ.get(
@@ -24,6 +26,17 @@ try:
 except ValueError:
     MAX_GAP_INTERPOLACION_SEGUNDOS = _MAX_GAP_INTERPOLACION_DEFAULT
 MAX_GAP_INTERPOLACION_SEGUNDOS = max(0, MAX_GAP_INTERPOLACION_SEGUNDOS)
+try:
+    VELOCIDAD_CMSV6_DIVISOR = float(
+        os.environ.get(
+            "VELOCIDADES_CMSV6_DIVISOR",
+            _VELOCIDAD_CMSV6_DIVISOR_DEFAULT,
+        )
+    )
+except ValueError:
+    VELOCIDAD_CMSV6_DIVISOR = _VELOCIDAD_CMSV6_DIVISOR_DEFAULT
+if VELOCIDAD_CMSV6_DIVISOR <= 0:
+    VELOCIDAD_CMSV6_DIVISOR = _VELOCIDAD_CMSV6_DIVISOR_DEFAULT
 
 
 def _pick(track: dict, *keys, default=None):
@@ -33,7 +46,14 @@ def _pick(track: dict, *keys, default=None):
     return default
 
 
-def _parsear_velocidad(valor):
+def _pick_con_key(track: dict, *keys, default=None):
+    for key in keys:
+        if key in track and track.get(key) not in (None, ""):
+            return key, track.get(key)
+    return None, default
+
+
+def _parsear_numero(valor):
     if valor is None:
         return None
     if isinstance(valor, (int, float)):
@@ -45,6 +65,16 @@ def _parsear_velocidad(valor):
     if not match:
         return None
     return float(match.group(0).replace(",", "."))
+
+
+def _parsear_velocidad(valor, key=None):
+    velocidad = _parsear_numero(valor)
+    if velocidad is None:
+        return None
+    if key and str(key).lower() in _VELOCIDAD_CMSV6_KEYS_DECIMALES:
+        velocidad = velocidad / VELOCIDAD_CMSV6_DIVISOR
+        return round(velocidad, 1)
+    return velocidad
 
 
 def _parsear_fecha(valor):
@@ -108,17 +138,16 @@ def _iterar_muestras_tracks(tracks):
             continue
         filas += 1
 
-        velocidad = _parsear_velocidad(
-            _pick(
-                track,
-                "speed",
-                "sp",
-                "gpsSpeed",
-                "gs",
-                "Velocidad(km / h)",
-                "Velocidad km/h",
-            )
+        velocidad_key, velocidad_valor = _pick_con_key(
+            track,
+            "speed",
+            "sp",
+            "gpsSpeed",
+            "gs",
+            "Velocidad(km / h)",
+            "Velocidad km/h",
         )
+        velocidad = _parsear_velocidad(velocidad_valor, velocidad_key)
         if velocidad is None:
             descartadas += 1
             continue
