@@ -1145,6 +1145,7 @@ class CMSV6Session:
         self.sid = None
         self.api_login_response = {}
         self.web_login_response = {}
+        self.web_login_ok = False
 
     def _reset_opener(self):
         self.cookie_jar = http.cookiejar.CookieJar()
@@ -1198,8 +1199,9 @@ class CMSV6Session:
         with self.opener.open(request, timeout=30) as response:
             result = _parse_response(json.loads(response.read()))
         self.web_login_response = result
+        self.web_login_ok = result.get("result") == 0
         if result.get("result") != 0:
-            raise Exception(f"Login CMSV6 fallido: {result}")
+            return
 
     def _post_web(self, endpoint, url_params, body_params, timeout=30):
         url = f"{self.config.base_url}/808gps/{endpoint}?{_enc(json.dumps(url_params))}"
