@@ -300,6 +300,10 @@ def _ffprobe_exe() -> str:
     return shutil.which("ffprobe") or "ffprobe"
 
 
+def _ffmpeg_timeout_secs() -> int:
+    return _setting_int("CMSV6_FFMPEG_TIMEOUT_SECS", 7200, minimum=60)
+
+
 RAW_H264_MIN_FPS = 5.0
 RAW_H264_MAX_FPS = 30.0
 
@@ -482,7 +486,12 @@ def _retime_mp4_to_expected_duration(path: Path, expected_secs, log_fn) -> bool:
         str(tmp_path),
     ]
     try:
-        result = subprocess.run(command, capture_output=True, timeout=1800, check=False)
+        result = subprocess.run(
+            command,
+            capture_output=True,
+            timeout=_ffmpeg_timeout_secs(),
+            check=False,
+        )
     except subprocess.TimeoutExpired:
         log_fn("    Timeout ajustando duracion a timeline CMSV6.")
         return False
@@ -626,7 +635,12 @@ def convert_to_mp4(src: Path, dst: Path, log_fn, expected_secs=None, *, raw_h264
         if dst.exists():
             dst.unlink()
         try:
-            result = subprocess.run(command, capture_output=True, timeout=1800, check=False)
+            result = subprocess.run(
+                command,
+                capture_output=True,
+                timeout=_ffmpeg_timeout_secs(),
+                check=False,
+            )
             if result.returncode == 0 and dst.exists() and dst.stat().st_size > 4096:
                 if treat_as_raw_h264 and expected_secs:
                     if _retime_mp4_to_expected_duration(dst, expected_secs, log_fn):
