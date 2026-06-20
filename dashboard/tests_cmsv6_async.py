@@ -1,11 +1,12 @@
 import datetime
+import urllib.error
 import re
 import tempfile
 import threading
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import parse_qs, urlparse
-from unittest.mock import Mock, patch
+from unittest.mock import MagicMock, Mock, patch
 
 from django.test import SimpleTestCase, TestCase
 
@@ -73,6 +74,38 @@ class _CMSV6RangeTestServer:
 
 
 class CMSV6AsyncPipelineTests(SimpleTestCase):
+    def test_login_conserva_sesion_api_si_login_web_responde_404(self):
+        config = cmsv6_downloader.CMSV6Config(
+            base_url="http://cmsv6.test",
+            account="cuenta",
+            password="clave",
+            device_id="4462510196",
+            output_dir="",
+        )
+        session = cmsv6_downloader.CMSV6Session(config)
+        api_response = MagicMock()
+        api_response.read.return_value = b'{"result":0,"jsession":"api-session"}'
+        api_response.__enter__.return_value = api_response
+        web_error = urllib.error.HTTPError(
+            "http://cmsv6.test/808gps/login.html",
+            404,
+            "Not Found",
+            {},
+            None,
+        )
+        session.opener.open = Mock(side_effect=[api_response, web_error])
+
+        session.login()
+
+        self.assertEqual(session.jsession, "api-session")
+        self.assertIsNone(session.sid)
+        self.assertFalse(session.web_login_ok)
+        self.assertEqual(session.web_login_response["http_status"], 404)
+        self.assertEqual(
+            session.web_login_response["fase"],
+            "login_web_secundario",
+        )
+
     def test_rango_semanal_mdvr_usa_solo_semana_actual(self):
         with patch(
             "dashboard.tasks.timezone.localdate",

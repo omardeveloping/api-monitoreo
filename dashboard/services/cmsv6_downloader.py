@@ -1186,32 +1186,52 @@ class CMSV6Session:
         if not self.jsession:
             raise Exception(f"Login API sin jsession: {api_response}")
 
-        self.opener.open(f"{self.config.base_url}/808gps/login.html", timeout=30)
-        request = urllib.request.Request(
-            f"{self.config.base_url}/808gps/StandardLoginAction_initLoginSession.action?{_enc('{}')}",
-            data=b"",
-            method="POST",
-            headers={"Newv": "1"},
-        )
-        with self.opener.open(request, timeout=30) as response:
-            self.sid = json.loads(_dec(json.loads(response.read())["data"]))["jsessionId"]
+        self.sid = None
+        self.web_login_response = {}
+        self.web_login_ok = False
+        try:
+            self.opener.open(f"{self.config.base_url}/808gps/login.html", timeout=30)
+            request = urllib.request.Request(
+                f"{self.config.base_url}/808gps/StandardLoginAction_initLoginSession.action?{_enc('{}')}",
+                data=b"",
+                method="POST",
+                headers={"Newv": "1"},
+            )
+            with self.opener.open(request, timeout=30) as response:
+                self.sid = json.loads(_dec(json.loads(response.read())["data"]))["jsessionId"]
 
-        password = _enc(base64.b64encode(urllib.parse.quote(self.config.password, safe="").encode()).decode())
-        login_payload = {
-            "account": self.config.account,
-            "ipson": password,
-            "language": "es",
-            "verificationCode": "",
-            "v9OldStyle": "",
-        }
-        request = urllib.request.Request(
-            f"{self.config.base_url}/808gps/StandardLoginAction_login.action?{_enc(json.dumps(login_payload))}",
-            data=b"",
-            method="POST",
-            headers={"Newv": "1", "jsessionId": self.sid},
-        )
-        with self.opener.open(request, timeout=30) as response:
-            result = _parse_response(json.loads(response.read()))
+            password = _enc(
+                base64.b64encode(
+                    urllib.parse.quote(self.config.password, safe="").encode()
+                ).decode()
+            )
+            login_payload = {
+                "account": self.config.account,
+                "ipson": password,
+                "language": "es",
+                "verificationCode": "",
+                "v9OldStyle": "",
+            }
+            request = urllib.request.Request(
+                f"{self.config.base_url}/808gps/StandardLoginAction_login.action?{_enc(json.dumps(login_payload))}",
+                data=b"",
+                method="POST",
+                headers={"Newv": "1", "jsessionId": self.sid},
+            )
+            with self.opener.open(request, timeout=30) as response:
+                result = _parse_response(json.loads(response.read()))
+        except Exception as exc:
+            self.sid = None
+            self.web_login_response = {
+                "result": None,
+                "fase": "login_web_secundario",
+                "error_type": type(exc).__name__,
+                "error": str(exc),
+            }
+            if isinstance(exc, urllib.error.HTTPError):
+                self.web_login_response["http_status"] = exc.code
+            return
+
         self.web_login_response = result
         self.web_login_ok = result.get("result") == 0
         if result.get("result") != 0:
