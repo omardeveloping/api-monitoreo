@@ -20,6 +20,8 @@ class _CMSV6ConfigStub:
     device_id = "4462510196"
     output_dir = ""
     small_response_bytes = 8
+    day_download_max_attempts = 3
+    day_download_retry_wait_secs = 0
 
     def validate(self):
         return None
@@ -152,6 +154,70 @@ class CMSV6AsyncPipelineTests(SimpleTestCase):
             callbacks,
             [(datetime.date(2026, 5, 4), resumen_dia)],
         )
+
+    def test_ejecutar_rango_reintenta_mismo_dia_antes_de_avanzar(self):
+        session = Mock()
+        session.get_gps.return_value = []
+        session.get_track.return_value = []
+        session.get_alarms.return_value = []
+        session.get_video_files.return_value = [{"file": "uno.h264"}]
+
+        config = _CMSV6ConfigStub()
+        resumen_fallido = {"descargados": 0, "omitidos": 0, "errores": 1, "total": 1}
+        resumen_ok = {"descargados": 1, "omitidos": 0, "errores": 0, "total": 1}
+
+        with tempfile.TemporaryDirectory() as tmp_dir, patch(
+            "dashboard.services.cmsv6_downloader.CMSV6Session",
+            return_value=session,
+        ), patch(
+            "dashboard.services.cmsv6_downloader._descargar_videos_dia",
+            side_effect=[resumen_fallido, resumen_ok],
+        ) as descargar:
+            resultado = cmsv6_downloader.ejecutar_rango(
+                tmp_dir,
+                datetime.datetime(2026, 5, 4, 0, 0),
+                datetime.datetime(2026, 5, 4, 23, 59),
+                lambda _mensaje: None,
+                lambda _progress, _mensaje: None,
+                opts={"excel_ruta": False, "excel_alarmas": False, "videos": True},
+                config=config,
+            )
+
+        self.assertEqual(descargar.call_count, 2)
+        self.assertEqual(resultado["videos_descargados"], 1)
+        self.assertEqual(resultado["videos_errores"], 0)
+
+    def test_ejecutar_rango_no_avanza_si_dia_no_completa(self):
+        session = Mock()
+        session.get_gps.return_value = []
+        session.get_track.return_value = []
+        session.get_alarms.return_value = []
+        session.get_video_files.return_value = [{"file": "uno.h264"}]
+
+        class Config(_CMSV6ConfigStub):
+            day_download_max_attempts = 2
+
+        resumen_fallido = {"descargados": 0, "omitidos": 0, "errores": 1, "total": 1}
+
+        with tempfile.TemporaryDirectory() as tmp_dir, patch(
+            "dashboard.services.cmsv6_downloader.CMSV6Session",
+            return_value=session,
+        ), patch(
+            "dashboard.services.cmsv6_downloader._descargar_videos_dia",
+            return_value=resumen_fallido,
+        ) as descargar, self.assertRaises(RuntimeError):
+            cmsv6_downloader.ejecutar_rango(
+                tmp_dir,
+                datetime.datetime(2026, 5, 4, 0, 0),
+                datetime.datetime(2026, 5, 5, 23, 59),
+                lambda _mensaje: None,
+                lambda _progress, _mensaje: None,
+                opts={"excel_ruta": False, "excel_alarmas": False, "videos": True},
+                config=Config(),
+            )
+
+        self.assertEqual(descargar.call_count, 2)
+        session.get_video_files.assert_called_once()
 
     def test_importar_videos_mdvr_task_permite_base_dir(self):
         with patch(

@@ -121,6 +121,8 @@ class CMSV6Config:
     small_response_bytes: int = 4096
     download_workers: int = 1
     serial_downloads_per_device: bool = True
+    day_download_max_attempts: int = 3
+    day_download_retry_wait_secs: int = 300
 
     @classmethod
     def from_settings(cls, output_dir: str | None = None):
@@ -163,6 +165,16 @@ class CMSV6Config:
                 minimum=0,
             )
             != 0,
+            day_download_max_attempts=_setting_int(
+                "CMSV6_DAY_DOWNLOAD_MAX_ATTEMPTS",
+                3,
+                minimum=0,
+            ),
+            day_download_retry_wait_secs=_setting_int(
+                "CMSV6_DAY_DOWNLOAD_RETRY_WAIT_SECS",
+                300,
+                minimum=0,
+            ),
         )
 
     def validate(self):
@@ -2517,6 +2529,14 @@ def _merge_resumen_descarga(destino: dict, parcial: dict):
     destino["errores"] += int(parcial.get("errores", 0) or 0)
 
 
+def _dia_descarga_completa(resumen: dict) -> bool:
+    total = int(resumen.get("total", 0) or 0)
+    errores = int(resumen.get("errores", 0) or 0)
+    descargados = int(resumen.get("descargados", 0) or 0)
+    omitidos = int(resumen.get("omitidos", 0) or 0)
+    return errores == 0 and descargados + omitidos >= total
+
+
 def _descargar_videos_dia(
     session,
     archivos,
@@ -2609,6 +2629,75 @@ def _descargar_videos_dia(
         f"{resumen['omitidos']} ya existian | {resumen['errores']} errores"
     )
     return resumen
+
+
+def _descargar_videos_dia_hasta_completar(
+    session,
+    archivos,
+    fecha,
+    carpeta_videos_base,
+    log_fn,
+    set_progress,
+    config,
+    base_pct,
+    end_pct,
+    *,
+    download_workers=1,
+    on_file_complete=None,
+):
+    max_attempts = int(getattr(config, "day_download_max_attempts", 3) or 0)
+    wait_secs = int(getattr(config, "day_download_retry_wait_secs", 300) or 0)
+    attempt = 0
+    last_resumen = None
+
+    while max_attempts == 0 or attempt < max_attempts:
+        attempt += 1
+        if attempt > 1:
+            log_fn(
+                f"  Reintentando dia {fecha.strftime('%Y-%m-%d')} "
+                f"(intento {attempt}/{max_attempts or 'sin limite'}) antes de avanzar."
+            )
+
+        resumen_dia = _descargar_videos_dia(
+            session,
+            archivos,
+            fecha,
+            carpeta_videos_base,
+            log_fn,
+            set_progress,
+            config,
+            base_pct,
+            end_pct,
+            download_workers=download_workers,
+            on_file_complete=on_file_complete,
+        )
+        last_resumen = resumen_dia
+        if _dia_descarga_completa(resumen_dia):
+            return resumen_dia
+
+        pendientes = max(
+            0,
+            int(resumen_dia.get("total", 0) or 0)
+            - int(resumen_dia.get("descargados", 0) or 0)
+            - int(resumen_dia.get("omitidos", 0) or 0),
+        )
+        log_fn(
+            f"  Dia {fecha.strftime('%Y-%m-%d')} incompleto: "
+            f"{resumen_dia.get('descargados', 0)} descargados, "
+            f"{resumen_dia.get('omitidos', 0)} existentes, "
+            f"{resumen_dia.get('errores', 0)} errores, "
+            f"{pendientes} pendientes."
+        )
+        if max_attempts and attempt >= max_attempts:
+            break
+        if wait_secs:
+            log_fn(f"  Esperando {wait_secs}s antes de reintentar el mismo dia.")
+            time.sleep(wait_secs)
+
+    raise RuntimeError(
+        "No se completaron todos los videos del dia "
+        f"{fecha.strftime('%Y-%m-%d')} tras {attempt} intento/s: {last_resumen}"
+    )
 
 
 def ejecutar_rango(
@@ -2803,7 +2892,7 @@ def ejecutar_rango(
                 archivos = archivos[: max(1, int(opts.get("test_limit", 1) or 1))]
                 log_fn(f"  [TEST] Seleccionados: {len(archivos)}/{total_servidor} clips")
 
-        resumen_dia = _descargar_videos_dia(
+        resumen_dia = _descargar_videos_dia_hasta_completar(
             session,
             archivos,
             fecha,
